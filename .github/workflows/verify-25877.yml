@@ -1,0 +1,86 @@
+name: Verify immutable shard cache
+on:
+  push:
+    branches: [verify/25877-cache]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare candidate and isolated baseline
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          echo ZGlmZiAtLWdpdCBhL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZS5nbyBiL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZS5nbwppbmRleCAwZDA5OWE4Li44OThjMjU1IDEwMDY0NAotLS0gYS9wa2cvc2hhcmRzZXJ2aWNlL3NlcnZpY2UuZ28KKysrIGIvcGtnL3NoYXJkc2VydmljZS9zZXJ2aWNlLmdvCkBAIC00MDQsMTQgKzQwNCwxNyBAQCBmdW5jIChzICpzZXJ2aWNlKSBUYWJsZVJlcGxpY2FDb3VudCh0YWJsZUlEIHVpbnQ2NCkgaW50NjQgewogZnVuYyAocyAqc2VydmljZSkgcmVtb3ZlUmVhZENhY2hlKAogCXRhYmxlIHVpbnQ2NCwKICkgewotCW9sZCA6PSBzLmdldFJlYWRDYWNoZSgpCi0JaWYgIW9sZC5oYXNUYWJsZUNhY2hlKHRhYmxlKSB7Ci0JCXJldHVybgorCWZvciB7CisJCW9sZCA6PSBzLmdldFJlYWRDYWNoZSgpCisJCWlmICFvbGQuaGFzVGFibGVDYWNoZSh0YWJsZSkgeworCQkJcmV0dXJuCisJCX0KKwkJbmV3IDo9IG9sZC5jbG9uZSgpCisJCWRlbGV0ZShuZXcuc2hhcmRzLCB0YWJsZSkKKwkJaWYgcy5jYWNoZS5yZWFkLkNvbXBhcmVBbmRTd2FwKG9sZCwgbmV3KSB7CisJCQlyZXR1cm4KKwkJfQogCX0KLQotCW5ldyA6PSBvbGQuY2xvbmUoKQotCWRlbGV0ZShuZXcuc2hhcmRzLCB0YWJsZSkKLQlzLmNhY2hlLnJlYWQuQ29tcGFyZUFuZFN3YXAob2xkLCBuZXcpCiB9CiAKIGZ1bmMgKHMgKnNlcnZpY2UpIGdldFNoYXJkcygKQEAgLTQ0OSwxMCArNDUyLDE0IEBAIE9VVDoKIAkJCQljb250aW51ZSBPVVQKIAkJCX0KIAkJfQotCQljYWNoZSA9IHMuY2FjaGUucmVhZC5Mb2FkKCkKLQkJY2FjaGUgPSBjYWNoZS5jbG9uZSgpCi0JCWNhY2hlLmFkZFNoYXJkcyh0YWJsZSwgbWV0YWRhdGEsIHNoYXJkcykKLQkJcy5jYWNoZS5yZWFkLlN0b3JlKGNhY2hlKQorCQlmb3IgeworCQkJb2xkIDo9IHMuY2FjaGUucmVhZC5Mb2FkKCkKKwkJCWNhY2hlID0gb2xkLmNsb25lKCkKKwkJCWNhY2hlLmFkZFNoYXJkcyh0YWJsZSwgbWV0YWRhdGEsIHNoYXJkcykKKwkJCWlmIHMuY2FjaGUucmVhZC5Db21wYXJlQW5kU3dhcChvbGQsIGNhY2hlKSB7CisJCQkJYnJlYWsKKwkJCX0KKwkJfQogCQlzLmxvZ2dlci5JbmZvKCJhZGQgcmVhZCBjYWNoZSIsCiAJCQl6YXAuVWludDY0KCJ0YWJsZSIsIHRhYmxlKSwKIAkJCXphcC5TdHJpbmcoIm1ldGFkYXRhIiwgbWV0YWRhdGEuU3RyaW5nKCkpLApAQCAtODExLDExICs4MTgsNyBAQCBmdW5jIChzICpzZXJ2aWNlKSBoYW5kbGVDaGVja0NoYW5nZWQoKSBlcnJvciB7CiBmdW5jIChzICpzZXJ2aWNlKSByZW1vdmVDYWNoZSgKIAl0YWJsZUlEIHVpbnQ2NCwKICkgewotCWNhY2hlIDo9IHMuY2FjaGUucmVhZC5Mb2FkKCkKLQlpZiBjYWNoZSAhPSBuaWwgewotCQljYWNoZS5kZWxldGUodGFibGVJRCkKLQkJcy5jYWNoZS5yZWFkLlN0b3JlKGNhY2hlKQotCX0KKwlzLnJlbW92ZVJlYWRDYWNoZSh0YWJsZUlEKQogfQogCiBmdW5jIChzICpzZXJ2aWNlKSBtYXliZVJlbW92ZVJlYWRDYWNoZSgKZGlmZiAtLWdpdCBhL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZV9yZWFkX3Rlc3QuZ28gYi9wa2cvc2hhcmRzZXJ2aWNlL3NlcnZpY2VfcmVhZF90ZXN0LmdvCmluZGV4IDY1MTgxMTAuLmY0OGExNGIgMTAwNjQ0Ci0tLSBhL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZV9yZWFkX3Rlc3QuZ28KKysrIGIvcGtnL3NoYXJkc2VydmljZS9zZXJ2aWNlX3JlYWRfdGVzdC5nbwpAQCAtNDIsNiArNDIsNDggQEAgdHlwZSBjb3VudGluZ01ldGhvZEJhc2VkQ2xpZW50IHN0cnVjdCB7CiAJYXN5bmNDYWxscyBhdG9taWMuSW50MzIKIH0KIAorZnVuYyBUZXN0UmVtb3ZlQ2FjaGVQcmVzZXJ2ZXNQdWJsaXNoZWRTbmFwc2hvdCh0ICp0ZXN0aW5nLlQpIHsKKwlzIDo9ICZzZXJ2aWNle30KKwlzLnJlbW92ZUNhY2hlKDEpCisJb2xkIDo9IG5ld1JlYWRDYWNoZSgpCisJb2xkLnNoYXJkc1sxXSA9IHNoYXJkc0NhY2hle30KKwlvbGQuc2hhcmRzWzJdID0gc2hhcmRzQ2FjaGV7fQorCXMuY2FjaGUucmVhZC5TdG9yZShvbGQpCisJcy5yZW1vdmVDYWNoZSgzKQorCXJlcXVpcmUuU2FtZSh0LCBvbGQsIHMuZ2V0UmVhZENhY2hlKCkpCisJcy5yZW1vdmVDYWNoZSgxKQorCXJlcXVpcmUuVHJ1ZSh0LCBvbGQuaGFzVGFibGVDYWNoZSgxKSwgImEgc25hcHNob3QgcmV0YWluZWQgYnkgYSByZWFkZXIgaXMgaW1tdXRhYmxlIikKKwlyZXF1aXJlLkZhbHNlKHQsIHMuZ2V0UmVhZENhY2hlKCkuaGFzVGFibGVDYWNoZSgxKSkKKwlyZXF1aXJlLlRydWUodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDIpKQorCXMucmVtb3ZlQ2FjaGUoMSkKKwlyZXF1aXJlLlRydWUodCwgb2xkLmhhc1RhYmxlQ2FjaGUoMSkpCit9CisKK2Z1bmMgVGVzdFJlbW92ZUNhY2hlQ29uY3VycmVudERlbGV0ZXModCAqdGVzdGluZy5UKSB7CisJcyA6PSAmc2VydmljZXt9CisJb2xkIDo9IG5ld1JlYWRDYWNoZSgpCisJZm9yIF8sIGlkIDo9IHJhbmdlIFtddWludDY0ezEsIDIsIDN9IHsKKwkJb2xkLnNoYXJkc1tpZF0gPSBzaGFyZHNDYWNoZXt9CisJfQorCXMuY2FjaGUucmVhZC5TdG9yZShvbGQpCisJc3RhcnQgOj0gbWFrZShjaGFuIHN0cnVjdHt9KQorCWRvbmUgOj0gbWFrZShjaGFuIHN0cnVjdHt9LCAyKQorCWZvciBfLCBpZCA6PSByYW5nZSBbXXVpbnQ2NHsxLCAyfSB7CisJCWdvIGZ1bmMoKSB7CisJCQk8LXN0YXJ0CisJCQlzLnJlbW92ZUNhY2hlKGlkKQorCQkJZG9uZSA8LSBzdHJ1Y3R7fXt9CisJCX0oKQorCX0KKwljbG9zZShzdGFydCkKKwk8LWRvbmUKKwk8LWRvbmUKKwlyZXF1aXJlLkxlbih0LCBvbGQuc2hhcmRzLCAzKQorCXJlcXVpcmUuRmFsc2UodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDEpKQorCXJlcXVpcmUuRmFsc2UodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDIpKQorCXJlcXVpcmUuVHJ1ZSh0LCBzLmdldFJlYWRDYWNoZSgpLmhhc1RhYmxlQ2FjaGUoMykpCit9CisKIGZ1bmMgKGMgKmNvdW50aW5nTWV0aG9kQmFzZWRDbGllbnQpIEFzeW5jU2VuZCgKIAljdHggY29udGV4dC5Db250ZXh0LAogCXJlcSAqc2hhcmQuUmVxdWVzdCwK | base64 -d > evidence/candidate.patch
+          echo ZGlmZiAtLWdpdCBhL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZV9yZWFkX3Rlc3QuZ28gYi9wa2cvc2hhcmRzZXJ2aWNlL3NlcnZpY2VfcmVhZF90ZXN0LmdvCmluZGV4IDY1MTgxMTAuLmY0OGExNGIgMTAwNjQ0Ci0tLSBhL3BrZy9zaGFyZHNlcnZpY2Uvc2VydmljZV9yZWFkX3Rlc3QuZ28KKysrIGIvcGtnL3NoYXJkc2VydmljZS9zZXJ2aWNlX3JlYWRfdGVzdC5nbwpAQCAtNDIsNiArNDIsNDggQEAgdHlwZSBjb3VudGluZ01ldGhvZEJhc2VkQ2xpZW50IHN0cnVjdCB7CiAJYXN5bmNDYWxscyBhdG9taWMuSW50MzIKIH0KIAorZnVuYyBUZXN0UmVtb3ZlQ2FjaGVQcmVzZXJ2ZXNQdWJsaXNoZWRTbmFwc2hvdCh0ICp0ZXN0aW5nLlQpIHsKKwlzIDo9ICZzZXJ2aWNle30KKwlzLnJlbW92ZUNhY2hlKDEpCisJb2xkIDo9IG5ld1JlYWRDYWNoZSgpCisJb2xkLnNoYXJkc1sxXSA9IHNoYXJkc0NhY2hle30KKwlvbGQuc2hhcmRzWzJdID0gc2hhcmRzQ2FjaGV7fQorCXMuY2FjaGUucmVhZC5TdG9yZShvbGQpCisJcy5yZW1vdmVDYWNoZSgzKQorCXJlcXVpcmUuU2FtZSh0LCBvbGQsIHMuZ2V0UmVhZENhY2hlKCkpCisJcy5yZW1vdmVDYWNoZSgxKQorCXJlcXVpcmUuVHJ1ZSh0LCBvbGQuaGFzVGFibGVDYWNoZSgxKSwgImEgc25hcHNob3QgcmV0YWluZWQgYnkgYSByZWFkZXIgaXMgaW1tdXRhYmxlIikKKwlyZXF1aXJlLkZhbHNlKHQsIHMuZ2V0UmVhZENhY2hlKCkuaGFzVGFibGVDYWNoZSgxKSkKKwlyZXF1aXJlLlRydWUodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDIpKQorCXMucmVtb3ZlQ2FjaGUoMSkKKwlyZXF1aXJlLlRydWUodCwgb2xkLmhhc1RhYmxlQ2FjaGUoMSkpCit9CisKK2Z1bmMgVGVzdFJlbW92ZUNhY2hlQ29uY3VycmVudERlbGV0ZXModCAqdGVzdGluZy5UKSB7CisJcyA6PSAmc2VydmljZXt9CisJb2xkIDo9IG5ld1JlYWRDYWNoZSgpCisJZm9yIF8sIGlkIDo9IHJhbmdlIFtddWludDY0ezEsIDIsIDN9IHsKKwkJb2xkLnNoYXJkc1tpZF0gPSBzaGFyZHNDYWNoZXt9CisJfQorCXMuY2FjaGUucmVhZC5TdG9yZShvbGQpCisJc3RhcnQgOj0gbWFrZShjaGFuIHN0cnVjdHt9KQorCWRvbmUgOj0gbWFrZShjaGFuIHN0cnVjdHt9LCAyKQorCWZvciBfLCBpZCA6PSByYW5nZSBbXXVpbnQ2NHsxLCAyfSB7CisJCWdvIGZ1bmMoKSB7CisJCQk8LXN0YXJ0CisJCQlzLnJlbW92ZUNhY2hlKGlkKQorCQkJZG9uZSA8LSBzdHJ1Y3R7fXt9CisJCX0oKQorCX0KKwljbG9zZShzdGFydCkKKwk8LWRvbmUKKwk8LWRvbmUKKwlyZXF1aXJlLkxlbih0LCBvbGQuc2hhcmRzLCAzKQorCXJlcXVpcmUuRmFsc2UodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDEpKQorCXJlcXVpcmUuRmFsc2UodCwgcy5nZXRSZWFkQ2FjaGUoKS5oYXNUYWJsZUNhY2hlKDIpKQorCXJlcXVpcmUuVHJ1ZSh0LCBzLmdldFJlYWRDYWNoZSgpLmhhc1RhYmxlQ2FjaGUoMykpCit9CisKIGZ1bmMgKGMgKmNvdW50aW5nTWV0aG9kQmFzZWRDbGllbnQpIEFzeW5jU2VuZCgKIAljdHggY29udGV4dC5Db250ZXh0LAogCXJlcSAqc2hhcmQuUmVxdWVzdCwK | base64 -d > evidence/tests.patch
+          git worktree add --detach "$RUNNER_TEMP/cache-baseline" 35c8dd5854750ef96f52f9dd298a70acd031d5e4
+          git -C "$RUNNER_TEMP/cache-baseline" apply "$GITHUB_WORKSPACE/evidence/tests.patch"
+          git apply evidence/candidate.patch
+          gofmt -w pkg/shardservice/service.go pkg/shardservice/service_read_test.go
+          git diff --check
+          git diff --numstat > evidence/numstat.txt
+          git diff > evidence/candidate.patch
+          go version > evidence/toolchain.txt
+          GOWORK=off go list -mod=readonly -deps -test -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./pkg/shardservice > evidence/cgo-dependencies.txt
+      - name: Build repository native generation
+        run: make -j2 cgo
+      - name: Prove baseline snapshot failure
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cache-baseline"
+          rc=0
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=240s -run '^TestRemoveCachePreservesPublishedSnapshot$' ./pkg/shardservice > "$GITHUB_WORKSPACE/evidence/baseline.log" 2>&1 || rc=$?
+          cat "$GITHUB_WORKSPACE/evidence/baseline.log"
+          test "$rc" -ne 0
+          grep -F -- '--- FAIL: TestRemoveCachePreservesPublishedSnapshot' "$GITHUB_WORKSPACE/evidence/baseline.log"
+          grep -F 'a snapshot retained by a reader is immutable' "$GITHUB_WORKSPACE/evidence/baseline.log"
+      - name: Focused fixed regressions and consumers
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=240s -run '^(TestRemoveCachePreservesPublishedSnapshot|TestRemoveCacheConcurrentDeletes|TestGetShardsWithAllocated|TestGetShardsWithoutCreate)$' ./pkg/shardservice 2>&1 | tee evidence/focused.log
+      - name: Measure and stress exact concurrency test
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -json -race -count=1 -timeout=240s -run '^TestRemoveCacheConcurrentDeletes$' ./pkg/shardservice > evidence/race-measure.jsonl
+          n=$(python3 -c 'import json; rows=[json.loads(x) for x in open("evidence/race-measure.jsonl")]; result=[x for x in rows if x.get("Test")=="TestRemoveCacheConcurrentDeletes" and x.get("Action")=="pass"]; assert len(result)==1; t=result[0].get("Elapsed",0); print(100 if t<=0 else max(1,min(100,int(30/t))))')
+          echo "N=$n" > evidence/race-budget.txt
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -race -count="$n" -timeout=240s -run '^TestRemoveCacheConcurrentDeletes$' ./pkg/shardservice 2>&1 | tee evidence/race-stress.log
+      - name: Owning package normal and race
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s ./pkg/shardservice 2>&1 | tee evidence/package.log
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -race -count=1 -timeout=600s ./pkg/shardservice 2>&1 | tee evidence/package-race.log
+      - name: Incremental static gates
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l pkg/shardservice/service.go pkg/shardservice/service_read_test.go)"
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go vet -mod=readonly ./pkg/shardservice
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          golangci-lint run --concurrency 2 -c .golangci.yml --new-from-rev 35c8dd5854750ef96f52f9dd298a70acd031d5e4 ./pkg/shardservice 2>&1 | tee evidence/lint.log
+      - name: Preserve exact candidate
+        if: always()
+        run: |
+          mkdir -p evidence/source
+          cp pkg/shardservice/service.go pkg/shardservice/service_read_test.go evidence/source/
+          git diff --numstat > evidence/numstat.txt
+          git diff > evidence/candidate.patch
+          git rev-parse HEAD > evidence/verification-head.txt
+          sha256sum evidence/source/* > evidence/sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-cache-25877-evidence
+          path: evidence
