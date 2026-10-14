@@ -1,0 +1,54 @@
+name: Verify shard cache static followup
+on:
+  push:
+    branches: [verify/30187-unused-cache-delete-20261014]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Native generation and source evidence
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git rev-parse HEAD > evidence/head.txt
+          git diff 256ba67822dceaa64316c8e4cc9f0ce07ffc297a -- pkg/shardservice > evidence/followup.patch
+          go version > evidence/toolchain.txt
+          make -j2 cgo
+      - name: Incremental static checks
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l pkg/shardservice/service.go pkg/shardservice/service_read_test.go)"
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go vet -mod=readonly ./pkg/shardservice
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          golangci-lint run --concurrency 2 -c .golangci.yml --new-from-rev fab7b5c0430a475bf64ad1619ce4d5249013a138 ./pkg/shardservice 2>&1 | tee evidence/lint.log
+      - name: Owning package regression normal and race
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s ./pkg/shardservice 2>&1 | tee evidence/package.log
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -race -count=1 -timeout=600s ./pkg/shardservice 2>&1 | tee evidence/package-race.log
+      - name: Keep exact source and delivery scope
+        if: always()
+        run: |
+          mkdir -p evidence/source
+          cp pkg/shardservice/service.go pkg/shardservice/service_read_test.go evidence/source/
+          git diff fab7b5c0430a475bf64ad1619ce4d5249013a138 --numstat -- pkg/shardservice > evidence/numstat.txt
+          sha256sum evidence/source/* > evidence/sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-cache-static-followup
+          path: evidence
