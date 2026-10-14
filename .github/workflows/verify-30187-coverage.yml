@@ -1,0 +1,49 @@
+name: Diagnose coverage ownership failure at base and candidate
+on:
+  push:
+    branches: [verify/30187-coverage-baseline-20261015]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        revision:
+          - fab7b5c0430a475bf64ad1619ce4d5249013a138
+          - f40c1899a93c05378c97d803eb0b092d4bd30c88
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.revision }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build matching native artifacts
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/head.txt
+          go version > evidence/toolchain.txt
+          make -j2 cgo
+      - name: Selected production ownership test under coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -short -tags matrixone_test -timeout=20m -covermode=set -coverpkg=./pkg/... -coverprofile=evidence/coverage.out -run '^TestBroadcastLoopJoinRemoteSourceOwnership$' ./pkg/sql/compile > evidence/ownership.log 2>&1
+          result=$?
+          set -e
+          printf '%s\n' "$result" > evidence/exit-code.txt
+          cat evidence/ownership.log
+          exit "$result"
+      - name: Preserve terminal diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-ownership-${{ matrix.revision }}
+          path: evidence
