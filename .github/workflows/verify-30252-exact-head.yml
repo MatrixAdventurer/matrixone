@@ -1,0 +1,78 @@
+name: Verify CSV whitespace exact head
+on:
+  push:
+    branches:
+      - fix/30252-preserve-whitespace-csv
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      GOWORK: 'off'
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify exact scope
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          go version | tee evidence/go-version.txt
+          git diff 94da0308ad0c5d4fb1d9912293339218bf26dfa3 HEAD --numstat | tee evidence/numstat.txt
+          test -z "$(gofmt -l pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go)"
+          git diff --check 94da0308ad0c5d4fb1d9912293339218bf26dfa3 HEAD
+          git diff --name-only 94da0308ad0c5d4fb1d9912293339218bf26dfa3 HEAD > evidence/changed-paths.txt
+          grep -F 'pkg/sql/util/csvparser/csv_parser.go' evidence/changed-paths.txt
+          grep -F 'pkg/sql/util/csvparser/csv_parser_test.go' evidence/changed-paths.txt
+      - name: Prepare native generation
+        run: |
+          set -euo pipefail
+          make -j2 cgo
+      - name: Focused whitespace and line-number regression
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=240s -run '^(TestCSVParserPreservesWhitespaceOnlyRecords|TestRecordLine)$' ./pkg/sql/util/csvparser 2>&1 | tee evidence/focused.log
+          grep -F -- '--- PASS: TestCSVParserPreservesWhitespaceOnlyRecords' evidence/focused.log
+          grep -F -- '--- PASS: TestRecordLine' evidence/focused.log
+      - name: Owning CSV parser package suite
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s ./pkg/sql/util/csvparser 2>&1 | tee evidence/parser-package.log
+      - name: External CSV reader consumer tests
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s -run '^(TestCsvReaderRejectsZeroVectorBatch|Test_getMOCSVReader)$' ./pkg/sql/colexec/external 2>&1 | tee evidence/external-consumer.log
+          grep -F -- '--- PASS: TestCsvReaderRejectsZeroVectorBatch' evidence/external-consumer.log
+          grep -F -- '--- PASS: Test_getMOCSVReader' evidence/external-consumer.log
+      - name: Vet CSV parser
+        run: |
+          set -euo pipefail
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go vet -mod=readonly ./pkg/sql/util/csvparser 2>&1 | tee evidence/vet.log
+      - name: Incremental linter
+        run: |
+          set -euo pipefail
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          golangci-lint run --concurrency 2 -c .golangci.yml --new-from-rev 94da0308ad0c5d4fb1d9912293339218bf26dfa3 ./pkg/sql/util/csvparser 2>&1 | tee evidence/lint.log
+      - name: Preserve exact-head evidence
+        if: always()
+        run: |
+          mkdir -p evidence/source
+          cp pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go evidence/source/
+          git rev-parse HEAD > evidence/verification-head.txt
+          sha256sum evidence/source/* > evidence/sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrixone-30252-exact-head
+          path: evidence
