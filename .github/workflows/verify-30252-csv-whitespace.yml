@@ -1,0 +1,94 @@
+name: Verify CSV whitespace preservation
+on:
+  push:
+    branches:
+      - verify/30252-csv-whitespace-20261015
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      GOWORK: 'off'
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Identify scope and prepare native dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          go version | tee evidence/go-version.txt
+          test -f pkg/sql/util/csvparser/csv_parser_test.go
+          grep -F 'func TestCSVParserPreservesWhitespaceOnlyRecords' pkg/sql/util/csvparser/csv_parser_test.go
+          git show 501c85ecdd6eee0195172743c6d8aaf125cb252d:pkg/sql/util/csvparser/csv_parser.go > pkg/sql/util/csvparser/csv_parser.go
+          make -j2 cgo
+      - name: RED - reproduce unquoted whitespace data loss
+        run: |
+          set -euo pipefail
+          rc=0
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=240s -run '^(TestCSVParserPreservesWhitespaceOnlyRecords|TestRecordLine)$' ./pkg/sql/util/csvparser > evidence/red.log 2>&1 || rc=$?
+          cat evidence/red.log
+          test "$rc" -ne 0
+          grep -F -- '--- FAIL: TestCSVParserPreservesWhitespaceOnlyRecords' evidence/red.log
+          grep -E -- 'FAIL: TestRecordLine/skipped_blank_lines_still_count|FAIL: TestCSVParserPreservesWhitespaceOnlyRecords/(space|tabs_and_CRLF|blank_lines)' evidence/red.log
+      - name: Apply minimal source fix and verify diff
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("pkg/sql/util/csvparser/csv_parser.go")
+          s = p.read_text()
+          substitutions = [
+              ("\twhitespaceLine := true\n", ""),
+              ("\t\t\twhitespaceLine = false\n", ""),
+              ("\t\t\t\twhitespaceLine = false\n", ""),
+              ("\t\t\t\t\twhitespaceLine = false\n", ""),
+              ("\t\t\t\t// skip lines only contain whitespaces\n\t\t\t\tif err == nil && whitespaceLine && len(bytes.TrimSpace(parser.recordBuffer)) == 0 {\n\t\t\t\t\tparser.recordBuffer = parser.recordBuffer[:0]\n\t\t\t\t\tparser.recordStartLine = parser.lineNo\n\t\t\t\t\tcontinue\n\t\t\t\t}\n", ""),
+          ]
+          for before, after in substitutions:
+              if before not in s:
+                  raise SystemExit("expected source fragment missing: "+repr(before))
+              s = s.replace(before, after)
+          if "whitespaceLine" in s:
+              raise SystemExit("whitespaceLine symbol remains")
+          p.write_text(s)
+          PY
+          git diff --check
+          test -z "$(gofmt -l pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go)"
+          git diff --stat | tee evidence/diff-stat.txt
+          git diff -- pkg/sql/util/csvparser/csv_parser.go > evidence/fix-source.patch
+      - name: GREEN - focused regression tests
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=240s -run '^(TestCSVParserPreservesWhitespaceOnlyRecords|TestRecordLine)$' ./pkg/sql/util/csvparser 2>&1 | tee evidence/green-focused.log
+      - name: GREEN - package suite
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s ./pkg/sql/util/csvparser 2>&1 | tee evidence/green-package.log
+      - name: Vet owning package
+        run: |
+          set -euo pipefail
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go vet -mod=readonly ./pkg/sql/util/csvparser 2>&1 | tee evidence/vet.log
+      - name: Preserve evidence and candidate
+        if: always()
+        run: |
+          mkdir -p evidence/source
+          cp pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go evidence/source/
+          git rev-parse HEAD > evidence/verification-commit.txt
+          git diff --numstat > evidence/numstat.txt
+          git diff -- pkg/sql/util/csvparser > evidence/all.patch
+          sha256sum evidence/source/* > evidence/sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrixone-30252-csv-whitespace
+          path: evidence
