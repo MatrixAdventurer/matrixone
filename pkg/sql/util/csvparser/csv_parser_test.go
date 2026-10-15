@@ -737,7 +737,6 @@ func TestRecordLine(t *testing.T) {
 	})
 }
 
-
 // A whitespace-only unquoted field is data, not an empty CSV record.
 // Empty physical lines still follow AllowEmptyLine, without losing line numbers.
 func TestCSVParserPreservesWhitespaceOnlyRecords(t *testing.T) {
