@@ -674,12 +674,11 @@ func TestRecordLine(t *testing.T) {
 	})
 
 	t.Run("skipped blank lines still count", func(t *testing.T) {
-		// line 1: a,1   lines 2-3 blank   line 4: b,2   line 5 whitespace
-		// line 6: c,3 -- a record starts where its content starts, not where
-		// the scan for it started.
+		// Lines 2-3 are blank; line 5 contains data (three spaces).
+		// Each returned row must report its own starting physical line.
 		parser, err := NewCSVParser(&cfg, NewStringReader("a,1\n\n\nb,2\n   \nc,3\n"), int64(ReadBlockSize), false)
 		require.NoError(t, err)
-		for _, want := range []int64{1, 4, 6} {
+		for _, want := range []int64{1, 4, 5, 6} {
 			_, err = parser.Read(nil)
 			require.NoError(t, err)
 			require.Equal(t, want, parser.RecordLine())
@@ -736,4 +735,39 @@ func TestRecordLine(t *testing.T) {
 			require.Equal(t, i, parser.RecordLine(), "record %d", i)
 		}
 	})
+}
+
+
+// A whitespace-only unquoted field is data, not an empty CSV record.
+// Empty physical lines still follow AllowEmptyLine, without losing line numbers.
+func TestCSVParserPreservesWhitespaceOnlyRecords(t *testing.T) {
+	cases := []struct {
+		name string
+		csv  string
+		want [][]string
+	}{
+		{"space", " \nx\n", [][]string{{" "}, {"x"}}},
+		{"tabs and CRLF", "\t\t\r\nx\r\n", [][]string{{"\t\t"}, {"x"}}},
+		{"blank lines", "\n \n\nx\n", [][]string{{" "}, {"x"}}},
+		{"whitespace at EOF", "x\n ", [][]string{{"x"}, {" "}}},
+		{"multiple fields", " ,x\n", [][]string{{" ", "x"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := CSVConfig{FieldsTerminatedBy: ",", FieldsEnclosedBy: `"`}
+			parser, err := NewCSVParser(&cfg, NewStringReader(tc.csv), int64(ReadBlockSize), false)
+			require.NoError(t, err)
+			for _, fields := range tc.want {
+				row, err := parser.Read(nil)
+				require.NoError(t, err)
+				expected := make([]Field, len(fields))
+				for i, value := range fields {
+					expected[i] = newStringField(value, false, false)
+				}
+				require.Equal(t, expected, row)
+			}
+			_, err = parser.Read(nil)
+			require.ErrorIs(t, err, io.EOF)
+		})
+	}
 }
