@@ -45,11 +45,11 @@ jobs:
           from pathlib import Path
           p = Path("pkg/sql/util/csvparser/csv_parser.go")
           s = p.read_text()
+          if s.count("whitespaceLine = false") != 3:
+              raise SystemExit("unexpected whitespaceLine assignments")
+          s = "".join(line for line in s.splitlines(keepends=True) if line.strip() != "whitespaceLine = false")
           substitutions = [
               ("\twhitespaceLine := true\n", ""),
-              ("\t\t\twhitespaceLine = false\n", ""),
-              ("\t\t\t\twhitespaceLine = false\n", ""),
-              ("\t\t\t\t\twhitespaceLine = false\n", ""),
               ("\t\t\t\t// skip lines only contain whitespaces\n\t\t\t\tif err == nil && whitespaceLine && len(bytes.TrimSpace(parser.recordBuffer)) == 0 {\n\t\t\t\t\tparser.recordBuffer = parser.recordBuffer[:0]\n\t\t\t\t\tparser.recordStartLine = parser.lineNo\n\t\t\t\t\tcontinue\n\t\t\t\t}\n", ""),
           ]
           for before, after in substitutions:
@@ -60,6 +60,7 @@ jobs:
               raise SystemExit("whitespaceLine symbol remains")
           p.write_text(s)
           PY
+          git show HEAD:pkg/sql/util/csvparser/csv_parser.go | cmp - pkg/sql/util/csvparser/csv_parser.go
           git diff --check
           test -z "$(gofmt -l pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go)"
           git diff --stat | tee evidence/diff-stat.txt
@@ -72,6 +73,29 @@ jobs:
         run: |
           set -euo pipefail
           .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s ./pkg/sql/util/csvparser 2>&1 | tee evidence/green-package.log
+      - name: GREEN - external CSV reader consumer
+        run: |
+          set -euo pipefail
+          .agents/skills/mo-dev/scripts/mo-cgo-test -v -count=1 -timeout=600s -run '^(TestCsvReaderRejectsZeroVectorBatch|Test_getMOCSVReader)        run: |
+          set -euo pipefail
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/cgo -I$GITHUB_WORKSPACE/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/thirdparties/install/lib"
+          go vet -mod=readonly ./pkg/sql/util/csvparser 2>&1 | tee evidence/vet.log
+      - name: Preserve evidence and candidate
+        if: always()
+        run: |
+          mkdir -p evidence/source
+          cp pkg/sql/util/csvparser/csv_parser.go pkg/sql/util/csvparser/csv_parser_test.go evidence/source/
+          git rev-parse HEAD > evidence/verification-commit.txt
+          git diff --numstat > evidence/numstat.txt
+          git diff -- pkg/sql/util/csvparser > evidence/all.patch
+          sha256sum evidence/source/* > evidence/sha256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrixone-30252-csv-whitespace
+          path: evidence
+ ./pkg/sql/colexec/external 2>&1 | tee evidence/green-consumer.log
       - name: Vet owning package
         run: |
           set -euo pipefail
