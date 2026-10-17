@@ -41,6 +41,7 @@ func Test_getColData_StringWidthStrict(t *testing.T) {
 		local         bool
 		parallel      bool
 		wantErr       bool
+		assertValue   bool
 	}{
 		{"varchar over-width strict serial", types.T_varchar, 3, "abcd", true, false, false, true},
 		{"varchar over-width strict parallel", types.T_varchar, 3, "abcd", true, false, true, true},
@@ -52,6 +53,17 @@ func Test_getColData_StringWidthStrict(t *testing.T) {
 		{"varchar over-width local", types.T_varchar, 3, "abcd", true, true, false, false},
 		{"varchar multibyte over-width strict", types.T_varchar, 2, "你好世", true, false, false, true},
 		{"varchar multibyte fits strict", types.T_varchar, 2, "你好", true, false, false, false},
+		// A declared width of zero is a real upper bound, not unlimited text.
+		{name: "varchar zero strict serial", oid: types.T_varchar, width: 0, val: "abc", strictSqlMode: true, wantErr: true},
+		{name: "varchar zero strict parallel", oid: types.T_varchar, width: 0, val: "abc", strictSqlMode: true, parallel: true, wantErr: true},
+		{name: "char zero strict serial", oid: types.T_char, width: 0, val: "abc", strictSqlMode: true, wantErr: true},
+		{name: "char zero strict parallel", oid: types.T_char, width: 0, val: "abc", strictSqlMode: true, parallel: true, wantErr: true},
+		{name: "varchar zero strict multibyte", oid: types.T_varchar, width: 0, val: "你好", strictSqlMode: true, wantErr: true},
+		{name: "varchar zero strict empty", oid: types.T_varchar, width: 0, val: "", strictSqlMode: true, assertValue: true},
+		{name: "varchar zero nonstrict", oid: types.T_varchar, width: 0, val: "abc", assertValue: true},
+		{name: "char zero nonstrict parallel", oid: types.T_char, width: 0, val: "abc", parallel: true, assertValue: true},
+		{name: "varchar zero local", oid: types.T_varchar, width: 0, val: "abc", strictSqlMode: true, local: true, assertValue: true},
+		{name: "varchar zero multibyte nonstrict", oid: types.T_varchar, width: 0, val: "你好", assertValue: true},
 	}
 
 	for _, tc := range cases {
@@ -88,7 +100,28 @@ func Test_getColData_StringWidthStrict(t *testing.T) {
 				require.Contains(t, err.Error(), "Data too long for column 'a'")
 			} else {
 				require.NoError(t, err)
+				if tc.assertValue {
+					require.Equal(t, "", bat.Vecs[0].GetStringAt(0), "zero-width text must be truncated before storage")
+				}
 			}
 		})
+	}
+}
+
+// Text width -1 means unspecified; width zero is explicitly bounded.
+func TestTruncateLoadDataStringValueZeroWidth(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		width int32
+		want  string
+	}{
+		{value: "abc", width: 0, want: ""},
+		{value: "你好", width: 0, want: ""},
+		{value: "", width: 0, want: ""},
+		{value: "abcd", width: 2, want: "ab"},
+		{value: "你好世", width: 2, want: "你好"},
+		{value: "abc", width: -1, want: "abc"},
+	} {
+		require.Equal(t, tc.want, truncateLoadDataStringValue(tc.value, tc.width))
 	}
 }

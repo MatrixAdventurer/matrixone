@@ -1613,7 +1613,7 @@ func loadDataNonStrictNumericPrefix(val string) string {
 }
 
 func truncateLoadDataStringValue(val string, width int32) string {
-	if width <= 0 || utf8.RuneCountInString(val) <= int(width) {
+	if width < 0 || utf8.RuneCountInString(val) <= int(width) {
 		return val
 	}
 	return string([]rune(val)[:width])
@@ -1954,7 +1954,7 @@ func getColData(bat *batch.Batch, line []csvparser.Field, rowIdx int, param *Ext
 	// (cast_strict) and MySQL's "Data too long" behavior. Uses rune count, like
 	// strToStr. LOCAL / non-strict loads keep the lenient (truncate) behavior.
 	if checkLineStrict(param) && (id == types.T_char || id == types.T_varchar) &&
-		col.Typ.Width > 0 && utf8.RuneCountInString(field.Val) > int(col.Typ.Width) {
+		col.Typ.Width >= 0 && utf8.RuneCountInString(field.Val) > int(col.Typ.Width) {
 		return moerr.NewInternalErrorf(param.Ctx, "Data too long for column '%s' at row %d", colName, rowIdx+1)
 	}
 
