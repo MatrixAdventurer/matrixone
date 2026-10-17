@@ -26,7 +26,7 @@ import (
 
 func TestPrepareStringParseErrorMapsOnlySyntaxErrors(t *testing.T) {
     ctx := context.Background()
-    for _, sql := range []string{"SELECT FROM", "WITH a AS () SELECT 1"} {
+    for _, sql := range []string{"SELECT FROM", "SELECT * FROM"} {
         _, parseErr := mysql.ParseWithSQLMode(ctx, sql, 1, "")
         if parseErr == nil {
             t.Fatalf("expected invalid SQL to be rejected: %q", sql)
