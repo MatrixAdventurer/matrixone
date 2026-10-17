@@ -15,6 +15,8 @@
 package plan
 
 import (
+	"context"
+	"errors"
 	"math"
 
 	"github.com/gogo/protobuf/proto"
@@ -91,6 +93,17 @@ func getPreparePlan(ctx CompilerContext, stmt tree.Statement) (*Plan, *Query, er
 	}
 }
 
+// ParseWithSQLMode returns a positioned parser error for invalid SQL. Wrap only
+// that typed parser failure into MatrixOne's SQL syntax code (1064/42000);
+// preserve infrastructure, planning, and cancellation errors unchanged.
+func prepareStringParseError(ctx context.Context, err error) error {
+	var positioned mysql.PositionedErr
+	if errors.As(err, &positioned) {
+		return moerr.NewParseError(ctx, err.Error())
+	}
+	return err
+}
+
 func buildPrepare(stmt tree.Prepare, ctx CompilerContext) (*Plan, error) {
 	// Views belong to the statement currently being built. Query/DML builders
 	// replace this state, but pure DDL builders do not, so clear the previous
@@ -129,7 +142,7 @@ func buildPrepare(stmt tree.Prepare, ctx CompilerContext) (*Plan, error) {
 		}
 		stmts, err := mysql.ParseWithSQLMode(ctx.GetContext(), pstmt.Sql, v.(int64), sqlMode)
 		if err != nil {
-			return nil, err
+			return nil, prepareStringParseError(ctx.GetContext(), err)
 		}
 		defer func() {
 			for _, s := range stmts {
