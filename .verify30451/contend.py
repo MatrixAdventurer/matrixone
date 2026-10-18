@@ -1,10 +1,17 @@
-"""Run the unchanged named SQL test with an observed restart-admission competitor."""
+"""Run the named SQL test with a temporary, bounded restart-admission handshake.
+
+The handshake only orders fault injection after Close and before Start. Original
+source is restored before the normal owning-package, race and static gates.
+"""
 import fcntl
+import difflib
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -13,6 +20,33 @@ import time
 mode, log_name = sys.argv[1:]
 assert mode in {"red", "green"}
 lock_path = Path(os.environ["TMPDIR"]) / "mo-test-cluster-lifecycle.lock"
+socket_path = str(Path(os.environ["TMPDIR"]) / "restart-barrier.sock")
+source_path = Path("pkg/tests/sqlintegration/multicn/view_description_test.go")
+original_bytes = source_path.read_bytes()
+original_source = original_bytes.decode()
+anchor = "\trequire.NoError(t, cluster.Close())\n"
+assert original_source.count(anchor) == 1
+handshake = '''\tif endpoint := os.Getenv("MO30451_BARRIER"); endpoint != "" {
+\t\tconnection, err := net.DialTimeout("unix", endpoint, 5*time.Second)
+\t\trequire.NoError(t, err)
+\t\trequire.NoError(t, connection.SetDeadline(time.Now().Add(10*time.Second)))
+\t\tack := make([]byte, 1)
+\t\t_, err = io.ReadFull(connection, ack)
+\t\trequire.NoError(t, connection.Close())
+\t\trequire.NoError(t, err)
+\t\trequire.Equal(t, byte(1), ack[0])
+\t}
+'''
+instrumented_source = original_source.replace('import (\n', 'import (\n\t"io"\n\t"net"\n\t"os"\n', 1)
+instrumented_source = instrumented_source.replace(anchor, anchor + handshake)
+Path(log_name + ".instrumentation.patch").write_text("".join(difflib.unified_diff(
+    original_source.splitlines(True), instrumented_source.splitlines(True),
+    fromfile=str(source_path), tofile=str(source_path) + ".instrumented")))
+Path(log_name + ".source-sha256").write_text(hashlib.sha256(original_bytes).hexdigest())
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(socket_path)
+listener.listen(1)
+listener.settimeout(0.2)
 stop = threading.Event()
 state = {}
 errors = []
@@ -20,16 +54,20 @@ errors = []
 
 def holder():
     try:
-        with lock_path.open("a+b") as lock:
-            while not stop.is_set():
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    stop.wait(0.01)
-            if stop.is_set():
-                return
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+                break
+            except socket.timeout:
+                continue
+        else:
+            return
+        with connection, lock_path.open("a+b") as lock:
+            # Close has released the lock; a failed acquisition is inconclusive.
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             state["acquired"] = time.monotonic()
+            connection.settimeout(10)
+            connection.sendall(b"\x01")
             # Duration is the injected fault, not a synchronization shortcut.
             stop.wait(185)
             state["held_seconds"] = time.monotonic() - state["acquired"]
@@ -48,16 +86,15 @@ def duration(value):
 command = [".agents/skills/mo-dev/scripts/mo-cgo-test", "-count=1", "-vet=all",
            "-short", "-tags=matrixone_test", "-timeout=15m", "-v",
            "-run=^TestViewDescriptionTwoCN$", "./pkg/tests/sqlintegration/multicn"]
-process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, bufsize=1, start_new_session=True)
-worker = None
+process = None
+worker = threading.Thread(target=holder)
 starts = 0
 waits = []
 named_failure = named_success = deadline = False
 
 
 def terminate():
-    if process.poll() is None:
+    if process is not None and process.poll() is None:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -65,8 +102,13 @@ def terminate():
 
 
 timer = threading.Timer(1800, terminate)
-timer.start()
 try:
+    source_path.write_text(instrumented_source)
+    worker.start()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1, start_new_session=True,
+                               env={**os.environ, "MO30451_BARRIER": socket_path})
+    timer.start()
     with Path(log_name).open("w") as output:
         for line in process.stdout:
             output.write(line)
@@ -74,9 +116,6 @@ try:
             print(line, end="", flush=True)
             if "MO_UT_SETUP" in line and "phase=service-start " in line and "status=ready" in line:
                 starts += 1
-                if starts == 1:
-                    worker = threading.Thread(target=holder)
-                    worker.start()
             if "MO_UT_SETUP" in line and "phase=admission-acquire " in line and "status=ready" in line:
                 match = re.search(r"duration=([^ ]+)", line)
                 if match:
@@ -88,16 +127,21 @@ try:
 finally:
     timer.cancel()
     terminate()
-    try:
-        process.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    process.stdout.close()
+    if process is not None:
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        process.stdout.close()
     stop.set()
-    if worker is not None:
+    if worker.ident is not None:
         worker.join(timeout=10)
-        assert not worker.is_alive(), "validation lock holder did not terminate"
+    listener.close()
+    Path(socket_path).unlink(missing_ok=True)
+    source_path.write_bytes(original_bytes)
+    assert source_path.read_bytes() == original_bytes, "source restoration changed bytes"
+    assert not worker.is_alive(), "validation lock holder did not terminate"
 
 summary = dict(mode=mode, exit_code=result, starts=starts, waits=waits,
                holder=state, errors=errors)
