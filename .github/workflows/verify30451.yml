@@ -1,0 +1,92 @@
+name: Verify view query context generations
+on:
+  push:
+    branches: [verify/30451-latest-main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOWORK: 'off'
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prepare private runtime and conventional native tools
+        run: |
+          test -z "${MO_TEST_CLUSTER_ADMISSION_POOL_SIZE:-}"
+          runtime_dir=$(mktemp -d /tmp/mo30451.XXXXXX)
+          echo "TMPDIR=$runtime_dir" >> "$GITHUB_ENV"
+          mkdir -p evidence30451
+          go version
+          go env GOOS GOARCH GOHOSTOS GOHOSTARCH CGO_ENABLED
+          df -h .
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev zlib1g-dev autoconf automake libtool
+      - name: Complete native generation
+        run: make -j2 cgo
+      - name: Baseline no-contention control
+        run: |
+          .agents/skills/mo-dev/scripts/mo-cgo-test -count=1 -vet=all -short -tags=matrixone_test -timeout=15m -v -run='^TestViewDescriptionTwoCN$' ./pkg/tests/sqlintegration/multicn 2>&1 | tee evidence30451/baseline-control.log
+          grep -q -- '--- PASS: TestViewDescriptionTwoCN' evidence30451/baseline-control.log
+      - name: Baseline controlled regression
+        run: python3 .verify30451/contend.py red evidence30451/red.log
+      - name: Apply reviewed minimal fix after red proof
+        run: |
+          git apply .verify30451/fix.patch
+          git diff --check
+          git diff -- pkg/tests/sqlintegration/multicn/view_description_test.go > evidence30451/product.patch
+          sha256sum pkg/tests/sqlintegration/multicn/view_description_test.go > evidence30451/product.sha256
+          test -z "$(gofmt -l pkg/tests/sqlintegration/multicn/view_description_test.go)"
+      - name: Fixed controlled regression
+        run: python3 .verify30451/contend.py green evidence30451/green.log
+      - name: Owning package normal and vet
+        run: |
+          .agents/skills/mo-dev/scripts/mo-cgo-test -count=1 -vet=all -short -tags=matrixone_test -timeout=20m -v ./pkg/tests/sqlintegration/multicn 2>&1 | tee evidence30451/package.log
+      - name: Focused race measurement and proportional stress
+        run: |
+          .agents/skills/mo-dev/scripts/mo-cgo-test -race -count=1 -vet=all -short -tags=matrixone_test -timeout=15m -json -run='^TestViewDescriptionTwoCN$' ./pkg/tests/sqlintegration/multicn > evidence30451/race-measure.jsonl
+          python3 - <<'PY'
+          import json, math, pathlib
+          events = [json.loads(line) for line in pathlib.Path('evidence30451/race-measure.jsonl').read_text().splitlines() if line.startswith('{')]
+          passes = [x for x in events if x.get('Action') == 'pass' and x.get('Test') == 'TestViewDescriptionTwoCN']
+          assert len(passes) == 1
+          elapsed = passes[0]['Elapsed']
+          count = min(100, max(1, math.floor(30 / elapsed))) if elapsed > 0 else 100
+          pathlib.Path('evidence30451/race-count.txt').write_text(str(count))
+          print('race measurement', elapsed, 'seconds; count', count)
+          PY
+          count=$(cat evidence30451/race-count.txt)
+          .agents/skills/mo-dev/scripts/mo-cgo-test -race -count="$count" -vet=all -short -tags=matrixone_test -timeout=15m -v -run='^TestViewDescriptionTwoCN$' ./pkg/tests/sqlintegration/multicn 2>&1 | tee evidence30451/race-stress.log
+      - name: Configured incremental static analyzers
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          go install github.com/matrixorigin/linter/cmd/molint@v0.0.0-20260602145143-222a0b8adf07
+          export CGO_CFLAGS="-I$PWD/cgo -I$PWD/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$PWD/thirdparties/install/lib"
+          go vet -mod=readonly -tags=matrixone_test -vettool="$(go env GOPATH)/bin/molint" ./pkg/tests/sqlintegration/multicn
+          golangci-lint run -c .golangci.yml --build-tags=matrixone_test --new-from-rev=3c07fac240311d6f2b706674614ed6034e97ff79 ./pkg/tests/sqlintegration/multicn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: view-context-evidence-${{ github.sha }}
+          path: evidence30451/
+      - name: Remove only this run's private temporary directory
+        if: always()
+        run: |
+          case "${TMPDIR:-}" in
+            /tmp/mo30451.*) rm -rf -- "$TMPDIR" ;;
+            *) echo 'No owned temporary directory to remove' ;;
+          esac
+
