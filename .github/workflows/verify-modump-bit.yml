@@ -1,0 +1,41 @@
+name: Verify MODUMP BIT regression
+on:
+  push:
+    branches: [verify/modump-bit-30653]
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      GOWORK: off
+      GOMAXPROCS: '4'
+      GOFLAGS: '-p=4'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check regression slice allocation
+        run: go run github.com/alexkohler/prealloc@v1.0.0 -set_exit_status pkg/frontend/export_bit_test.go
+      - name: Install native build tools
+        run: python3 -m pip install --user cmake==4.4.4
+      - name: Build unchanged native dependencies
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          make cgo -j4
+      - name: Build and vet frontend
+        run: |
+          export CGO_CFLAGS="-I$PWD/cgo -I$PWD/thirdparties/install/include"
+          export CGO_LDFLAGS="-L$PWD/thirdparties/install/lib"
+          go build -mod=readonly ./pkg/frontend
+          go vet -mod=readonly ./pkg/frontend
+      - name: Focused regression
+        run: .agents/skills/mo-dev/scripts/mo-cgo-test -count=1 -timeout=120s -run '^Test(ResultSetCSVBitEncoding|SavedQueryResultBitExport)$' -v ./pkg/frontend
+      - name: Complete frontend package tests
+        run: .agents/skills/mo-dev/scripts/mo-cgo-test -count=1 -timeout=120s ./pkg/frontend
+# 由 LW 授权的 ChatGPT Personal 智能体提交。
