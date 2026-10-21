@@ -1,0 +1,107 @@
+name: Verify SDK JSON path roundtrip
+on:
+  push:
+    branches: [verify/json-paths-20261022]
+permissions:
+  contents: read
+jobs:
+  json-path:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        sqlalchemy: ['>=1.4,<1.5', '>=2.0,<2.1', '>=2.1,<3']
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:4.2.5
+        ports: ['6001:6001']
+        options: --memory=4g
+    defaults:
+      run:
+        working-directory: clients/python
+    env:
+      BASE_SHA: 3b5ccf1da2539b844b95fe33fcb85dd224c6d3be
+      CANDIDATE_SHA: 8541db1514be735cd20c6153eeff7be6fe0d62da
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: MatrixAdventurer/matrixone
+          ref: 8541db1514be735cd20c6153eeff7be6fe0d62da
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tested SDK
+        env:
+          SA_RANGE: ${{ matrix.sqlalchemy }}
+        run: |
+          python -m pip install -e '.[test]' "SQLAlchemy[asyncio]${SA_RANGE}" pytest-subtests flake8 build twine
+          python -c "import sys,sqlalchemy; print(sys.version); print(sqlalchemy.__version__)"
+          git rev-parse HEAD
+      - name: Wait for isolated MatrixOne SQL execution
+        run: |
+          python - <<'PY'
+          import time,pymysql
+          for attempt in range(90):
+              try:
+                  c=pymysql.connect(host="127.0.0.1",port=6001,user="root",password="111",autocommit=True)
+                  with c.cursor() as cur:
+                      cur.execute("SELECT json_extract('{\"ready\":1}', '$.ready')")
+                      print("SQL ready:",cur.fetchone())
+                      cur.execute("SELECT VERSION(), @@sql_mode")
+                      print("Server:",cur.fetchone())
+                      cur.execute("CREATE DATABASE IF NOT EXISTS test")
+                  c.close()
+                  break
+              except Exception as e:
+                  if attempt == 89: raise
+                  print("Waiting for SQL:",type(e).__name__)
+                  time.sleep(2)
+          PY
+      - name: Prove baseline failure and candidate online roundtrip
+        run: |
+          python - <<'PY'
+          import os,pathlib,subprocess,sys,xml.etree.ElementTree as ET
+          source="clients/python/matrixone/sqlalchemy_ext/json_functions.py"
+          target=pathlib.Path("matrixone/sqlalchemy_ext/json_functions.py")
+          test="tests/online/test_json_online.py"
+          base=subprocess.check_output(["git","show",os.environ["BASE_SHA"]+":"+source])
+          fixed=subprocess.check_output(["git","show",os.environ["CANDIDATE_SHA"]+":"+source])
+          def invoke(report):
+              return subprocess.run([sys.executable,"-m","pytest",test,"-k","json_path_quoted_key_roundtrip",
+                                     "-o","addopts=","-q","--tb=short","--junitxml="+report])
+          try:
+              target.write_bytes(base)
+              red=invoke("json-red.xml")
+              cases=ET.parse("json-red.xml").getroot().findall(".//testcase")
+              assert red.returncode == 1, red.returncode
+              assert len(cases) == 6 and all(c.find("failure") is not None for c in cases)
+              assert all(c.find("error") is None and c.find("skipped") is None for c in cases)
+              print("BASELINE RED: all six selected roundtrips failed, no errors/skips")
+          finally:
+              target.write_bytes(fixed)
+          green=invoke("json-green.xml")
+          cases=ET.parse("json-green.xml").getroot().findall(".//testcase")
+          assert green.returncode == 0, green.returncode
+          assert len(cases) == 6 and all(c.find("skipped") is None for c in cases)
+          print("CANDIDATE GREEN: six online roundtrips passed")
+          PY
+      - name: Full offline suite and fatal Python checks
+        run: |
+          python -m pytest tests/offline -o addopts='' -q --tb=short --junitxml=json-offline.xml
+          python -m flake8 matrixone --select=E9,F63,F7,F82 --show-source --statistics
+          git diff --exit-code
+      - name: Build distributions
+        run: |
+          python -m build --outdir dist
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: json-path-${{ strategy.job-index }}
+          path: |
+            clients/python/json-*.xml
+            clients/python/dist/*
+# 由 LW 授权的 ChatGPT Personal 智能体提交。
