@@ -261,10 +261,11 @@ class BaseMetadataManager:
         if not rows:
             return {}
 
-        total_objects = len(set(row._mapping['object_name'] for row in rows))
+        object_row_counts = {row._mapping['object_name']: row._mapping.get('rows_cnt', 0) for row in rows}
+        total_objects = len(object_row_counts)
         total_original_size = sum(row._mapping.get('origin_size', 0) for row in rows)
         total_compress_size = sum(row._mapping.get('compress_size', 0) for row in rows)
-        total_row_cnt = sum(row._mapping.get('rows_cnt', 0) for row in rows)
+        total_row_cnt = sum(object_row_counts.values())
         total_null_cnt = sum(row._mapping.get('null_cnt', 0) for row in rows)
 
         return {
