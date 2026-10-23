@@ -1,0 +1,108 @@
+name: SDK metadata real frontend
+on:
+  push:
+    branches: [validation/python-metadata-row-count-20261023]
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports: ['6001:6001']
+        options: --memory=4g
+    defaults:
+      run:
+        working-directory: clients/python
+    env:
+      MATRIXONE_HOST: 127.0.0.1
+      MATRIXONE_PORT: '6001'
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: '111'
+      MATRIXONE_DATABASE: mo_catalog
+      PYTHONDONTWRITEBYTECODE: '1'
+      SDK_HEAD: 955ca701ee5a05ff2ce5b598fbb013eb724cb64e
+      SDK_BASE: f8c872001603fed3d23784e1ada26f9a2d8f4fba
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Record signed validation provenance
+        run: |
+          echo '由 LW 授权的 ChatGPT Personal 智能体提交。'
+          test "$(git rev-parse HEAD^)" = "$SDK_HEAD"
+          echo "Validation head $(git rev-parse HEAD); product head $SDK_HEAD"
+          git diff --stat "$SDK_HEAD" HEAD
+          docker image inspect matrixorigin/matrixone:latest --format '{{json .RepoDigests}}'
+      - name: Install SDK and integration dependencies
+        run: python -m pip install -e '.[test]' 'SQLAlchemy[asyncio]==2.0.55' pytest-asyncio pytest-subtests
+      - name: Wait for real SQL query service
+        run: |
+          python - <<'PY'
+          import time
+          import pymysql
+          deadline = time.monotonic() + 180
+          while True:
+              try:
+                  with pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='mo_catalog', connect_timeout=2, read_timeout=5) as connection:
+                      with connection.cursor() as cursor:
+                          cursor.execute('SELECT COUNT(*) FROM mo_catalog.mo_tables')
+                          assert cursor.fetchone()[0] > 0
+                          cursor.execute('SELECT VERSION()')
+                          print('Real MatrixOne ready:', cursor.fetchone()[0])
+                  break
+              except Exception:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(1)
+          PY
+      - name: Prove original frontend regression fails
+        run: |
+          git show "$SDK_BASE:clients/python/matrixone/metadata.py" > matrixone/metadata.py
+          set +e
+          PYTHONPATH=. python -m pytest tests/online/test_metadata_row_count_online.py -o addopts='' -q --tb=short --junitxml=metadata-red.xml
+          result=$?
+          set -e
+          git restore --source="$SDK_HEAD" -- matrixone/metadata.py
+          test "$result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('metadata-red.xml').getroot().iter('testcase'))
+          assert len(cases) == 4
+          assert all(c.find('error') is None and c.find('skipped') is None for c in cases)
+          assert all(c.find('failure') is not None and 'assert 4 == 2' in ''.join(c.find('failure').itertext()) for c in cases)
+          print('RED confirmed: four original public SDK paths report 4 instead of 2')
+          PY
+      - name: Fixed frontend regression and same-instance repeat
+        run: |
+          test "$(git hash-object matrixone/metadata.py)" = "$(git rev-parse "$SDK_HEAD:clients/python/matrixone/metadata.py")"
+          PYTHONPATH=. python -m pytest tests/online/test_metadata_row_count_online.py -o addopts='' -q --tb=short --junitxml=metadata-green-1.xml
+          PYTHONPATH=. python -m pytest tests/online/test_metadata_row_count_online.py -o addopts='' -q --tb=short --junitxml=metadata-green-2.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          for path in ('metadata-green-1.xml', 'metadata-green-2.xml'):
+              cases = list(ET.parse(path).getroot().iter('testcase'))
+              assert len(cases) == 4
+              assert all(all(c.find(t) is None for t in ('error', 'failure', 'skipped')) for c in cases)
+          print('GREEN confirmed twice on the same MatrixOne instance: 4 + 4 passed, no skips')
+          PY
+          git diff --exit-code -- matrixone tests/online/test_metadata_row_count_online.py
+      - name: Collect test-owned service diagnostics
+        if: always()
+        run: |
+          container_id=$(docker ps -aq --filter ancestor=matrixorigin/matrixone:latest)
+          docker logs "$container_id" > metadata-matrixone.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metadata-real-frontend
+          path: |
+            clients/python/metadata-red.xml
+            clients/python/metadata-green-*.xml
+            clients/python/metadata-matrixone.log
