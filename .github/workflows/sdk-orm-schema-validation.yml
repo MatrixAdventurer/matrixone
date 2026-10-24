@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 4
+          fetch-depth: 5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -100,13 +100,32 @@ jobs:
               assert all(all(c.find(t) is None for t in ('error', 'failure', 'skipped')) for c in cases)
           print('GREEN confirmed twice on the same MatrixOne instance: 6 + 6 passed, no skips')
           PY
+          set +e
           PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -o addopts='' -q --tb=short --junitxml=schema-owning.xml
+          fixed_result=$?
+          set -e
+          test "$fixed_result" -eq 1
+          git show "$SDK_BASE:clients/python/matrixone/_utils.py" > matrixone/_utils.py
+          git show "$SDK_BASE:clients/python/tests/online/test_clone_builder_online.py" > tests/online/test_clone_builder_online.py
+          set +e
+          PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -o addopts='' -q --tb=short --junitxml=schema-baseline-owning.xml
+          base_result=$?
+          set -e
+          git restore --source="$SDK_HEAD" -- matrixone/_utils.py tests/online/test_clone_builder_online.py
+          test "$base_result" -eq 1
           python - <<'PY'
           import xml.etree.ElementTree as ET
           cases = list(ET.parse('schema-owning.xml').getroot().iter('testcase'))
-          assert len(cases) >= 6
-          assert all(all(c.find(t) is None for t in ('error', 'failure', 'skipped')) for c in cases)
-          print('Full owning online suite:', len(cases), 'passed, no skips')
+          baseline = list(ET.parse('schema-baseline-owning.xml').getroot().iter('testcase'))
+          assert len(cases) == 16 and len(baseline) == 11
+          for suite in (cases, baseline):
+              assert all(c.find('error') is None and c.find('skipped') is None for c in suite)
+              failures = [c for c in suite if c.find('failure') is not None]
+              assert len(failures) == 1
+              assert failures[0].attrib['classname'].endswith('TestCloneDatabaseOnline')
+              assert failures[0].attrib['name'] == 'test_clone_nonexistent_source_fails'
+              assert 'DID NOT RAISE' in ''.join(failures[0].find('failure').itertext())
+          print('Full owning suites: fixed 15 passed / 1 failure; baseline 10 passed / SAME 1 failure; no skips or new failures')
           PY
           git diff --exit-code -- matrixone tests/online/test_clone_builder_online.py
       - name: Collect test-owned service diagnostics
@@ -122,6 +141,7 @@ jobs:
             clients/python/schema-red.xml
             clients/python/schema-green-*.xml
             clients/python/schema-owning.xml
+            clients/python/schema-baseline-owning.xml
             clients/python/schema-matrixone.log
 
 
