@@ -1,0 +1,127 @@
+name: SDK ORM schemas real frontend
+on:
+  push:
+    branches: [validation/python-orm-schema-resolution-20261024]
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports: ['6001:6001']
+        options: --memory=4g
+    defaults:
+      run:
+        working-directory: clients/python
+    env:
+      MATRIXONE_HOST: 127.0.0.1
+      MATRIXONE_PORT: '6001'
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: '111'
+      MATRIXONE_DATABASE: test
+      PYTHONDONTWRITEBYTECODE: '1'
+      SDK_HEAD: e412fbde9c9543beeee386ac3eff4dd65960c788
+      SDK_BASE: 3878a13ef00fc85b1bced8a58a4f7d17df848806
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Record signed validation provenance
+        run: |
+          echo '由 LW 授权的 ChatGPT Personal 智能体提交。'
+          test "$(git rev-parse HEAD^)" = "$SDK_HEAD"
+          echo "Validation head $(git rev-parse HEAD); product head $SDK_HEAD"
+          git diff --stat "$SDK_HEAD" HEAD
+          docker image inspect matrixorigin/matrixone:latest --format '{{json .RepoDigests}}'
+      - name: Install SDK and integration dependencies
+        run: python -m pip install -e '.[test]' 'SQLAlchemy[asyncio]==2.0.55' pytest-asyncio pytest-subtests
+      - name: Wait for real SQL query service
+        run: |
+          python - <<'PY'
+          import time
+          import subprocess
+          import pymysql
+          deadline = time.monotonic() + 180
+          while True:
+              try:
+                  container = subprocess.check_output(['docker', 'ps', '-q', '--filter', 'ancestor=matrixorigin/matrixone:latest'], text=True).strip()
+                  log = subprocess.check_output(['docker', 'logs', container], stderr=subprocess.STDOUT, text=True)
+                  assert 'ISCP-Task Start' in log
+                  with pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='mo_catalog', connect_timeout=2, read_timeout=5) as connection:
+                      with connection.cursor() as cursor:
+                          cursor.execute('SELECT COUNT(*) FROM mo_catalog.mo_tables')
+                          assert cursor.fetchone()[0] > 0
+                          cursor.execute('CREATE DATABASE IF NOT EXISTS test')
+                          cursor.execute('SELECT VERSION()')
+                          print('Real MatrixOne ready:', cursor.fetchone()[0])
+                  break
+              except Exception:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(1)
+          PY
+      - name: Prove original frontend regression fails
+        run: |
+          git show "$SDK_BASE:clients/python/matrixone/_utils.py" > matrixone/_utils.py
+          set +e
+          PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -k cross_database -o addopts='' -q --tb=short --junitxml=schema-red.xml
+          result=$?
+          set -e
+          git restore --source="$SDK_HEAD" -- matrixone/_utils.py
+          test "$result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('schema-red.xml').getroot().iter('testcase'))
+          assert len(cases) == 6
+          assert all(c.find('error') is None and c.find('skipped') is None for c in cases)
+          failed = [c for c in cases if c.find('failure') is not None]
+          assert len(failed) == 4
+          assert all('string' not in c.attrib['name'] for c in failed)
+          assert all('t1' in ''.join(c.find('failure').itertext()) for c in failed)
+          print('RED confirmed: four ORM cross-database paths fail; two qualified string controls pass')
+          PY
+      - name: Fixed frontend regression and same-instance repeat
+        run: |
+          test "$(git hash-object matrixone/_utils.py)" = "$(git rev-parse "$SDK_HEAD:clients/python/matrixone/_utils.py")"
+          PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -k cross_database -o addopts='' -q --tb=short --junitxml=schema-green-1.xml
+          PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -k cross_database -o addopts='' -q --tb=short --junitxml=schema-green-2.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          for path in ('schema-green-1.xml', 'schema-green-2.xml'):
+              cases = list(ET.parse(path).getroot().iter('testcase'))
+              assert len(cases) == 6
+              assert all(all(c.find(t) is None for t in ('error', 'failure', 'skipped')) for c in cases)
+          print('GREEN confirmed twice on the same MatrixOne instance: 6 + 6 passed, no skips')
+          PY
+          PYTHONPATH=. python -m pytest tests/online/test_clone_builder_online.py -o addopts='' -q --tb=short --junitxml=schema-owning.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('schema-owning.xml').getroot().iter('testcase'))
+          assert len(cases) >= 6
+          assert all(all(c.find(t) is None for t in ('error', 'failure', 'skipped')) for c in cases)
+          print('Full owning online suite:', len(cases), 'passed, no skips')
+          PY
+          git diff --exit-code -- matrixone tests/online/test_clone_builder_online.py
+      - name: Collect test-owned service diagnostics
+        if: always()
+        run: |
+          container_id=$(docker ps -aq --filter ancestor=matrixorigin/matrixone:latest)
+          docker logs "$container_id" > schema-matrixone.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: schema-real-frontend
+          path: |
+            clients/python/schema-red.xml
+            clients/python/schema-green-*.xml
+            clients/python/schema-owning.xml
+            clients/python/schema-matrixone.log
+
+
