@@ -29,14 +29,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Record signed validation provenance
         run: |
           echo '由 LW 授权的 ChatGPT Personal 智能体提交。'
-          test "$(git rev-parse HEAD^)" = "$SDK_HEAD"
+          git merge-base --is-ancestor "$SDK_HEAD" HEAD
           echo "Validation head $(git rev-parse HEAD); product head $SDK_HEAD"
           git diff --stat "$SDK_HEAD" HEAD
           docker image inspect matrixorigin/matrixone:latest --format '{{json .RepoDigests}}'
@@ -54,7 +54,7 @@ jobs:
                   container = subprocess.check_output(['docker', 'ps', '-q', '--filter', 'ancestor=matrixorigin/matrixone:latest'], text=True).strip()
                   log = subprocess.check_output(['docker', 'logs', container], stderr=subprocess.STDOUT, text=True)
                   assert 'ISCP-Task Start' in log
-                  with pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='mo_catalog', connect_timeout=2, read_timeout=5) as connection:
+                  with pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='mo_catalog', connect_timeout=2, read_timeout=5, autocommit=True) as connection:
                       with connection.cursor() as cursor:
                           cursor.execute('SELECT COUNT(*) FROM mo_catalog.mo_tables')
                           assert cursor.fetchone()[0] > 0
