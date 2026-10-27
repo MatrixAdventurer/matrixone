@@ -11,6 +11,7 @@ zero-copy transport. PyArrow is an optional dependency, imported on first use.
 import glob
 import math
 import os
+import re
 import sys
 import tempfile
 import uuid
@@ -863,7 +864,17 @@ class AnalyticsManager:
                                 raise ValueError("Arrow staging byte limit exceeded")
                 if sink.tell() > max_staging_bytes:
                     raise ValueError("Arrow staging byte limit exceeded")
-            server_path = str(Path(server_staging_dir or directory) / Path(path).name)
+            server_directory = os.fspath(server_staging_dir or directory)
+            filename = Path(path).name
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", server_directory):
+                # Preserve URI bytes (including repeated slashes and scheme case).
+                suffix_at = min(
+                    (server_directory.find(c) for c in "?#" if c in server_directory), default=len(server_directory)
+                )
+                base, suffix = server_directory[:suffix_at], server_directory[suffix_at:]
+                server_path = base + ("" if base.endswith("/") else "/") + filename + suffix
+            else:
+                server_path = str(Path(server_directory) / filename)
             try:
                 with _write_transaction(self.engine, rows=rows) as conn:
                     if create:

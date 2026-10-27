@@ -8,6 +8,7 @@ oracle for file aggregates, not the execution backend of this SDK feature.
 """
 
 import os
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -19,6 +20,92 @@ from matrixone.analytics import AnalyticsManager, _identifier, _sql_type, _valid
 
 pa = pytest.importorskip("pyarrow", minversion="18.0.0")
 pq = pytest.importorskip("pyarrow.parquet")
+
+
+@pytest.mark.parametrize(
+    "server_directory,expected_prefix",
+    [
+        ("s3://bucket/staging", "s3://bucket/staging/"),
+        ("s3://bucket/staging/", "s3://bucket/staging/"),
+        ("stage://archive", "stage://archive/"),
+        ("S3://bucket/staging//", "S3://bucket/staging//"),
+        ("s3://bucket/staging?version=1#fragment", "s3://bucket/staging/"),
+        ("/server/mount/", "/server/mount/"),
+        ("/server/a://dir?name", "/server/a:/dir?name/"),
+        ("/", "/"),
+    ],
+)
+def test_upload_arrow_preserves_server_staging_directory(monkeypatch, tmp_path, server_directory, expected_prefix):
+    import pyarrow.ipc as ipc
+    import matrixone.analytics as module
+
+    observed = []
+    engine = object()
+
+    class Connection:
+        def exec_driver_sql(self, sql, params=None):
+            if sql.startswith("LOAD DATA"):
+                local_files = list(tmp_path.glob("mo_py_arrow_*.arrow"))
+                assert len(local_files) == 1
+                with ipc.open_file(str(local_files[0])) as reader:
+                    assert reader.read_all().to_pydict() == {"id": [1, 2]}
+                observed.append((params[0], local_files[0].name))
+
+    @contextmanager
+    def transaction(actual_engine, rows=None):
+        assert actual_engine is engine and rows == 2
+        yield Connection()
+
+    monkeypatch.setattr(module, "_write_transaction", transaction)
+    manager = AnalyticsManager(SimpleNamespace(_engine=engine))
+    assert manager.upload_arrow("target", pa.table({"id": [1, 2]}), tmp_path, server_staging_dir=server_directory) == 2
+    suffix = "?version=1#fragment" if server_directory.endswith("?version=1#fragment") else ""
+    assert observed == [(expected_prefix + observed[0][1] + suffix, observed[0][1])]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upload_arrow_default_and_pathlike_directory(monkeypatch, tmp_path):
+    import matrixone.analytics as module
+
+    observed = []
+
+    class Connection:
+        def exec_driver_sql(self, sql, params=None):
+            if sql.startswith("LOAD DATA"):
+                observed.append(params[0])
+
+    @contextmanager
+    def transaction(engine, rows=None):
+        yield Connection()
+
+    monkeypatch.setattr(module, "_write_transaction", transaction)
+    manager = AnalyticsManager(SimpleNamespace(_engine=object()))
+    for server_directory in (None, tmp_path):
+        assert manager.upload_arrow("target", pa.table({"id": [1]}), tmp_path, server_staging_dir=server_directory) == 1
+    assert len(observed) == 2
+    assert all(os.path.dirname(value) == str(tmp_path.resolve()) for value in observed)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upload_arrow_cleans_staged_file_on_load_failure(monkeypatch, tmp_path):
+    import matrixone.analytics as module
+
+    class Connection:
+        def exec_driver_sql(self, sql, params=None):
+            if sql.startswith("LOAD DATA"):
+                assert params[0].startswith("s3://bucket/staging/")
+                assert len(list(tmp_path.glob("mo_py_arrow_*.arrow"))) == 1
+                raise RuntimeError("load failed")
+
+    @contextmanager
+    def transaction(engine, rows=None):
+        yield Connection()
+
+    monkeypatch.setattr(module, "_write_transaction", transaction)
+    manager = AnalyticsManager(SimpleNamespace(_engine=object()))
+    with pytest.raises(RuntimeError, match="load failed"):
+        manager.upload_arrow("target", pa.table({"id": [1]}), tmp_path, server_staging_dir="s3://bucket/staging")
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_arrow18_json_inference_is_bounded(monkeypatch):
