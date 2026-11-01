@@ -11,13 +11,26 @@ permissions:
 
 jobs:
   native-go-regression:
+    name: MatrixOne native package regression (#${{ matrix.issue }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - issue: '31625'
+            branch: fix/31625-zonemap-owned-vectors
+            package: ./pkg/sql/colexec/external
+            test_filter: '^TestLoomZonemapHiddenColumn'
+          - issue: '31626'
+            branch: fix/31626-s3writer-close-cleanup
+            package: ./pkg/sql/colexec
+            test_filter: '^TestLoomCNS3WriterCloseReleasesBlockInfoBat'
     steps:
       - name: Check out candidate fix from user-owned fork
         uses: actions/checkout@v4
         with:
-          ref: fix/31890-localfs-unlink-error
+          ref: ${{ matrix.branch }}
           persist-credentials: false
 
       - name: Install exact Go toolchain from go.mod
@@ -42,9 +55,11 @@ jobs:
       - name: Build native MatrixOne CGo and third-party libraries
         run: make cgo NATIVE_BUILD_JOBS=2
 
-      - name: Run actual pkg/fileservice regression for issue 31890
+      - name: Run real MatrixOne package regression
+        env:
+          TEST_FILTER: ${{ matrix.test_filter }}
+          TEST_PACKAGE: ${{ matrix.package }}
         run: |
           .agents/skills/mo-dev/scripts/mo-cgo-test \
-            -count=1 -timeout=180s \
-            -run '^(TestLocalFSCreateAndRemoveFileReportsUnlinkFailure|TestLocalFSOpenFile)$' \
-            ./pkg/fileservice
+            -count=1 -timeout=180s -v \
+            -run "$TEST_FILTER" "$TEST_PACKAGE"
