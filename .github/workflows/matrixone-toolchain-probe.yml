@@ -1,0 +1,50 @@
+name: MatrixOne Toolchain and Regression Probe
+
+on:
+  push:
+    branches:
+      - ci/matrixone-toolchain-probe-20261101
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-go-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out candidate fix from user-owned fork
+        uses: actions/checkout@v4
+        with:
+          ref: fix/31890-localfs-unlink-error
+          persist-credentials: false
+
+      - name: Install exact Go toolchain from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Verify compiler and Go version
+        shell: bash
+        run: |
+          set -euxo pipefail
+          go version
+          go env GOVERSION CGO_ENABLED GOOS GOARCH
+          gcc --version | head -1
+          make --version | head -1
+          test "$(go env GOVERSION)" = 'go1.27.1'
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Build native MatrixOne CGo and third-party libraries
+        run: make cgo NATIVE_BUILD_JOBS=2
+
+      - name: Run actual pkg/fileservice regression for issue 31890
+        run: |
+          .agents/skills/mo-dev/scripts/mo-cgo-test \
+            -count=1 -timeout=180s \
+            -run '^(TestLocalFSCreateAndRemoveFileReportsUnlinkFailure|TestLocalFSOpenFile)$' \
+            ./pkg/fileservice
