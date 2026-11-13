@@ -9235,7 +9235,7 @@ func TestSleep(t *testing.T) {
 			inputs: []FunctionTestInput{
 				NewFunctionTestInput(types.T_uint64.ToType(), []uint64{1, 0, 1}, []bool{false, true, true}),
 			},
-			expect: NewFunctionTestResult(types.T_uint8.ToType(), true, []uint8{0, 0, 0}, []bool{false, true, true}),
+			expect: NewFunctionTestResult(types.T_uint8.ToType(), false, []uint8{0, 0, 0}, []bool{false, true, true}),
 		},
 	}
 
@@ -9252,20 +9252,27 @@ func TestSleep(t *testing.T) {
 			inputs: []FunctionTestInput{
 				NewFunctionTestInput(types.T_float64.ToType(), []float64{0.1, 0, 0.1}, []bool{false, true, true}),
 			},
-			expect: NewFunctionTestResult(types.T_uint8.ToType(), true, []uint8{0, 0, 0}, []bool{false, true, true}),
+			expect: NewFunctionTestResult(types.T_uint8.ToType(), false, []uint8{0, 0, 0}, []bool{false, true, true}),
 		},
 		{
-			info: "sleep float64 with null",
+			info: "sleep float64 negative and null",
 			inputs: []FunctionTestInput{
 				NewFunctionTestInput(types.T_float64.ToType(), []float64{0.1, -1.0, 0.1}, []bool{false, false, true}),
 			},
-			expect: NewFunctionTestResult(types.T_uint8.ToType(), true, []uint8{0, 0, 0}, []bool{false, true, true}),
+			expect: NewFunctionTestResult(types.T_uint8.ToType(), false, []uint8{0, 0, 0}, []bool{false, false, true}),
+		},
+		{
+			info: "sleep float64 negative only",
+			inputs: []FunctionTestInput{
+				NewFunctionTestInput(types.T_float64.ToType(), []float64{-1.0}, []bool{false}),
+			},
+			expect: NewFunctionTestResult(types.T_uint8.ToType(), false, []uint8{0}, []bool{false}),
 		},
 	}
 
 	proc := testutil.NewProcess(t)
 	defer proc.Free()
-	durations := []time.Duration{time.Second, time.Second, 300 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond}
+	durations := []time.Duration{time.Second, time.Second, 300 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond, 0}
 	for i, tc := range append(testCases, testCases2...) {
 		fn := Sleep[float64]
 		if tc.inputs[0].typ.Oid == types.T_uint64 {

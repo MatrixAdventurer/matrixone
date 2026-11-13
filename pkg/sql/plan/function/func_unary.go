@@ -11706,8 +11706,9 @@ func UTCTimestamp(ivecs []*vector.Vector, result vector.FunctionResultWrapper, p
 }
 
 func sleepSeconds(proc *process.Process, sec float64) (uint8, error) {
+	// MySQL: a negative duration does not sleep and returns 0.
 	if sec < 0 {
-		return 0, moerr.NewInvalidArg(proc.Ctx, "sleep", "input contains negative")
+		return 0, nil
 	}
 
 	sleepNano := time.Nanosecond * time.Duration(sec*1e9)
@@ -11724,16 +11725,19 @@ func Sleep[T uint64 | float64](ivecs []*vector.Vector, result vector.FunctionRes
 	ivec := vector.GenerateFunctionFixedTypeParameter[T](ivecs[0])
 	for i := uint64(0); i < uint64(length); i++ {
 		v, null := ivec.GetValue(i)
+		// MySQL: SLEEP(NULL) returns NULL and does not sleep.
 		if null {
-			return moerr.NewInvalidArg(proc.Ctx, "sleep", "input contains null")
-		} else {
-			res, err := sleepSeconds(proc, float64(v))
-			if err == nil {
-				err = rs.Append(res, false)
-			}
-			if err != nil {
+			if err := rs.Append(0, true); err != nil {
 				return err
 			}
+			continue
+		}
+		res, err := sleepSeconds(proc, float64(v))
+		if err == nil {
+			err = rs.Append(res, false)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil
