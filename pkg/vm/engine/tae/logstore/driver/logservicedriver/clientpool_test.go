@@ -97,19 +97,25 @@ func TestAppendCancellationDuringBackoff(t *testing.T) {
 	})
 }
 
+type failFirstAppendClient struct {
+	recordingPayloadClient
+}
+
+func (c *failFirstAppendClient) Append(ctx context.Context, record logservice.LogRecord) (uint64, error) {
+	psn, err := c.recordingPayloadClient.Append(ctx, record)
+	if len(c.records) == 1 {
+		return 0, moerr.NewInternalErrorNoCtx("temporary append failure")
+	}
+	return psn, err
+}
+
 func TestAppendRetriesWithLiveParent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		recorder := &recordingPayloadClient{err: moerr.NewInternalErrorNoCtx("temporary append failure")}
+		recorder := &failFirstAppendClient{}
 		client := &wrappedClient{wrapped: recorder, pool: &clientPool{cfg: &Config{MaxTimeout: time.Second}}}
-		done := make(chan error, 1)
-		go func() {
-			_, err := client.Append(context.Background(), LogEntry("skip"), nil)
-			done <- err
-		}()
-		synctest.Wait()
-		require.Len(t, recorder.records, 1)
-		recorder.err = nil
-		require.NoError(t, <-done)
+		psn, err := client.Append(context.Background(), LogEntry("skip"), nil)
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), psn)
 		require.Len(t, recorder.records, 2)
 	})
 }
