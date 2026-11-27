@@ -214,6 +214,15 @@ func getColumnTypeFromAst(
 		bounded.InternalType.DisplayWith = types.MaxVarcharLen
 		parseType = &bounded
 	}
+	if !internal && astType != nil && astType.InternalType.DisplayWith > types.MaxCharLen {
+		// MySQL rejects an over-long fixed-length column with ER_TOO_BIG_FIELDLENGTH
+		// naming the column. The shared type resolver has no column name (CAST
+		// targets have none), so report the DDL declaration here.
+		switch strings.ToLower(astType.InternalType.FamilyString) {
+		case "char", "binary":
+			return plan.Type{}, moerr.NewTooBigFieldLength(ctx, column.Name.ColNameOrigin(), types.MaxCharLen)
+		}
+	}
 	typCtx := ctx
 	if replayedEnumDomainUnchanged(column, astType, replay) {
 		// LIKE/CLONE/COPY replay of an existing column renders its stored labels

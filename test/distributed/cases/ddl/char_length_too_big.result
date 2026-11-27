@@ -1,0 +1,26 @@
+drop database if exists char_len_too_big;
+create database char_len_too_big;
+use char_len_too_big;
+create table t1 (id int primary key, code char(256));
+Column length too big for column 'code' (max = 255); use BLOB or TEXT instead
+create table t2 (id int primary key, digest binary(300));
+Column length too big for column 'digest' (max = 255); use BLOB or TEXT instead
+create table t3 (id int primary key, code char(255), digest binary(255));
+show create table t3;
+➤ Table[12,2,0]  ¦  Create Table[12,133,0]  𝄀
+t3  ¦  CREATE TABLE `t3` (
+  `id` int NOT NULL,
+  `code` char(255) DEFAULT NULL,
+  `digest` binary(255) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+)
+alter table t3 add column note char(256);
+Column length too big for column 'note' (max = 255); use BLOB or TEXT instead
+alter table t3 modify column code char(1000);
+Column length too big for column 'code' (max = 255); use BLOB or TEXT instead
+alter table t3 change column digest digest2 binary(256);
+Column length too big for column 'digest2' (max = 255); use BLOB or TEXT instead
+select cast('abc' as char(10));
+➤ cast(abc as char(10))[1,10,0]  𝄀
+abc
+drop database char_len_too_big;
