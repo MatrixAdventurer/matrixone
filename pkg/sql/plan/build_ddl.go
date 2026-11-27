@@ -3982,7 +3982,7 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 			}
 			if len(pks) > 0 {
 				if len(primaryKeys) > 0 {
-					return moerr.NewInvalidInput(ctx.GetContext(), "more than one primary key defined")
+					return moerr.NewErrMultiplePriKey(ctx.GetContext())
 				}
 				primaryKeys = pks
 			}
@@ -4148,7 +4148,7 @@ func buildTableDefs(stmt *tree.CreateTable, ctx CompilerContext, createTable *pl
 			genColIdx++
 		case *tree.PrimaryKeyIndex:
 			if len(primaryKeys) > 0 {
-				return moerr.NewInvalidInput(ctx.GetContext(), "more than one primary key defined")
+				return moerr.NewErrMultiplePriKey(ctx.GetContext())
 			}
 			pksMap := map[string]bool{}
 			for _, key := range def.KeyParts {
