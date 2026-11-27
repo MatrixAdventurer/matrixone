@@ -5396,7 +5396,7 @@ func buildUniqueIndexTable(createTable *plan.CreateTable, indexInfos []*tree.Uni
 			nameOrigin := keyPart.ColName.ColNameOrigin()
 			name := keyPart.ColName.ColName()
 			if _, ok := colMap[name]; !ok {
-				return moerr.NewInvalidInputf(ctx.GetContext(), "column '%s' is not exist", nameOrigin)
+				return moerr.NewErrKeyColumnDoesNotExist(ctx.GetContext(), nameOrigin)
 			}
 			if err := checkIndexColumnSupportabilityWithKeyFormat(
 				ctx.GetContext(), colMap[name], keyPart, "unique", tableDef.KeyFormat,
@@ -5610,7 +5610,7 @@ func checkSpatialIndexColumnSupport(ctx CompilerContext, indexInfo *tree.Index, 
 	nameOrigin := indexInfo.KeyParts[0].ColName.ColNameOrigin()
 	col, ok := colMap[name]
 	if !ok {
-		return moerr.NewInvalidInputf(ctx.GetContext(), "column '%s' is not exist", nameOrigin)
+		return moerr.NewErrKeyColumnDoesNotExist(ctx.GetContext(), nameOrigin)
 	}
 	if !isGeometryPlanType(&col.Typ) {
 		return moerr.NewNotSupported(ctx.GetContext(), fmt.Sprintf("SPATIAL INDEX can only be created on GEOMETRY column '%s'", nameOrigin))
@@ -5652,7 +5652,7 @@ func buildMasterSecondaryIndexDef(ctx CompilerContext, indexInfo *tree.Index, co
 		nameOrigin := keyPart.ColName.ColNameOrigin()
 		name := keyPart.ColName.ColName()
 		if _, ok := colMap[name]; !ok {
-			return nil, nil, moerr.NewInvalidInputf(ctx.GetContext(), "column '%s' is not exist", nameOrigin)
+			return nil, nil, moerr.NewErrKeyColumnDoesNotExist(ctx.GetContext(), nameOrigin)
 		}
 		if colMap[name].Typ.Id != int32(types.T_varchar) {
 			return nil, nil, moerr.NewNotSupported(ctx.GetContext(), fmt.Sprintf("column '%s' is not varchar type.", nameOrigin))
@@ -5797,7 +5797,7 @@ func buildRegularSecondaryIndexDef(ctx CompilerContext, indexInfo *tree.Index, c
 	for _, keyPart := range indexInfo.KeyParts {
 		name := keyPart.ColName.ColName()
 		if _, ok := colMap[name]; !ok {
-			return nil, nil, moerr.NewInvalidInputf(ctx.GetContext(), "column '%s' is not exist", keyPart.ColName.ColNameOrigin())
+			return nil, nil, moerr.NewErrKeyColumnDoesNotExist(ctx.GetContext(), keyPart.ColName.ColNameOrigin())
 		}
 		indexKind := "secondary"
 		if indexInfo.KeyType == tree.INDEX_TYPE_RTREE {

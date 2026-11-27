@@ -337,9 +337,9 @@ bread    3
 read    null
 write    null
 create table index_table_07 (col1 bigint not null auto_increment,col2 varchar(25),col3 int,col4 varchar(50),primary key (col1),unique key col10(col10),key num_id(col4));
-invalid input: column 'col10' is not exist
+Key column 'col10' doesn't exist in table
 create table index_table_07 (col1 bigint not null auto_increment,col2 varchar(25),col3 int,col4 varchar(50),primary key (col1),unique key col2(col2),key num_id(col40));
-invalid input: column 'col40' is not exist
+Key column 'col40' doesn't exist in table
 create table create_index_01 (col1 bigint primary key,col2 varchar(25),col3 float,col4 varchar(50));
 create unique index varchar_index on create_index_01(col2) comment 'create varchar index';
 insert into create_index_01 values (1,'13456789872',20.23,'5678'),(2,'13873458290',100.00,'23'),(3,NULL,100.00,'23');
@@ -612,7 +612,7 @@ col1    col2    col3    col4
 drop table create_index_19;
 create table create_index_20(col1 int,col2 char(15));
 create unique index m3_index on create_index_20(col3);
-invalid input: column 'col3' is not exist
+Key column 'col3' doesn't exist in table
 drop index char_index on create_index_20;
 Can't DROP 'char_index'; check that column/key exists
 drop account if exists unique_test_account;

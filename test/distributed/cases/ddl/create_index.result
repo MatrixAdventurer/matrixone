@@ -53,7 +53,7 @@ insert into t3 values(5,"Dora", 29,'zbcvdf');
 Duplicate entry ('\(\w{4}\,\d{2}\)'|'\d{7}\w\d{8}\w\d\w\d{5}') for key '(.*)'
 drop table t3;
 create table t4(a int, b int, key(c));
-invalid input: column 'c' is not exist
+Key column 'c' doesn't exist in table
 create table t5(a int, b int, unique key(a));
 show create table t5;
 Table    Create Table
