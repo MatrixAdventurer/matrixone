@@ -79,6 +79,40 @@ func TestIssue33109ReplaceCascadeSetNullGrandchild(t *testing.T) {
 		"REPLACE must cascade-delete the child")
 	require.True(t, queryUpdatesTable(query, "replace_fk_cg"),
 		"REPLACE must SET NULL the grandchild, not fail planning")
+	// Several cascaded child rows can match one grandchild row; the SET NULL
+	// source must be grouped so each grandchild row is updated once.
+	require.True(t, setNullSourceIsGrouped(query, "replace_fk_cg"),
+		"REPLACE SET NULL source must collapse duplicate join matches")
+}
+
+// setNullSourceIsGrouped reports whether the INNER join that scans the SET NULL
+// child table is followed by an AGG before the step's SINK.
+func setNullSourceIsGrouped(query *plan.Query, child string) bool {
+	parent := make(map[int32]int32, len(query.Nodes))
+	for _, n := range query.Nodes {
+		for _, c := range n.Children {
+			parent[c] = n.NodeId
+		}
+	}
+	for _, n := range query.Nodes {
+		if n.NodeType != plan.Node_TABLE_SCAN || n.TableDef == nil || n.TableDef.Name != child {
+			continue
+		}
+		id, ok := parent[n.NodeId]
+		if !ok || query.Nodes[id].NodeType != plan.Node_JOIN {
+			continue
+		}
+		for {
+			id, ok = parent[id]
+			if !ok || query.Nodes[id].NodeType == plan.Node_SINK {
+				break
+			}
+			if query.Nodes[id].NodeType == plan.Node_AGG {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestIssue33109DeleteCascadeSetNullGrandchildStillPlans(t *testing.T) {

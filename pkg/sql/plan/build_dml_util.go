@@ -2385,6 +2385,11 @@ func buildDeletePlans(ctx CompilerContext, builder *QueryBuilder, bindCtx *BindC
 						}, bindCtx)
 
 						if preRemapSetNull {
+							// Several cascaded parent rows can match the same
+							// child row; keep one SET NULL update per child row
+							// (the DELETE path collapses them with a positional
+							// AGG), but stay bind-tagged until remapping.
+							lastNodeId = appendTaggedDistinctForFkJoin(builder, bindCtx, lastNodeId)
 							projectTag := builder.qry.Nodes[lastNodeId].BindingTags[0]
 							lastNodeId = appendSinkNodeWithTag(builder, bindCtx, lastNodeId, projectTag)
 							if builder.preserveSinkProjection == nil {
@@ -2719,6 +2724,41 @@ func appendExcludeSelfReferCascadeRootsLocal(
 		OnList:      []*Expr{rowIDEqual},
 		ProjectList: getProjectionByLastNode(builder, inputNodeID),
 	}, bindCtx), nil
+}
+
+// appendTaggedDistinctForFkJoin is the pre-remap counterpart of
+// appendAggNodeForFkJoin: it groups by the complete bind-tagged output of
+// lastNodeId and re-exposes the groups through a tagged PROJECT, so the result
+// can still go through optimization and column remapping (#33109).
+func appendTaggedDistinctForFkJoin(builder *QueryBuilder, bindCtx *BindContext, lastNodeId int32) int32 {
+	inputTag := builder.qry.Nodes[lastNodeId].BindingTags[0]
+	groupByList := getProjectionByLastNodeWithTag(builder, lastNodeId, inputTag)
+	groupTag := builder.genNewBindTag()
+	aggTag := builder.genNewBindTag()
+	lastNodeId = builder.appendNode(&Node{
+		NodeType:    plan.Node_AGG,
+		GroupBy:     groupByList,
+		Children:    []int32{lastNodeId},
+		BindingTags: []int32{groupTag, aggTag},
+		SpillMem:    builder.aggSpillMem,
+	}, bindCtx)
+	projectList := make([]*Expr, len(groupByList))
+	for i, e := range groupByList {
+		projectList[i] = &Expr{
+			Typ: e.Typ,
+			Expr: &plan.Expr_Col{Col: &plan.ColRef{
+				RelPos: groupTag,
+				ColPos: int32(i),
+				Name:   e.GetCol().GetName(),
+			}},
+		}
+	}
+	return builder.appendNode(&Node{
+		NodeType:    plan.Node_PROJECT,
+		Children:    []int32{lastNodeId},
+		ProjectList: projectList,
+		BindingTags: []int32{builder.genNewBindTag()},
+	}, bindCtx)
 }
 
 // appendAggNodeForFkJoin append agg node. to deal with these case:
@@ -6354,6 +6394,12 @@ func buildDeleteRegularIndex(ctx CompilerContext, builder *QueryBuilder, bindCtx
 	rebuildCompositeSetNullIndex := indexBecomesNull && isSK && logicalIndexParts > 1
 	usePositionalIndexDelete := skipIndexInsert &&
 		delCtx.sourceTag == 0 && !delCtx.preserveUpdateSourceProjection
+	// REPLACE and tagged recursive FK actions are planned before createQuery
+	// remaps the graph, so their composite SET NULL rebuild must stay
+	// bind-tagged; a positional join here reaches pushdown/remapping (#33109).
+	taggedCompositeSetNullRebuild := rebuildCompositeSetNullIndex &&
+		(delCtx.sourceTag != 0 || delCtx.preserveUpdateSourceProjection) &&
+		!delCtx.isPostCreateQueryFkSetNullAction && !localCascadeDelete
 
 	uniqueObjRef, uniqueTableDef, err := builder.compCtx.ResolveIndexTableByRef(delCtx.objRef, indexdef.IndexTableName, nil, nil)
 	if err != nil {
@@ -6384,7 +6430,7 @@ func buildDeleteRegularIndex(ctx CompilerContext, builder *QueryBuilder, bindCtx
 			preserveIndexProjection = false
 			preserveActionRows = false
 		}
-		if rebuildCompositeSetNullIndex {
+		if rebuildCompositeSetNullIndex && !taggedCompositeSetNullRebuild {
 			// The replacement insert has its own action stream, so this branch only
 			// needs the positional old-row image plus the matched hidden row.
 			preserveIndexProjection = false
@@ -6453,7 +6499,7 @@ func buildDeleteRegularIndex(ctx CompilerContext, builder *QueryBuilder, bindCtx
 				lastNodeId = appendSinkScanNode(builder, bindCtx, newSourceStep)
 			}
 			delNodeInfo := makeDeleteNodeInfo(builder.compCtx, uniqueObjRef, uniqueTableDef, uniqueDeleteIdx, false, uniqueTblPkPos, uniqueTblPkTyp, delCtx.lockTable)
-			if rebuildCompositeSetNullIndex {
+			if rebuildCompositeSetNullIndex && !taggedCompositeSetNullRebuild {
 				inputProjection := getProjectionByLastNode(builder, lastNodeId)
 				lastNodeId = builder.appendNode(&Node{
 					NodeType: plan.Node_PROJECT,
@@ -6484,6 +6530,17 @@ func buildDeleteRegularIndex(ctx CompilerContext, builder *QueryBuilder, bindCtx
 				// the shared index-join source is also consumed by the delete branch
 				// and cannot provide a second independent stream here.
 				lastNodeId = appendSinkScanNode(builder, bindCtx, delCtx.sourceStep)
+				if taggedCompositeSetNullRebuild {
+					// Same pre-remap ABI as buildUpdatePlans' own source scans.
+					if builder.preserveScanProjection == nil {
+						builder.preserveScanProjection = make(map[int32]struct{})
+					}
+					builder.preserveScanProjection[lastNodeId] = struct{}{}
+					if builder.positionalSinkScans == nil {
+						builder.positionalSinkScans = make(map[int32]struct{})
+					}
+					builder.positionalSinkScans[lastNodeId] = struct{}{}
+				}
 			} else if indexSourceTag != 0 {
 				lastNodeId = builder.appendTaggedSinkScan(bindCtx, newSourceStep, indexSourceTag)
 			} else {
