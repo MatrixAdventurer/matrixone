@@ -2311,7 +2311,7 @@ func buildDeletePlans(ctx CompilerContext, builder *QueryBuilder, bindCtx *BindC
 									builder.GetContext(), "self-referencing SET NULL rowid is unavailable")
 							}
 						}
-						// Match child rows to the parent action stream before building their new images.
+						// plan : sink_scan -> join[f1 inner join c1 on f1.id = c1.fid, get c1.* & null] -> project -> sink   then + updatePlans
 						rightId := builder.appendNode(&plan.Node{
 							NodeType:    plan.Node_TABLE_SCAN,
 							Stats:       &plan.Stats{},
@@ -2326,19 +2326,10 @@ func buildDeletePlans(ctx CompilerContext, builder *QueryBuilder, bindCtx *BindC
 							}
 							builder.preserveScanProjection[rightId] = struct{}{}
 						}
-						preRemapSetNull := delCtx.skipTargetDelete || delCtx.sourceTag != 0
-						inputs := []int32{lastNodeId, rightId}
-						joinType := plan.Node_INNER
-						if preRemapSetNull {
-							// SET NULL updates each matching child once, even when several
-							// deleted parent rows match the same foreign-key prefix.
-							inputs = []int32{rightId, lastNodeId}
-							joinType = plan.Node_SEMI
-						}
 						lastNodeId = builder.appendNode(&plan.Node{
 							NodeType:    plan.Node_JOIN,
-							Children:    inputs,
-							JoinType:    joinType,
+							Children:    []int32{lastNodeId, rightId},
+							JoinType:    plan.Node_INNER,
 							OnList:      joinConds,
 							ProjectList: childForJoinProject,
 							BindingTags: func() []int32 {
@@ -2366,7 +2357,12 @@ func buildDeletePlans(ctx CompilerContext, builder *QueryBuilder, bindCtx *BindC
 						}
 						cascadeExcluded := excludedNodeID != lastNodeId
 						lastNodeId = excludedNodeID
-						// Add the NULL update values above the join.
+						// inner join cannot dealwith null expr in projectList. so we append a project node
+						// REPLACE and already-tagged recursive plans are built
+						// before createQuery remaps the graph. They must keep
+						// planner bind tags and must not introduce the
+						// positional AGG used by post-remap DELETE (#33109).
+						preRemapSetNull := delCtx.skipTargetDelete || delCtx.sourceTag != 0
 						projectProjection := getProjectionByLastNode(builder, lastNodeId)
 						if preRemapSetNull {
 							projectProjection = DeepCopyExprList(builder.qry.Nodes[lastNodeId].ProjectList)
@@ -2390,6 +2386,24 @@ func buildDeletePlans(ctx CompilerContext, builder *QueryBuilder, bindCtx *BindC
 
 						if preRemapSetNull {
 							projectTag := builder.qry.Nodes[lastNodeId].BindingTags[0]
+							// Overlapping parent matches produce identical child update images
+							// (including rowid). Group them before any UPDATE or index write.
+							groupBy := getProjectionByLastNodeWithTag(builder, lastNodeId, projectTag)
+							groupTag := builder.genNewBindTag()
+							output := getProjectionByLastNode(builder, lastNodeId)
+							for _, col := range output {
+								col.GetCol().RelPos = groupTag
+							}
+							lastNodeId = builder.appendNode(&Node{
+								NodeType: plan.Node_AGG, Children: []int32{lastNodeId},
+								GroupBy: groupBy, BindingTags: []int32{groupTag, builder.genNewBindTag()},
+								SpillMem: builder.aggSpillMem,
+							}, bindCtx)
+							projectTag = builder.genNewBindTag()
+							lastNodeId = builder.appendNode(&Node{
+								NodeType: plan.Node_PROJECT, Children: []int32{lastNodeId},
+								ProjectList: output, BindingTags: []int32{projectTag},
+							}, bindCtx)
 							lastNodeId = appendSinkNodeWithTag(builder, bindCtx, lastNodeId, projectTag)
 							if builder.preserveSinkProjection == nil {
 								builder.preserveSinkProjection = make(map[int32]struct{})
