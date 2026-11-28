@@ -71,7 +71,7 @@ func bindTestCast(t testing.TB, proc *process.Process, overload int32, source *p
 
 func TestSemanticParameterVectorsRestoresUnicodeMetadataWithoutMutatingInput(t *testing.T) {
 	mp := mpool.MustNewZero()
-	physical := vector.NewVec(types.T_varchar.ToType())
+	physical := vector.NewVec(types.T_varchar.ToType(), mp)
 	defer physical.Free(mp)
 	require.NoError(t, vector.AppendBytes(physical, []byte("A"), false, mp))
 
@@ -94,7 +94,7 @@ func evalTestTextParameter(t *testing.T, proc *process.Process, executor Express
 // prior parameter state is restored before returning.
 func evalTestTypedParameter(t *testing.T, proc *process.Process, executor ExpressionExecutor, value string, isNull bool, typed *vector.Vector, batches []*batch.Batch, mask []bool) *vector.Vector {
 	t.Helper()
-	params := vector.NewVec(types.T_text.ToType())
+	params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 	defer params.Free(proc.Mp())
 	previous := proc.DetachPrepareParams()
 	defer proc.RestorePrepareParams(previous)
@@ -236,7 +236,7 @@ func TestMemoExpressionLifecycle(t *testing.T) {
 			checkExpressionStorageAfterCleanup(t, proc)
 			input := batch.NewWithSize(1)
 			t.Cleanup(func() { input.Clean(proc.Mp()) })
-			input.Vecs[0] = vector.NewVec(types.T_int32.ToType())
+			input.Vecs[0] = vector.NewVec(types.T_int32.ToType(), proc.Mp())
 			require.NoError(t, vector.AppendFixedList(input.Vecs[0], []int32{0, 10, 20}, []bool{true, false, false}, proc.Mp()))
 			input.SetRowCount(3)
 			column := &plan.Expr{AuxId: tc.auxID, Typ: plan.Type{Id: int32(types.T_int32)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{}}}
@@ -288,7 +288,7 @@ func TestConstantExpressionMaterialization(t *testing.T) {
 	checkExpressionStorageAfterCleanup(t, proc)
 	t.Run("list_reset_transfer", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		bat.SetRowCount(10)
 		expr := &plan.Expr{
@@ -338,7 +338,7 @@ func TestConstantExpressionMaterialization(t *testing.T) {
 	})
 	t.Run("int64_reuse_duplication", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		bat.SetRowCount(10)
 		executor, err := NewExpressionExecutor(proc, makePlan2Int64ConstExprWithType(218311))
@@ -429,7 +429,7 @@ func TestConstantExpressionMaterialization(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			checkExpressionStorageAfterCleanup(t, proc)
-			bat := batch.New(nil)
+			bat := batch.NewWithSize(0)
 			t.Cleanup(func() { bat.Clean(proc.Mp()) })
 			bat.SetRowCount(tc.rows)
 			executor, err := NewExpressionExecutor(proc, tc.expr)
@@ -531,7 +531,7 @@ func TestLiteralMaterialization(t *testing.T) {
 	t.Run("list and vector", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
 		data := func() []byte {
-			vec := vector.NewVec(types.T_varchar.ToType())
+			vec := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 			defer vec.Free(proc.Mp())
 			require.NoError(t, vector.AppendStringList(vec, []string{"a", "b"}, nil, proc.Mp()))
 			data, err := vec.MarshalBinary()
@@ -596,7 +596,6 @@ func TestLiteralMaterialization(t *testing.T) {
 			{"nonliteral", &plan.Expr{Typ: plan.Type{Id: int32(types.T_varchar)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{ColPos: 0}}}, moerr.ErrInternal},
 			{"timestamp precision", &plan.Expr{Typ: plan.Type{Id: int32(types.T_timestamp), Scale: 7}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_Timestampval{Timestampval: 1}}}}, moerr.ErrTooBigPrecision},
 			{"unsupported payload", &plan.Expr{Typ: plan.Type{Id: int32(types.T_varchar)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{}}}, moerr.ErrNYI},
-			{"payload write", &plan.Expr{Typ: plan.Type{Id: int32(types.T_json)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_Sval{Sval: ""}}}}, moerr.ErrInvalidInput},
 			{"invalid source", &plan.Expr{Typ: plan.Type{Id: int32(types.T_varchar)}, Expr: &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_Sval{Sval: "b"}, StringSource: 257}}}, moerr.ErrInvalidInput},
 		} {
 			t.Run(test.name, func(t *testing.T) {
@@ -605,9 +604,6 @@ func TestLiteralMaterialization(t *testing.T) {
 				if test.later.Typ.Id == int32(types.T_timestamp) {
 					first.Expr = &plan.Expr_Lit{Lit: &plan.Literal{Value: &plan.Literal_Timestampval{Timestampval: 1}}}
 					first.Typ.Scale = 6
-				}
-				if test.later.Typ.Id == int32(types.T_json) {
-					first.Expr = &plan.Expr_Lit{Lit: &plan.Literal{Isnull: true}}
 				}
 				before := proc.Mp().CurrNB()
 				bytes, objects := proc.Mp().OnHeapOutstanding()
@@ -687,7 +683,7 @@ func TestStringSourceConsumerTotality(t *testing.T) {
 	}
 	input := batch.NewWithSize(1)
 	defer input.Clean(proc.Mp())
-	input.Vecs[0] = vector.NewVec(types.T_varchar.ToType())
+	input.Vecs[0] = vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 	for range sources {
 		require.NoError(t, vector.AppendBytes(input.Vecs[0], []byte("5"), false, proc.Mp()))
 	}
@@ -738,19 +734,14 @@ func TestStringSourceConsumerTotality(t *testing.T) {
 				}
 			}
 			if name == "numeric" {
-				defer input.Vecs[0].SetIsBin(false)
-				for _, test := range []struct {
-					binary bool
-					want   int64
-				}{{true, 53}, {false, 5}} {
-					input.Vecs[0].SetIsBin(test.binary)
-					result, err := executor.Eval(proc, []*batch.Batch{input}, []bool{true, false, true, false, true})
-					require.NoError(t, err)
-					for row := range sources {
-						require.Equal(t, row%2 != 0, result.IsNull(uint64(row)))
-						if row%2 == 0 {
-							require.Equal(t, test.want, vector.GetFixedAtNoTypeCheck[int64](result, row))
-						}
+				// A column reference is never a binary literal: its bytes
+				// convert as numeric text on the selected-row path too.
+				result, err := executor.Eval(proc, []*batch.Batch{input}, []bool{true, false, true, false, true})
+				require.NoError(t, err)
+				for row := range sources {
+					require.Equal(t, row%2 != 0, result.IsNull(uint64(row)))
+					if row%2 == 0 {
+						require.Equal(t, int64(5), vector.GetFixedAtNoTypeCheck[int64](result, row))
 					}
 				}
 			}
@@ -765,7 +756,7 @@ func TestFlowControlBranchPreparation(t *testing.T) {
 		expr := NewFunctionExpressionExecutor()
 		defer expr.Free()
 		require.NoError(t, expr.Init(proc, 3, types.T_int64.ToType()))
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		bat.SetRowCount(3)
 
 		condition, err := vector.NewConstFixed(types.T_bool.ToType(), false, 1, proc.Mp())
@@ -791,10 +782,10 @@ func TestFlowControlBranchPreparation(t *testing.T) {
 		expr := NewFunctionExpressionExecutor()
 		defer expr.Free()
 		require.NoError(t, expr.Init(proc, 3, types.T_int64.ToType()))
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		bat.SetRowCount(2)
 
-		condition := vector.NewVec(types.T_bool.ToType())
+		condition := vector.NewVec(types.T_bool.ToType(), proc.Mp())
 		expr.SetParameter(0, NewFixedVectorExpressionExecutor(proc.Mp(), false, condition))
 		require.NoError(t, vector.AppendFixedList(condition, []bool{true, false}, nil, proc.Mp()))
 		thenExecutor := &failingExpressionExecutor{}
@@ -819,7 +810,7 @@ func TestFlowControlBranchPreparation(t *testing.T) {
 		require.NoError(t, expr.Init(proc, 3, types.T_int64.ToType()))
 		nativeMode := proc.GetSessionInfo().MatrixOneNativeMode
 		defer func() { proc.GetSessionInfo().MatrixOneNativeMode = nativeMode }()
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		bat.SetRowCount(2)
 
 		condition := testutil.MakeVarlenaVector(
@@ -851,7 +842,7 @@ func TestFlowControlBranchPreparation(t *testing.T) {
 		newConditionBatch := func(values []bool) *batch.Batch {
 			bat := batch.NewWithSize(1)
 			t.Cleanup(func() { bat.Clean(proc.Mp()) })
-			bat.Vecs[0] = vector.NewVec(types.T_bool.ToType())
+			bat.Vecs[0] = vector.NewVec(types.T_bool.ToType(), proc.Mp())
 			require.NoError(t, vector.AppendFixedList(bat.Vecs[0], values, nil, proc.Mp()))
 			bat.SetRowCount(len(values))
 			return bat
@@ -898,7 +889,7 @@ func TestFlowControlFolding(t *testing.T) {
 			foldCalls++
 			return realEval(params, result, proc, length, selection)
 		}
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		bat.SetRowCount(1)
 		vec, err := expr.Eval(proc, []*batch.Batch{bat}, nil)
 		require.NoError(t, err)
@@ -969,13 +960,13 @@ func TestFlowControlFolding(t *testing.T) {
 				require.True(t, expr.folded.canFold)
 				require.Equal(t, "selected", result.GetStringAt(0))
 
-				zeroBatch := batch.New(nil)
+				zeroBatch := batch.NewWithSize(0)
 				zeroBatch.SetRowCount(0)
 				result, err = expr.Eval(proc, []*batch.Batch{zeroBatch}, nil)
 				require.NoError(t, err)
 				require.Zero(t, result.Length())
 
-				nonemptyBatch := batch.New(nil)
+				nonemptyBatch := batch.NewWithSize(0)
 				nonemptyBatch.SetRowCount(4)
 				result, err = expr.Eval(proc, []*batch.Batch{nonemptyBatch}, nil)
 				require.NoError(t, err)
@@ -1007,7 +998,7 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 			{"boolean", "true", false},
 			{"text", "text", false},
 		}
-		params := vector.NewVec(types.T_text.ToType())
+		params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 		t.Cleanup(func() { params.Free(proc.Mp()) })
 		state := proc.DetachPrepareParams()
 		t.Cleanup(func() { proc.RestorePrepareParams(state) })
@@ -1024,13 +1015,13 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 				result, err := executor.Eval(proc, nil, nil)
 				require.NoError(t, err, test.name)
 				require.Equal(t, test.value, result.GetStringAt(0), test.name)
-				require.Equal(t, test.binary, result.GetIsBin(), test.name)
+				require.Equal(t, test.binary, isBinaryLiteralResult(executor, result), test.name)
 			}()
 		}
 	})
 	t.Run("batch cardinality", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		params := vector.NewVec(types.T_varchar.ToType())
+		params := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 		t.Cleanup(func() { params.Free(proc.Mp()) })
 		state := proc.DetachPrepareParams()
 		t.Cleanup(func() { proc.RestorePrepareParams(state) })
@@ -1039,7 +1030,7 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 
 		executor := NewParamExpressionExecutor(proc.Mp(), 0, types.T_varchar.ToType())
 		t.Cleanup(executor.Free)
-		input := batch.New(nil)
+		input := batch.NewWithSize(0)
 		input.SetRowCount(4)
 
 		vec, err := executor.Eval(proc, []*batch.Batch{input}, nil)
@@ -1055,7 +1046,7 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 	})
 	t.Run("lookup failure recovery", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		params := vector.NewVec(types.T_varchar.ToType())
+		params := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 		t.Cleanup(func() { params.Free(proc.Mp()) })
 		state := proc.DetachPrepareParams()
 		t.Cleanup(func() { proc.RestorePrepareParams(state) })
@@ -1102,7 +1093,7 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 		} {
 			func() {
 				executor.ResetForNextQuery()
-				params := vector.NewVec(types.T_text.ToType())
+				params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 				defer params.Free(proc.Mp())
 				state := proc.DetachPrepareParams()
 				defer proc.RestorePrepareParams(state)
@@ -1139,7 +1130,7 @@ func TestParamExpressionExecutorLifecycle(t *testing.T) {
 		t.Run("transfer "+test.name, func(t *testing.T) {
 			checkExpressionStorageAfterCleanup(t, proc)
 
-			params := vector.NewVec(types.T_varchar.ToType())
+			params := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 			t.Cleanup(func() { params.Free(proc.Mp()) })
 			state := proc.DetachPrepareParams()
 			t.Cleanup(func() { proc.RestorePrepareParams(state) })
@@ -1222,7 +1213,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 			t.Cleanup(executor.Free)
 		}
 		require.NoError(t, err)
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		bat.SetRowCount(3)
 		for row, mask := range [][]bool{{true, false, false}, {false, true, false}} {
@@ -1267,7 +1258,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 				t.Cleanup(executor.Free)
 			}
 			require.NoError(t, err)
-			bat := batch.New(nil)
+			bat := batch.NewWithSize(0)
 			t.Cleanup(func() { bat.Clean(proc.Mp()) })
 			bat.SetRowCount(3)
 			for _, mask := range [][]bool{nil, {true, true, true}, {false, true, false}} {
@@ -1309,7 +1300,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 	}
 	t.Run("column_stays_flat", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		input := vector.NewVec(types.T_float64.ToType())
+		input := vector.NewVec(types.T_float64.ToType(), proc.Mp())
 		bat := testutil.NewBatchWithVectors([]*vector.Vector{input}, nil)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		require.NoError(t, vector.AppendFixedList(input, []float64{2.5, 3.5, -1.5}, nil, proc.Mp()))
@@ -1340,7 +1331,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 			t.Cleanup(executor.Free)
 		}
 		require.NoError(t, err)
-		bat := batch.New(nil)
+		bat := batch.NewWithSize(0)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		bat.SetRowCount(3)
 		got := evalTestFloatParameter(t, proc, executor, []*batch.Batch{bat}, nil)
@@ -1354,7 +1345,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 	})
 	t.Run("floor_consumes_parameter", func(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
-		input := vector.NewVec(types.T_varchar.ToType())
+		input := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 		bat := testutil.NewBatchWithVectors([]*vector.Vector{input}, nil)
 		t.Cleanup(func() { bat.Clean(proc.Mp()) })
 		require.NoError(t, vector.AppendBytesList(input, [][]byte{[]byte("1.23456"), []byte("-2.34561")}, nil, proc.Mp()))
@@ -1382,7 +1373,7 @@ func TestPrivateIntegerArgumentScalarLifecycle(t *testing.T) {
 func TestFlowControlPreparedParamOnPartialSelection(t *testing.T) {
 	proc := testutil.NewProcess(t, testutil.WithFileService(nil))
 	checkExpressionStorageAfterCleanup(t, proc)
-	params := vector.NewVec(types.T_text.ToType())
+	params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 	defer params.Free(proc.Mp())
 	require.NoError(t, vector.AppendBytes(params, []byte("5.5"), false, proc.Mp()))
 	proc.SetPrepareParams(params)
@@ -1631,7 +1622,7 @@ func TestVariableExpressionLifecycle(t *testing.T) {
 			}
 			require.NoError(t, err)
 
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			input.SetRowCount(2)
 			for _, step := range []struct {
 				value  any
@@ -1916,25 +1907,25 @@ func TestVariableExpressionLifecycle(t *testing.T) {
 
 		vec, err := executor.Eval(proc, nil, nil)
 		require.NoError(t, err)
-		require.True(t, vec.GetIsBin())
+		require.True(t, isBinaryLiteralResult(executor, vec))
 		require.Equal(t, "AB\x00\x00", vec.GetStringAt(0))
 
 		value, isBin = "5.0", false
 		vec, err = executor.Eval(proc, nil, nil)
 		require.NoError(t, err)
-		require.False(t, vec.GetIsBin())
+		require.False(t, isBinaryLiteralResult(executor, vec))
 		require.Equal(t, "5.0", vec.GetStringAt(0))
 
 		value = "text"
 		vec, err = executor.Eval(proc, nil, nil)
 		require.NoError(t, err)
-		require.False(t, vec.GetIsBin())
+		require.False(t, isBinaryLiteralResult(executor, vec))
 		require.Equal(t, "text", vec.GetStringAt(0))
 
 		value, isBin = "CD\x00\x00", true
 		vec, err = executor.Eval(proc, nil, nil)
 		require.NoError(t, err)
-		require.True(t, vec.GetIsBin())
+		require.True(t, isBinaryLiteralResult(executor, vec))
 		require.Equal(t, "CD\x00\x00", vec.GetStringAt(0))
 
 		// Resolver errors must stop before later metadata callbacks or publication.
@@ -1960,7 +1951,8 @@ func TestVariableExpressionLifecycle(t *testing.T) {
 				require.False(t, result.IsNull(uint64(row)))
 				require.Equal(t, "7", result.GetStringAt(row))
 			}
-			require.True(t, result.GetIsBin())
+			// The executor resolved the variable's binary flag for this value.
+			require.True(t, executor.(*VarExpressionExecutor).isBin)
 		}
 		for stage, expectedCalls := range [][2]int{{1, 0}, {1, 1}} {
 			failStage, calls = stage, [2]int{}
@@ -1984,7 +1976,7 @@ func TestVariableExpressionLifecycle(t *testing.T) {
 			require.Zero(t, objects)
 		}
 		failStage, calls = -2, [2]int{}
-		input := batch.New(nil)
+		input := batch.NewWithSize(0)
 		input.SetRowCount(3)
 		masked, err := executor.Eval(proc, []*batch.Batch{input}, []bool{false, false, false})
 		require.NoError(t, err)
@@ -2097,7 +2089,6 @@ func TestColumnExpressionLifecycle(t *testing.T) {
 			require.Equal(t, typ, *vec.GetType())
 			require.Equal(t, length, vec.Length())
 			require.True(t, vec.IsConstNull())
-			require.False(t, vec.IsGrouping())
 			for row := 0; row < length; row++ {
 				require.True(t, vec.IsNull(uint64(row)))
 			}
@@ -2133,30 +2124,6 @@ func TestColumnExpressionLifecycle(t *testing.T) {
 		executor.Free()
 		executor = nil
 		checkNull(owned, types.T_int32.ToType(), 1)
-	})
-
-	t.Run("grouping borrowed", func(t *testing.T) {
-		checkExpressionStorageAfterCleanup(t, proc)
-		bat := batch.NewWithSize(1)
-		t.Cleanup(func() { bat.Clean(proc.Mp()) })
-		bat.Vecs[0] = vector.NewRollupConst(types.T_varchar.ToType(), 3, proc.Mp())
-		bat.SetRowCount(3)
-		executor, err := NewExpressionExecutor(proc, &plan.Expr{
-			Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 0, ColPos: 0}},
-			Typ:  plan.Type{Id: int32(types.T_varchar)},
-		})
-		if executor != nil {
-			t.Cleanup(executor.Free)
-		}
-		require.NoError(t, err)
-		result, err := executor.Eval(proc, []*batch.Batch{bat}, nil)
-		require.NoError(t, err)
-		require.Same(t, bat.Vecs[0], result)
-		require.Equal(t, types.T_varchar.ToType(), *result.GetType())
-		require.Equal(t, 3, result.Length())
-		require.True(t, result.IsConstNull())
-		require.True(t, result.IsGrouping())
-		require.Equal(t, 3, result.GetGrouping().Count())
 	})
 
 	t.Run("relation error and recovery", func(t *testing.T) {
@@ -2445,7 +2412,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 	})
 
 	t.Run("skipped varlen function preserves batch length", func(t *testing.T) {
-		input := batch.New(nil)
+		input := batch.NewWithSize(0)
 		input.SetRowCount(2)
 		expr := bindTestFunction(t, proc, "concat", stringConst("a"), stringConst("b"))
 		executor, err := NewExpressionExecutor(proc, expr)
@@ -2606,7 +2573,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 				checkExpressionStorageAfterCleanup(t, proc)
 				input := batch.NewWithSize(1)
 				t.Cleanup(func() { input.Clean(proc.Mp()) })
-				input.Vecs[0] = vector.NewVec(test.inputType)
+				input.Vecs[0] = vector.NewVec(test.inputType, proc.Mp())
 				require.NoError(t, vector.AppendAny(input.Vecs[0], test.inputValue, false, proc.Mp()))
 				input.SetRowCount(1)
 				executor, err := NewExpressionExecutor(proc, test.expr)
@@ -2629,7 +2596,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
 		previousParams := proc.DetachPrepareParams()
 		defer proc.RestorePrepareParams(previousParams)
-		params := vector.NewVec(types.T_text.ToType())
+		params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 		defer params.Free(proc.Mp())
 		proc.SetPrepareParams(params)
 
@@ -2658,7 +2625,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 		checkExpressionStorageAfterCleanup(t, proc)
 		previousParams := proc.DetachPrepareParams()
 		defer proc.RestorePrepareParams(previousParams)
-		params := vector.NewVec(types.T_text.ToType())
+		params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 		defer params.Free(proc.Mp())
 		require.NoError(t, vector.AppendBytes(params, []byte("parameter"), false, proc.Mp()))
 		proc.SetPrepareParams(params)
@@ -2713,7 +2680,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 
 		eval := func(value string) string {
 			t.Helper()
-			params := vector.NewVec(types.T_text.ToType())
+			params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 			defer params.Free(proc.Mp())
 			require.NoError(t, vector.AppendBytes(params, []byte(value), false, proc.Mp()))
 			proc.SetPrepareParams(params)
@@ -2759,7 +2726,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 		require.NoError(t, err)
 		defer executor.Free()
 
-		input := batch.New(nil)
+		input := batch.NewWithSize(0)
 		input.SetRowCount(8192)
 		batches := []*batch.Batch{input}
 		result, err := executor.Eval(proc, batches, nil)
@@ -2972,7 +2939,7 @@ func TestFlowControlShortCircuitInvalidCast(t *testing.T) {
 	})
 
 	t.Run("integer in-list compaction and reset", func(t *testing.T) {
-		list := vector.NewVec(types.T_int64.ToType())
+		list := vector.NewVec(types.T_int64.ToType(), proc.Mp())
 		defer list.Free(proc.Mp())
 		for i := int64(0); i < 32; i += 2 {
 			require.NoError(t, vector.AppendFixed(list, i, false, proc.Mp()))
@@ -3285,7 +3252,7 @@ func BenchmarkConstantFlowControlExpression(b *testing.B) {
 	executor, err := NewExpressionExecutor(proc, expr)
 	require.NoError(b, err)
 	defer executor.Free()
-	input := batch.New(nil)
+	input := batch.NewWithSize(0)
 	input.SetRowCount(8192)
 	batches := []*batch.Batch{input}
 	_, err = executor.Eval(proc, batches, nil)
@@ -3431,7 +3398,7 @@ func TestPreparedCastLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, executors, 1)
 			executor := executors[0]
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			input.SetRowCount(4)
 			checkTwelve := func(result *vector.Vector) {
 				t.Helper()
@@ -3510,7 +3477,7 @@ func TestExplicitDecimalCastRowDiagnostics(t *testing.T) {
 				executor, err := NewExpressionExecutor(proc, expr)
 				require.NoError(t, err)
 				t.Cleanup(executor.Free)
-				input := batch.New(nil)
+				input := batch.NewWithSize(0)
 				t.Cleanup(func() { input.Clean(proc.Mp()) })
 				eval := func(rows int, mask []bool) *vector.Vector {
 					t.Helper()
@@ -3593,7 +3560,7 @@ func TestDecimalCastFoldingBoundaries(t *testing.T) {
 			executor, err := NewExpressionExecutor(proc, bindTestCast(t, proc, tc.overload, source, types.New(types.T_decimal64, 5, 2)))
 			require.NoError(t, err)
 			t.Cleanup(executor.Free)
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			t.Cleanup(func() { input.Clean(proc.Mp()) })
 			input.SetRowCount(2)
 			result, err := executor.Eval(proc, []*batch.Batch{input}, nil)
@@ -3632,7 +3599,7 @@ func TestDecimalCastFoldingBoundaries(t *testing.T) {
 			for _, executor := range executors {
 				t.Cleanup(executor.Free)
 			}
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			t.Cleanup(func() { input.Clean(proc.Mp()) })
 			for _, rows := range []int{2, 3} {
 				input.SetRowCount(rows)
@@ -3852,7 +3819,7 @@ func TestLastDayPersistedVarcharABI(t *testing.T) {
 	defer proc.Free()
 	input := batch.NewWithSize(1)
 	defer input.Clean(proc.Mp())
-	input.Vecs[0] = vector.NewVec(types.T_varchar.ToType())
+	input.Vecs[0] = vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 	require.NoError(t, vector.AppendStringList(input.Vecs[0], []string{"2024-02-10", "0000-00-00", "bad"}, nil, proc.Mp()))
 	input.SetRowCount(3)
 	for _, oid := range []int64{0, 1} {
@@ -3898,7 +3865,7 @@ func TestDecimalCastLifecycle(t *testing.T) {
 		targetType := types.New(types.T_decimal64, 3, 2)
 		input := batch.NewWithSize(1)
 		t.Cleanup(func() { input.Clean(proc.Mp()) })
-		input.Vecs[0] = vector.NewVec(sourceType)
+		input.Vecs[0] = vector.NewVec(sourceType, proc.Mp())
 		values := make([]types.Decimal128, 3)
 		for i, literal := range []string{"1.499999999999999999999999999999", "9.995000000000000000000000000000"} {
 			var err error
@@ -3942,7 +3909,7 @@ func TestDecimalCastLifecycle(t *testing.T) {
 			targetType := types.New(types.T_decimal128, 38, 2)
 			input := batch.NewWithSize(1)
 			t.Cleanup(func() { input.Clean(proc.Mp()) })
-			input.Vecs[0] = vector.NewVec(sourceType)
+			input.Vecs[0] = vector.NewVec(sourceType, proc.Mp())
 			require.NoError(t, vector.AppendFixedList(input.Vecs[0], []types.Decimal64{149, 200}, []bool{false, nullable}, proc.Mp()))
 			expr := bindTestFunction(t, proc, "cast",
 				&plan.Expr{Typ: plan.Type{Id: int32(sourceType.Oid), Width: sourceType.Width, Scale: sourceType.Scale}, Expr: &plan.Expr_Col{Col: &plan.ColRef{RelPos: 0, ColPos: 0}}},
@@ -4056,9 +4023,9 @@ func TestJSONStringEltEvaluatesOnlySelectedSubtree(t *testing.T) {
 	checkExpressionStorageAfterCleanup(t, proc)
 	input := batch.NewWithSize(3)
 	defer input.Clean(proc.Mp())
-	input.Vecs[0] = vector.NewVec(types.T_int64.ToType())
-	input.Vecs[1] = vector.NewVec(types.T_json.ToType())
-	input.Vecs[2] = vector.NewVec(types.T_varchar.ToType())
+	input.Vecs[0] = vector.NewVec(types.T_int64.ToType(), proc.Mp())
+	input.Vecs[1] = vector.NewVec(types.T_json.ToType(), proc.Mp())
+	input.Vecs[2] = vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 	for _, n := range []int64{1, 2} {
 		require.NoError(t, vector.AppendFixed(input.Vecs[0], n, false, proc.Mp()))
 	}
@@ -4113,8 +4080,8 @@ func TestJSONStringEltDoesNotFoldUnselectedCast(t *testing.T) {
 	checkExpressionStorageAfterCleanup(t, proc)
 	input := batch.NewWithSize(2)
 	defer input.Clean(proc.Mp())
-	input.Vecs[0] = vector.NewVec(types.T_int64.ToType())
-	input.Vecs[1] = vector.NewVec(types.T_json.ToType())
+	input.Vecs[0] = vector.NewVec(types.T_int64.ToType(), proc.Mp())
+	input.Vecs[1] = vector.NewVec(types.T_json.ToType(), proc.Mp())
 	require.NoError(t, vector.AppendFixed(input.Vecs[0], int64(1), false, proc.Mp()))
 	value, err := types.ParseStringToByteJson(`{"p":1}`)
 	require.NoError(t, err)
@@ -4164,7 +4131,7 @@ func TestBitCountDiagnosticFolding(t *testing.T) {
 				t.Cleanup(executor.Free)
 			}
 			require.NoError(t, err)
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			t.Cleanup(func() { input.Clean(proc.Mp()) })
 			input.SetRowCount(3)
 			for _, mask := range [][]bool{nil, {false, true, true}, {false, false, false}} {
@@ -4224,7 +4191,7 @@ func TestDiagnosticScalarValues(t *testing.T) {
 			executor, err := NewExpressionExecutor(proc, expr)
 			require.NoError(t, err)
 			defer executor.Free()
-			input := batch.New(nil)
+			input := batch.NewWithSize(0)
 			defer input.Clean(proc.Mp())
 			input.SetRowCount(3)
 			// Reuse without reset: a scalar output must never cache away effects.
@@ -4269,7 +4236,7 @@ func TestDiagnosticScalarValues(t *testing.T) {
 
 	conditions := batch.NewWithSize(1)
 	defer conditions.Clean(proc.Mp())
-	conditions.Vecs[0] = vector.NewVec(types.T_bool.ToType())
+	conditions.Vecs[0] = vector.NewVec(types.T_bool.ToType(), proc.Mp())
 	require.NoError(t, vector.AppendFixedList(conditions.Vecs[0], []bool{true, false, true}, nil, proc.Mp()))
 	conditions.SetRowCount(3)
 	condition := &plan.Expr{Typ: plan.Type{Id: int32(types.T_bool)}, Expr: &plan.Expr_Col{Col: &plan.ColRef{ColPos: 0}}}
@@ -4315,7 +4282,7 @@ func TestBitCountDiagnosticFoldPreparedReuse(t *testing.T) {
 		t.Cleanup(executor.Free)
 	}
 	require.NoError(t, err)
-	input := batch.New(nil)
+	input := batch.NewWithSize(0)
 	t.Cleanup(func() { input.Clean(proc.Mp()) })
 	input.SetRowCount(3)
 	for _, tc := range []struct {

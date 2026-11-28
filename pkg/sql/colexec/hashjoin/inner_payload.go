@@ -25,6 +25,10 @@ import (
 // resolved tuples across small duplicate groups instead of projecting each
 // group/row separately. No lookup result or selection escapes its JoinMap.
 func (ctr *container) probeInnerPayload(join *HashJoin, proc *process.Process, result *vm.CallResult) error {
+	resMP, err := join.resultMP(proc)
+	if err != nil {
+		return err
+	}
 	rows := ctr.leftBat.RowCount()
 	outputLimit := ctr.maxOutputRows()
 	outputRows := 0
@@ -36,18 +40,47 @@ func (ctr *container) probeInnerPayload(join *HashJoin, proc *process.Process, r
 			break
 		}
 	}
+	target := outputAreaTarget()
+	boundBuild := ctr.gatherBuildRowBytes > target/int64(outputLimit)
 	for outputRows < outputLimit {
 		count := 0
-		limit := min(hashmap.UnitLimit, outputLimit-outputRows)
+		safeEnd := outputLimit
+		if boundBuild {
+			safeEnd = max(repeatedProbeRows, ctr.innerGatherEnd(join, target, outputRows, outputLimit))
+		}
+		limit := min(hashmap.UnitLimit, safeEnd-outputRows)
+		if limit == 0 {
+			break
+		}
 		for count < limit {
 			if len(ctr.sels) > 0 {
 				if repeatPayload && repeatedProbeRows == outputRows+count {
 					// Copy each long probe value once for its complete duplicate
 					// group in this output, even when build gathering spans chunks.
 					repeats := min(len(ctr.sels), outputLimit-outputRows-count)
+					if ctr.checkProbeArea && outputRows+count > 0 && !ctr.probePayloadFits(join, target) {
+						outputLimit = outputRows + count
+						break
+					}
+					if repeats > safeEnd-outputRows-count {
+						// Flush staged rows first. Measure this group against the
+						// actual remaining space before copying its probe value.
+						if count > 0 {
+							break
+						}
+						fit, full := ctr.fitRemainingInnerGroup(join, repeats, outputRows)
+						if full {
+							repeats = fit
+							outputLimit = outputRows + fit
+							limit = min(limit, fit)
+							if fit == 0 {
+								break
+							}
+						}
+					}
 					for column, position := range join.ResultCols {
 						if position.Rel == 0 && repeatProbeArea(ctr.leftBat.Vecs[position.Pos]) {
-							if err := ctr.resBat.Vecs[column].UnionMulti(ctr.leftBat.Vecs[position.Pos], int64(ctr.lastIdx-1), repeats, proc.Mp()); err != nil {
+							if err := ctr.resBat.Vecs[column].UnionMulti(ctr.leftBat.Vecs[position.Pos], int64(ctr.lastIdx-1), repeats, resMP); err != nil {
 								return err
 							}
 						}
@@ -106,7 +139,7 @@ func (ctr *container) probeInnerPayload(join *HashJoin, proc *process.Process, r
 						if repeatPayload && repeatProbeArea(ctr.leftBat.Vecs[position.Pos]) {
 							continue
 						}
-						if err := ctr.resBat.Vecs[column].Union(ctr.leftBat.Vecs[position.Pos], left, proc.Mp()); err != nil {
+						if err := ctr.resBat.Vecs[column].Union(ctr.leftBat.Vecs[position.Pos], left, resMP); err != nil {
 							return err
 						}
 					}
@@ -132,7 +165,42 @@ func (ctr *container) probeInnerPayload(join *HashJoin, proc *process.Process, r
 }
 
 func repeatProbeArea(source *vector.Vector) bool {
-	// Dictionary UnionMulti uses its existing selected scalar copier, so keep
-	// those sources on the selected bulk path rather than adding row calls.
-	return !source.IsDictionary() && source.GetType().IsVarlen() && len(source.GetArea()) != 0
+	return source.GetType().IsVarlen() && len(source.GetArea()) != 0
+}
+
+// Non-inline probe payload is copied once when its duplicate group starts.
+func (ctr *container) probePayloadFits(join *HashJoin, target int64) bool {
+	for i, pos := range join.ResultCols {
+		if pos.Rel != 0 || !ctr.resBat.Vecs[i].GetType().IsVarlen() {
+			continue
+		}
+		bytes := vector.VarlenaPayloadSize(ctr.leftBat.Vecs[pos.Pos], ctr.lastIdx-1)
+		if bytes > target-int64(len(ctr.resBat.Vecs[i].GetArea())) {
+			return false
+		}
+	}
+	return true
+}
+
+// Use the bytes already copied so a wide, unselected build row does not
+// reduce all subsequent output batches to the worst-case row count.
+func (ctr *container) innerGatherEnd(join *HashJoin, target int64, rows, end int) int {
+	for i, pos := range join.ResultCols {
+		dst := ctr.resBat.Vecs[i]
+		if pos.Rel == 1 && dst.GetType().IsVarlen() {
+			room := target - int64(len(dst.GetArea()))
+			end = min(end, rows+int(room/ctr.gatherBuildRowBytes))
+		}
+	}
+	return end
+}
+
+func (ctr *container) fitRemainingInnerGroup(join *HashJoin, count, rows int) (int, bool) {
+	var scratch [8]outputArea
+	areas := ctr.outputAreas(scratch[:0], true)
+	for i := range areas {
+		area := &areas[i]
+		area.remaining -= int64(len(ctr.resBat.Vecs[area.column].GetArea()))
+	}
+	return ctr.fitGroupOutput(join, areas, int64(ctr.lastIdx-1), count, rows)
 }

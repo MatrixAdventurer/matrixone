@@ -225,6 +225,12 @@ func (r *ConstantFold) foldExpr(expr *plan.Expr, proc *process.Process, spatialC
 
 		return expr
 	}
+	// A typed RoutineCall is an execute-time boundary. Even a zero-argument
+	// call with only literal metadata must reach ExternalRoutineEval so that
+	// volatility, row cardinality, and the captured revision remain intact.
+	if fn.RoutineCall != nil {
+		return expr
+	}
 	overloadID := fn.Func.GetObj()
 	if r.isPrepared && IsNullIntegerArgumentCast(expr) {
 		return expr
@@ -656,7 +662,7 @@ func scalarConstantVector(expr *plan.Expr) *vector.Vector {
 	}
 	// Checked decoding borrows immutable payload bytes (including ReadNoCopy
 	// nulls); this fresh temporary owns no MPool allocations to release.
-	decoded := vector.NewVec(types.T_any.ToType())
+	decoded := vector.NewVec(types.T_any.ToType(), nil)
 	if err := decoded.UnmarshalBinary(literal.Data); err != nil {
 		return nil
 	}
@@ -1393,7 +1399,9 @@ func ContainsTruncatedFloatTextConversion(expr *plan.Expr) bool {
 					}
 				}
 				// scalarConstantVector is a borrowed view of the literal payload.
-				if vec := scalarConstantVector(source); vec != nil && !vec.IsNull(0) && !vec.GetIsBin() &&
+				// A LiteralVec payload carries no binary-literal flag; IsBin
+				// exists only on plan.Literal, checked above.
+				if vec := scalarConstantVector(source); vec != nil && !vec.IsNull(0) &&
 					function.FloatTextTruncated(vec.GetStringAt(0)) {
 					return true
 				}

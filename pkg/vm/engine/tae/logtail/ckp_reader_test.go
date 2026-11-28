@@ -189,7 +189,7 @@ func TestConsumeCheckpointWithTableID(t *testing.T) {
 	require.Equal(t, 1, dataEntries)
 	require.Equal(t, 1, tombstoneEntries)
 
-	meta := ckputil.NewMetaBatch()
+	meta := ckputil.NewMetaBatch(proc.Mp())
 	defer meta.Clean(proc.Mp())
 	for _, ranges := range [][]ckputil.TableRange{dataRanges, tombstoneRanges} {
 		for _, r := range ranges {
@@ -453,7 +453,7 @@ func makeCheckpointObjectRanges(
 	t.Helper()
 
 	ctx := context.Background()
-	data := ckputil.NewObjectListBatch()
+	data := ckputil.NewObjectListBatch(mp)
 	defer data.Clean(mp)
 
 	sinker := ckputil.NewDataSinker(
@@ -517,7 +517,7 @@ func makeCheckpointObjectRanges(
 	require.Empty(t, inMemory)
 	require.NotEmpty(t, files)
 
-	ranges := ckputil.MakeTableRangeBatch()
+	ranges := ckputil.MakeTableRangeBatch(mp)
 	defer ranges.Clean(mp)
 	require.NoError(t, ckputil.CollectTableRanges(ctx, files, ranges, mp, fs))
 
@@ -569,22 +569,30 @@ func makeCheckpointMetaFixture(
 	fs.SetAsyncUpdate(false)
 	mp := mpool.MustNewZero()
 	t.Cleanup(func() {
+		defer mpool.DeleteMPool(mp)
 		fs.Close(ctx)
 		require.Zero(t, mp.CurrNB())
-		mpool.DeleteMPool(mp)
 	})
-	bat := ckputil.NewMetaBatch()
+	return fs, writeCheckpointMetaFixture(t, fs, mp, ranges), mp
+}
+
+func writeCheckpointMetaFixture(
+	t testing.TB, fs fileservice.FileService, mp *mpool.MPool, ranges []ckputil.TableRange,
+) objectio.Location {
+	t.Helper()
+	ctx := context.Background()
+	bat := ckputil.NewMetaBatch(mp)
 	defer bat.Clean(mp)
 	for i := range ranges {
 		require.NoError(t, ranges[i].AppendTo(bat, mp))
 	}
 	writer := ioutil.ConstructWriter(0, ckputil.MetaSeqnums, -1, false, false, fs)
-	_, err = writer.WriteBatch(bat)
+	_, err := writer.WriteBatch(bat)
 	require.NoError(t, err)
 	_, _, err = writer.Sync(ctx)
 	require.NoError(t, err)
 	stats := writer.GetObjectStats()
-	return fs, stats.ObjectLocation(), mp
+	return stats.ObjectLocation()
 }
 
 func checkpointMetaRange(tableID uint64, objectType int8, ordinal int) ckputil.TableRange {
@@ -847,21 +855,21 @@ func TestCompatibilityForV12PropagatesAppendError(t *testing.T) {
 	require.NoError(t, objectio.SetObjectStatsObjectName(stats, name))
 	require.NoError(t, objectio.SetObjectStatsSize(stats, 1))
 	require.NoError(t, vector.AppendFixed(
-		source.Vecs[0].GetDownstreamVector(), int8(0), false, sourceMP))
+		source.Vecs[0], int8(0), false, sourceMP))
 	require.NoError(t, vector.AppendBytes(
-		source.Vecs[ObjectInfo_ObjectStats_Idx+2].GetDownstreamVector(),
+		source.Vecs[ObjectInfo_ObjectStats_Idx+2],
 		stats[:], false, sourceMP))
 	require.NoError(t, vector.AppendFixed(
-		source.Vecs[ObjectInfo_DBID_Idx+2].GetDownstreamVector(),
+		source.Vecs[ObjectInfo_DBID_Idx+2],
 		uint64(1), false, sourceMP))
 	require.NoError(t, vector.AppendFixed(
-		source.Vecs[ObjectInfo_TID_Idx+2].GetDownstreamVector(),
+		source.Vecs[ObjectInfo_TID_Idx+2],
 		uint64(1), false, sourceMP))
 	now := types.NextGlobalTsForTest()
 	require.NoError(t, vector.AppendFixed(
-		source.Vecs[ObjectInfo_CreateAt_Idx+2].GetDownstreamVector(), now, false, sourceMP))
+		source.Vecs[ObjectInfo_CreateAt_Idx+2], now, false, sourceMP))
 	require.NoError(t, vector.AppendFixed(
-		source.Vecs[ObjectInfo_DeleteAt_Idx+2].GetDownstreamVector(), now, false, sourceMP))
+		source.Vecs[ObjectInfo_DeleteAt_Idx+2], now, false, sourceMP))
 
 	destMP, err := mpool.NewMPool("v12-compatibility-error", 1<<20, mpool.NoFixed)
 	require.NoError(t, err)
@@ -870,7 +878,7 @@ func TestCompatibilityForV12PropagatesAppendError(t *testing.T) {
 	require.NoError(t, err)
 	defer destMP.Free(held)
 
-	dest := ckputil.MakeDataScanTableIDBatch()
+	dest := ckputil.MakeDataScanTableIDBatch(destMP)
 	defer dest.Clean(destMP)
 	err = compatibilityForV12(
 		objectio.NewBlockid(objectio.NewSegmentid(), 0, 0),
@@ -880,7 +888,7 @@ func TestCompatibilityForV12PropagatesAppendError(t *testing.T) {
 	require.True(t, moerr.IsMoErrCode(err, moerr.ErrMPoolCapacity), err)
 	require.Zero(t, dest.RowCount())
 
-	successDest := ckputil.MakeDataScanTableIDBatch()
+	successDest := ckputil.MakeDataScanTableIDBatch(sourceMP)
 	defer successDest.Clean(sourceMP)
 	err = compatibilityForV12(
 		objectio.NewBlockid(objectio.NewSegmentid(), 0, 0),
@@ -896,7 +904,7 @@ func TestCompatibilityForV12PropagatesAppendError(t *testing.T) {
 		func() {
 			failureMP, err := mpool.NewMPool("v12-compatibility-error-after-append", 1<<20, mpool.NoFixed)
 			require.NoError(t, err)
-			dest := ckputil.MakeDataScanTableIDBatch()
+			dest := ckputil.MakeDataScanTableIDBatch(failureMP)
 			defer func() {
 				dest.Clean(failureMP)
 				mpool.DeleteMPool(failureMP)
@@ -904,7 +912,7 @@ func TestCompatibilityForV12PropagatesAppendError(t *testing.T) {
 			for _, column := range columns {
 				require.NoError(t, dest.Vecs[column].PreExtend(1, failureMP))
 				if column == ckputil.TableObjectsAttr_Accout_Idx {
-					require.NoError(t, dest.Vecs[column].PreExtendBitmap(1, failureMP))
+					require.NoError(t, dest.Vecs[column].PreExtendNulls(1, failureMP))
 				}
 			}
 			available := failureMP.Cap() - failureMP.CurrNB()
@@ -940,13 +948,13 @@ func TestCompatibilityForV12PropagatesEveryAppendError(t *testing.T) {
 	name := objectio.MockObjectName()
 	require.NoError(t, objectio.SetObjectStatsObjectName(stats, name))
 	require.NoError(t, objectio.SetObjectStatsSize(stats, 1))
-	require.NoError(t, vector.AppendFixed(source.Vecs[0].GetDownstreamVector(), int8(0), false, sourceMP))
-	require.NoError(t, vector.AppendBytes(source.Vecs[ObjectInfo_ObjectStats_Idx+2].GetDownstreamVector(), stats[:], false, sourceMP))
-	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_DBID_Idx+2].GetDownstreamVector(), uint64(1), false, sourceMP))
-	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_TID_Idx+2].GetDownstreamVector(), uint64(1), false, sourceMP))
+	require.NoError(t, vector.AppendFixed(source.Vecs[0], int8(0), false, sourceMP))
+	require.NoError(t, vector.AppendBytes(source.Vecs[ObjectInfo_ObjectStats_Idx+2], stats[:], false, sourceMP))
+	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_DBID_Idx+2], uint64(1), false, sourceMP))
+	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_TID_Idx+2], uint64(1), false, sourceMP))
 	now := types.NextGlobalTsForTest()
-	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_CreateAt_Idx+2].GetDownstreamVector(), now, false, sourceMP))
-	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_DeleteAt_Idx+2].GetDownstreamVector(), now, false, sourceMP))
+	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_CreateAt_Idx+2], now, false, sourceMP))
+	require.NoError(t, vector.AppendFixed(source.Vecs[ObjectInfo_DeleteAt_Idx+2], now, false, sourceMP))
 
 	const capacity = 1 << 20
 	for _, test := range []struct {
@@ -970,7 +978,7 @@ func TestCompatibilityForV12PropagatesEveryAppendError(t *testing.T) {
 			require.NoError(t, err)
 			defer destMP.Free(held)
 
-			dest := ckputil.MakeDataScanTableIDBatch()
+			dest := ckputil.MakeDataScanTableIDBatch(destMP)
 			defer dest.Clean(destMP)
 			err = compatibilityForV12(
 				objectio.NewBlockid(objectio.NewSegmentid(), 0, 0),
@@ -1010,7 +1018,7 @@ func TestCKPObjectReaderForV12ReleasesAllLoadedBlocksOnConversionError(t *testin
 				tombstoneLocations = []objectio.Location{location}
 			}
 			reader := newCKPObjectReaderForV12(dataLocations, tombstoneLocations, fs)
-			dest := ckputil.MakeDataScanTableIDBatch()
+			dest := ckputil.MakeDataScanTableIDBatch(mp)
 			end, err := reader.Read(ctx, dest, mp)
 			require.False(t, end)
 			require.True(t, moerr.IsMoErrCode(err, moerr.ErrMPoolCapacity), err)
@@ -1019,7 +1027,7 @@ func TestCKPObjectReaderForV12ReleasesAllLoadedBlocksOnConversionError(t *testin
 			require.Zero(t, mp.CurrNB())
 
 			reader.Reset(ctx)
-			dest = ckputil.MakeDataScanTableIDBatch()
+			dest = ckputil.MakeDataScanTableIDBatch(mp)
 			end, err = reader.Read(ctx, dest, mp)
 			require.False(t, end)
 			require.NoError(t, err)
@@ -1065,15 +1073,15 @@ func makeV12DataObjectBatch(t *testing.T, mp *mpool.MPool, block int) *container
 	require.NoError(t, objectio.SetObjectStatsObjectName(stats, name))
 	require.NoError(t, objectio.SetObjectStatsSize(stats, 1))
 
-	require.NoError(t, vector.AppendFixed(bat.Vecs[0].GetDownstreamVector(), types.Rowid{}, false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[1].GetDownstreamVector(), types.TS{}, false, mp))
-	require.NoError(t, vector.AppendBytes(bat.Vecs[2].GetDownstreamVector(), stats[:], false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[3].GetDownstreamVector(), uint64(1), false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[4].GetDownstreamVector(), uint64(1), false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[5].GetDownstreamVector(), types.TS{}, false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[6].GetDownstreamVector(), types.TS{}, false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[7].GetDownstreamVector(), types.TS{}, false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[8].GetDownstreamVector(), types.TS{}, false, mp))
-	require.NoError(t, vector.AppendFixed(bat.Vecs[9].GetDownstreamVector(), types.TS{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[0], types.Rowid{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[1], types.TS{}, false, mp))
+	require.NoError(t, vector.AppendBytes(bat.Vecs[2], stats[:], false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[3], uint64(1), false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[4], uint64(1), false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[5], types.TS{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[6], types.TS{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[7], types.TS{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[8], types.TS{}, false, mp))
+	require.NoError(t, vector.AppendFixed(bat.Vecs[9], types.TS{}, false, mp))
 	return bat
 }

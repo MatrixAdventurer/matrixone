@@ -160,7 +160,7 @@ func TestDecimal256ConstantFoldBoundaries(t *testing.T) {
 						require.NoError(t, decoded.Unmarshal(encoded))
 						got = decoded
 					}
-					input := batch.New(nil)
+					input := batch.NewWithSize(0)
 					defer input.Clean(proc.Mp())
 					input.SetRowCount(3)
 					result, free, err := colexec.GetReadonlyResultFromExpression(proc, got, []*batch.Batch{input})
@@ -701,7 +701,7 @@ func TestConstantFoldPreservesExplicitCastSource(t *testing.T) {
 
 func TestMakeInExprRuntimePayloadKeepsExpressionSource(t *testing.T) {
 	proc := testutil.NewProcess(t)
-	scanKeys := vector.NewVec(types.T_varchar.ToType())
+	scanKeys := vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 	require.NoError(t, vector.AppendBytes(scanKeys, []byte("runtime-key"), false, proc.Mp()))
 	data, err := scanKeys.MarshalBinary()
 	require.NoError(t, err)

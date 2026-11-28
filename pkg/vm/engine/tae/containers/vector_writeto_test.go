@@ -31,7 +31,7 @@ func TestVectorWrapper_WriteTo_DirectWrite(t *testing.T) {
 	mp := mpool.MustNewZero()
 
 	// Create a simple vector
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	err := vector.AppendFixed(vec, int32(1), false, mp)
@@ -39,11 +39,11 @@ func TestVectorWrapper_WriteTo_DirectWrite(t *testing.T) {
 	err = vector.AppendFixed(vec, int32(2), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test 1: Write to bytes.Buffer (should use direct write optimization)
 	var buf bytes.Buffer
-	n, err := wrapper.WriteTo(&buf)
+	n, err := writeVector(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -52,7 +52,7 @@ func TestVectorWrapper_WriteTo_DirectWrite(t *testing.T) {
 
 	// Test 2: Write again to verify consistency
 	var buf2 bytes.Buffer
-	n2, err := wrapper.WriteTo(&buf2)
+	n2, err := writeVector(wrapper, &buf2)
 	require.NoError(t, err)
 	assert.Equal(t, n, n2, "should produce same size")
 	assert.Equal(t, data1, buf2.Bytes(), "should produce same data")
@@ -62,7 +62,7 @@ func TestVectorWrapper_WriteTo_DirectWrite(t *testing.T) {
 func TestVectorWrapper_WriteTo_SizeHeader(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int64.ToType())
+	vec := vector.NewVec(types.T_int64.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 10; i++ {
@@ -70,10 +70,10 @@ func TestVectorWrapper_WriteTo_SizeHeader(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	var buf bytes.Buffer
-	n, err := wrapper.WriteTo(&buf)
+	n, err := writeVector(wrapper, &buf)
 	require.NoError(t, err)
 
 	data := buf.Bytes()
@@ -89,7 +89,7 @@ func TestVectorWrapper_WriteTo_SizeHeader(t *testing.T) {
 func TestVectorWrapper_WriteTo_NoIntermediateAllocation(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 100; i++ {
@@ -97,13 +97,13 @@ func TestVectorWrapper_WriteTo_NoIntermediateAllocation(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Write to bytes.Buffer multiple times
 	// If optimization works, no intermediate buffer should be allocated
 	for i := 0; i < 10; i++ {
 		var buf bytes.Buffer
-		n, err := wrapper.WriteTo(&buf)
+		n, err := writeVector(wrapper, &buf)
 		require.NoError(t, err)
 		assert.Greater(t, n, int64(0))
 	}
@@ -113,17 +113,17 @@ func TestVectorWrapper_WriteTo_NoIntermediateAllocation(t *testing.T) {
 func TestVectorWrapper_WriteToV1_DirectWrite(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	err := vector.AppendFixed(vec, int32(1), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test WriteToV1 with bytes.Buffer
 	var buf bytes.Buffer
-	n, err := wrapper.WriteToV1(&buf)
+	n, err := writeVectorV1(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -146,7 +146,7 @@ func (e *errorWriter) Write(p []byte) (n int, err error) {
 func TestVectorWrapper_WriteTo_Fallback(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 10; i++ {
@@ -154,11 +154,11 @@ func TestVectorWrapper_WriteTo_Fallback(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test with a custom writer (not bytes.Buffer)
 	var buf bytes.Buffer
-	n, err := wrapper.WriteTo(&buf)
+	n, err := writeVector(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -175,17 +175,17 @@ func TestVectorWrapper_WriteTo_Fallback(t *testing.T) {
 func TestVectorWrapper_WriteTo_Error(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	err := vector.AppendFixed(vec, int32(1), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test with error writer (fallback path)
 	errorW := &errorWriter{}
-	n, err := wrapper.WriteTo(errorW)
+	n, err := writeVector(wrapper, errorW)
 	assert.Error(t, err)
 	assert.Equal(t, int64(0), n)
 	assert.Contains(t, err.Error(), "write error")
@@ -195,7 +195,7 @@ func TestVectorWrapper_WriteTo_Error(t *testing.T) {
 func TestVectorWrapper_WriteTo_BufferGrow(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	// Create a large vector to trigger buffer growth
@@ -204,11 +204,11 @@ func TestVectorWrapper_WriteTo_BufferGrow(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Create buffer with small initial capacity
 	buf := bytes.NewBuffer(make([]byte, 0, 10))
-	n, err := wrapper.WriteTo(buf)
+	n, err := writeVector(wrapper, buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -224,17 +224,17 @@ func TestVectorWrapper_WriteTo_BufferGrow(t *testing.T) {
 func TestVectorWrapper_WriteTo_SmallEstimatedSize(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	// Create a small vector (estimated size will be < 256)
 	err := vector.AppendFixed(vec, int32(1), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	var buf bytes.Buffer
-	n, err := wrapper.WriteTo(&buf)
+	n, err := writeVector(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -246,7 +246,7 @@ func TestVectorWrapper_WriteTo_SmallEstimatedSize(t *testing.T) {
 func TestVectorWrapper_WriteToV1_Fallback(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 10; i++ {
@@ -254,11 +254,11 @@ func TestVectorWrapper_WriteToV1_Fallback(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test with a custom writer (not bytes.Buffer)
 	var buf bytes.Buffer
-	n, err := wrapper.WriteToV1(&buf)
+	n, err := writeVectorV1(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -275,17 +275,17 @@ func TestVectorWrapper_WriteToV1_Fallback(t *testing.T) {
 func TestVectorWrapper_WriteToV1_Error(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	err := vector.AppendFixed(vec, int32(1), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Test with error writer (fallback path)
 	errorW := &errorWriter{}
-	n, err := wrapper.WriteToV1(errorW)
+	n, err := writeVectorV1(wrapper, errorW)
 	assert.Error(t, err)
 	assert.Equal(t, int64(0), n)
 	assert.Contains(t, err.Error(), "write error")
@@ -295,7 +295,7 @@ func TestVectorWrapper_WriteToV1_Error(t *testing.T) {
 func TestVectorWrapper_WriteToV1_BufferGrow(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	// Create a large vector to trigger buffer growth
@@ -304,11 +304,11 @@ func TestVectorWrapper_WriteToV1_BufferGrow(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Create buffer with small initial capacity
 	buf := bytes.NewBuffer(make([]byte, 0, 10))
-	n, err := wrapper.WriteToV1(buf)
+	n, err := writeVectorV1(wrapper, buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -324,17 +324,17 @@ func TestVectorWrapper_WriteToV1_BufferGrow(t *testing.T) {
 func TestVectorWrapper_WriteToV1_SmallEstimatedSize(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	// Create a small vector (estimated size will be < 256)
 	err := vector.AppendFixed(vec, int32(1), false, mp)
 	require.NoError(t, err)
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	var buf bytes.Buffer
-	n, err := wrapper.WriteToV1(&buf)
+	n, err := writeVectorV1(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -346,7 +346,7 @@ func TestVectorWrapper_WriteToV1_SmallEstimatedSize(t *testing.T) {
 func TestVectorWrapper_WriteTo_NoGrowNeeded(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 10; i++ {
@@ -354,11 +354,11 @@ func TestVectorWrapper_WriteTo_NoGrowNeeded(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Create buffer with large initial capacity (no grow needed)
 	buf := bytes.NewBuffer(make([]byte, 0, 10000))
-	n, err := wrapper.WriteTo(buf)
+	n, err := writeVector(wrapper, buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -370,7 +370,7 @@ func TestVectorWrapper_WriteTo_NoGrowNeeded(t *testing.T) {
 func TestVectorWrapper_WriteToV1_NoGrowNeeded(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	for i := 0; i < 10; i++ {
@@ -378,11 +378,11 @@ func TestVectorWrapper_WriteToV1_NoGrowNeeded(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	// Create buffer with large initial capacity (no grow needed)
 	buf := bytes.NewBuffer(make([]byte, 0, 10000))
-	n, err := wrapper.WriteToV1(buf)
+	n, err := writeVectorV1(wrapper, buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -394,7 +394,7 @@ func TestVectorWrapper_WriteToV1_NoGrowNeeded(t *testing.T) {
 func TestVectorWrapper_WriteToV1_WithNulls(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	vec := vector.NewVec(types.T_int32.ToType())
+	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)
 
 	// Add some values with nulls
@@ -404,10 +404,10 @@ func TestVectorWrapper_WriteToV1_WithNulls(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wrapper := &vectorWrapper{wrapped: vec}
+	wrapper := vec
 
 	var buf bytes.Buffer
-	n, err := wrapper.WriteToV1(&buf)
+	n, err := writeVectorV1(wrapper, &buf)
 	require.NoError(t, err)
 	assert.Greater(t, n, int64(0))
 
@@ -431,7 +431,7 @@ func TestVectorWrapper_WriteToV1_DifferentTypes(t *testing.T) {
 	}
 
 	for _, typ := range testTypes {
-		vec := vector.NewVec(typ)
+		vec := vector.NewVec(typ, mp)
 		defer vec.Free(mp)
 
 		// Add some data
@@ -452,10 +452,10 @@ func TestVectorWrapper_WriteToV1_DifferentTypes(t *testing.T) {
 			}
 		}
 
-		wrapper := &vectorWrapper{wrapped: vec}
+		wrapper := vec
 
 		var buf bytes.Buffer
-		n, err := wrapper.WriteToV1(&buf)
+		n, err := writeVectorV1(wrapper, &buf)
 		require.NoError(t, err, "WriteToV1 should succeed for type %s", typ.String())
 		assert.Greater(t, n, int64(0))
 

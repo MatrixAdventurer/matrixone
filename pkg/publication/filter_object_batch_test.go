@@ -53,10 +53,10 @@ func TestConvertObjectToBatchSupportsChunkedColumnExtents(t *testing.T) {
 	writer.SetChunkedColumnPolicy(func() bool { return true })
 	writer.SetAppendable()
 	source := batch.NewWithSize(4)
-	source.Vecs[0] = vector.NewVec(types.T_varchar.ToType())
-	source.Vecs[1] = vector.NewVec(types.T_Rowid.ToType())
-	source.Vecs[2] = vector.NewVec(types.T_TS.ToType())
-	source.Vecs[3] = vector.NewVec(types.T_bool.ToType())
+	source.Vecs[0] = vector.NewVec(types.T_varchar.ToType(), mp)
+	source.Vecs[1] = vector.NewVec(types.T_Rowid.ToType(), mp)
+	source.Vecs[2] = vector.NewVec(types.T_TS.ToType(), mp)
+	source.Vecs[3] = vector.NewVec(types.T_bool.ToType(), mp)
 	payload := []byte(strings.Repeat("p", 3<<20))
 	var blk types.Blockid
 	for row := 0; row < 3; row++ {
@@ -103,7 +103,7 @@ func TestConvertObjectToBatchSupportsChunkedColumnExtents(t *testing.T) {
 	require.NoError(t, err)
 	defer converted.Close()
 	require.Equal(t, 3, converted.Length())
-	require.Len(t, converted.GetVectorByName("tmp_0").ShallowGet(0).([]byte), len(payload))
+	require.Len(t, converted.GetVectorByName("tmp_0").GetBytesAt(0), len(payload))
 
 	filtered, offsets, err := filterBatchBySnapshotTS(
 		ctx, converted, types.BuildTS(200, 0), mp,
@@ -152,7 +152,7 @@ func TestRewriteTombstoneRowidsBatch_NilAObjectMap(t *testing.T) {
 	require.NoError(t, err)
 	defer mp.Free(nil)
 
-	rowidVec := vector.NewVec(types.T_Rowid.ToType())
+	rowidVec := vector.NewVec(types.T_Rowid.ToType(), mp)
 	rid := types.BuildTestRowid(1, 2)
 	require.NoError(t, vector.AppendFixed(rowidVec, rid, false, mp))
 
@@ -177,7 +177,7 @@ func TestRewriteTombstoneRowidsBatch_WrongType(t *testing.T) {
 	require.NoError(t, err)
 	defer mp.Free(nil)
 
-	intVec := vector.NewVec(types.T_int32.ToType())
+	intVec := vector.NewVec(types.T_int32.ToType(), mp)
 	require.NoError(t, vector.AppendFixed(intVec, int32(1), false, mp))
 
 	bat := &batch.Batch{Vecs: []*vector.Vector{intVec}}
@@ -201,7 +201,7 @@ func TestRewriteTombstoneRowidsBatch_WithMapping(t *testing.T) {
 	// Create a rowid referencing the upstream object
 	rid := types.NewRowIDWithObjectIDBlkNumAndRowID(upstreamObjID, 0, 42)
 
-	rowidVec := vector.NewVec(types.T_Rowid.ToType())
+	rowidVec := vector.NewVec(types.T_Rowid.ToType(), mp)
 	require.NoError(t, vector.AppendFixed(rowidVec, rid, false, mp))
 
 	bat := &batch.Batch{Vecs: []*vector.Vector{rowidVec}}
@@ -252,8 +252,8 @@ func TestFilterBatchBySnapshotTS_NoDeletes(t *testing.T) {
 	tsVec := containers.MakeVector(types.T_TS.ToType(), mp)
 	ts1 := types.BuildTS(100, 0)
 	ts2 := types.BuildTS(200, 0)
-	tsVec.Append(ts1, false)
-	tsVec.Append(ts2, false)
+	tsVec.MustAppendValue(ts1, false)
+	tsVec.MustAppendValue(ts2, false)
 	bat.AddVector(objectio.TombstoneAttr_CommitTs_Attr, tsVec)
 
 	snapshotTS := types.BuildTS(300, 0)
@@ -274,14 +274,14 @@ func TestFilterBatchBySnapshotTS_WithDeletes(t *testing.T) {
 	ts1 := types.BuildTS(100, 0)
 	ts2 := types.BuildTS(500, 0) // > snapshotTS, should be filtered
 	ts3 := types.BuildTS(200, 0)
-	tsVec.Append(ts1, false)
-	tsVec.Append(ts2, false)
-	tsVec.Append(ts3, false)
+	tsVec.MustAppendValue(ts1, false)
+	tsVec.MustAppendValue(ts2, false)
+	tsVec.MustAppendValue(ts3, false)
 	bat.AddVector(objectio.TombstoneAttr_CommitTs_Attr, tsVec)
 	abortVec := containers.MakeVector(types.T_bool.ToType(), mp)
-	abortVec.Append(false, false)
-	abortVec.Append(false, false)
-	abortVec.Append(true, false) // visible commit TS, but rolled back
+	abortVec.MustAppendValue(false, false)
+	abortVec.MustAppendValue(false, false)
+	abortVec.MustAppendValue(true, false) // visible commit TS, but rolled back
 	bat.AddVector(objectio.TombstoneAttr_Abort_Attr, abortVec)
 
 	snapshotTS := types.BuildTS(300, 0)
@@ -301,8 +301,8 @@ func TestFilterBatchBySnapshotTS_AllDeleted(t *testing.T) {
 	tsVec := containers.MakeVector(types.T_TS.ToType(), mp)
 	ts1 := types.BuildTS(500, 0)
 	ts2 := types.BuildTS(600, 0)
-	tsVec.Append(ts1, false)
-	tsVec.Append(ts2, false)
+	tsVec.MustAppendValue(ts1, false)
+	tsVec.MustAppendValue(ts2, false)
 	bat.AddVector(objectio.TombstoneAttr_CommitTs_Attr, tsVec)
 
 	snapshotTS := types.BuildTS(100, 0)
@@ -323,9 +323,9 @@ func TestPublicationOffsetMapPreservesInteriorAbortProvenance(t *testing.T) {
 	commitTSVec := containers.MakeVector(types.T_TS.ToType(), mp)
 	abortVec := containers.MakeVector(types.T_bool.ToType(), mp)
 	for row, key := range []int32{20, 99, 10} {
-		pkVec.Append(key, false)
-		commitTSVec.Append(types.BuildTS(1, 0), false)
-		abortVec.Append(row == 1, false)
+		pkVec.MustAppendValue(key, false)
+		commitTSVec.MustAppendValue(types.BuildTS(1, 0), false)
+		abortVec.MustAppendValue(row == 1, false)
 	}
 	bat.AddVector("pk", pkVec)
 	bat.AddVector(objectio.TombstoneAttr_CommitTs_Attr, commitTSVec)
@@ -355,7 +355,7 @@ func TestPublicationOffsetMapPreservesInteriorAbortProvenance(t *testing.T) {
 
 	upstreamObjID := types.NewObjectid()
 	deleteRowID := types.NewRowIDWithObjectIDBlkNumAndRowID(upstreamObjID, 0, 2)
-	rowIDVec := vector.NewVec(types.T_Rowid.ToType())
+	rowIDVec := vector.NewVec(types.T_Rowid.ToType(), mp)
 	require.NoError(t, vector.AppendFixed(rowIDVec, deleteRowID, false, mp))
 	tombstoneBatch := &batch.Batch{Vecs: []*vector.Vector{rowIDVec}}
 	tombstoneBatch.SetRowCount(1)
@@ -410,7 +410,7 @@ func TestRewriteTombstoneRowids_NilAObjectMap(t *testing.T) {
 	bat := containers.NewBatch()
 	rowidVec := containers.MakeVector(types.T_Rowid.ToType(), mp)
 	rid := types.BuildTestRowid(1, 2)
-	rowidVec.Append(rid, false)
+	rowidVec.MustAppendValue(rid, false)
 	bat.AddVector("rowid", rowidVec)
 
 	err = rewriteTombstoneRowids(context.Background(), bat, nil, mp)
@@ -440,7 +440,7 @@ func TestRewriteTombstoneRowids_WrongType(t *testing.T) {
 
 	bat := containers.NewBatch()
 	intVec := containers.MakeVector(types.T_int32.ToType(), mp)
-	intVec.Append(int32(1), false)
+	intVec.MustAppendValue(int32(1), false)
 	bat.AddVector("col", intVec)
 	amap := NewAObjectMap()
 
@@ -460,7 +460,7 @@ func TestRewriteTombstoneRowids_WithMapping(t *testing.T) {
 
 	bat := containers.NewBatch()
 	rowidVec := containers.MakeVector(types.T_Rowid.ToType(), mp)
-	rowidVec.Append(rid, false)
+	rowidVec.MustAppendValue(rid, false)
 	bat.AddVector("rowid", rowidVec)
 
 	downstreamObjID := types.NewObjectid()
@@ -477,7 +477,7 @@ func TestRewriteTombstoneRowids_WithMapping(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify rewrite
-	rowids := vector.MustFixedColWithTypeCheck[types.Rowid](rowidVec.GetDownstreamVector())
+	rowids := vector.MustFixedColWithTypeCheck[types.Rowid](rowidVec)
 	rewrittenObjID := rowids[0].BorrowObjectID()
 	assert.Equal(t, downstreamObjID.Segment(), rewrittenObjID.Segment())
 	assert.Equal(t, uint32(20), rowids[0].GetRowOffset())
@@ -494,7 +494,7 @@ func TestRewriteTombstoneRowids_NoMatchingMapping(t *testing.T) {
 
 	bat := containers.NewBatch()
 	rowidVec := containers.MakeVector(types.T_Rowid.ToType(), mp)
-	rowidVec.Append(rid, false)
+	rowidVec.MustAppendValue(rid, false)
 	bat.AddVector("rowid", rowidVec)
 
 	// AObjectMap with a different object ID
@@ -508,7 +508,7 @@ func TestRewriteTombstoneRowids_NoMatchingMapping(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Rowid should be unchanged
-	rowids := vector.MustFixedColWithTypeCheck[types.Rowid](rowidVec.GetDownstreamVector())
+	rowids := vector.MustFixedColWithTypeCheck[types.Rowid](rowidVec)
 	assert.Equal(t, upstreamObjID.String(), rowids[0].BorrowObjectID().String())
 	bat.Close()
 }

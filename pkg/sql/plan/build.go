@@ -40,6 +40,7 @@ func BindIndexMaintenanceView(ctx CompilerContext, stmt *tree.Select) error {
 		return moerr.NewInvalidInputNoCtx("invalid index maintenance view probe")
 	}
 	builder := NewQueryBuilder(plan.Query_SELECT, ctx, false, true)
+	builder.zeroScalarPolicy = zeroScalarValidateOnly
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
 		bindCtx.snapshot = ctx.GetSnapshot()
@@ -81,7 +82,7 @@ func bindAndOptimizeSelectQueryWithValidator(
 	validate func(*Query) error,
 ) (*Plan, error) {
 	return bindAndOptimizeSelectQueryWithValidatorAndCapture(
-		stmtType, ctx, stmt, isPrepareStmt, skipStats, validate, nil, false, "", nil,
+		stmtType, ctx, stmt, isPrepareStmt, skipStats, validate, nil, false, "", zeroScalarExecutable, nil,
 	)
 }
 
@@ -95,6 +96,7 @@ func bindAndOptimizeSelectQueryWithValidatorAndCapture(
 	capture func(*BindContext),
 	restoreViewMySQLSpecialTypes bool,
 	persistedViewTarget string,
+	zeroScalarPolicy zeroScalarPolicy,
 	planningInput *PlanningInput,
 ) (*Plan, error) {
 	start := time.Now()
@@ -113,6 +115,7 @@ func bindAndOptimizeSelectQueryWithValidatorAndCapture(
 		ctx, stmt, builder.isReusablePlan(),
 	)
 	bindCtx := NewBindContext(builder, nil)
+	builder.zeroScalarPolicy = zeroScalarPolicy
 	bindCtx.restoreViewMySQLSpecialTypes = restoreViewMySQLSpecialTypes
 	if capture != nil {
 		bindCtx.captureViewStarExpansion = true
@@ -224,6 +227,7 @@ func bindAndOptimizeInsertQuery(ctx CompilerContext, stmt *tree.Insert, isPrepar
 	}()
 
 	builder := NewQueryBuilder(plan.Query_INSERT, ctx, isPrepareStmt, true)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	builder.parseOptimizeHints()
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
@@ -329,6 +333,7 @@ func bindAndOptimizeReplaceQuery(ctx CompilerContext, stmt *tree.Replace, isPrep
 	}()
 
 	builder := NewQueryBuilder(plan.Query_INSERT, ctx, isPrepareStmt, true)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	builder.parseOptimizeHints()
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
@@ -482,6 +487,7 @@ func bindAndOptimizeDeleteQuery(ctx CompilerContext, stmt *tree.Delete, isPrepar
 	}
 
 	builder := NewQueryBuilder(plan.Query_DELETE, ctx, isPrepareStmt, true)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
 		bindCtx.snapshot = ctx.GetSnapshot()
@@ -540,6 +546,7 @@ func bindAndOptimizeUpdateQuery(ctx CompilerContext, stmt *tree.Update, isPrepar
 	}
 
 	builder := NewQueryBuilder(plan.Query_UPDATE, ctx, isPrepareStmt, true)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
 		bindCtx.snapshot = ctx.GetSnapshot()
@@ -637,7 +644,6 @@ func buildExplainPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bo
 		v2.TxnStatementBuildExplainHistogram.Observe(time.Since(start).Seconds())
 	}()
 
-	//get query optimizer and execute Optimize
 	plan, err := BuildPlan(ctx, stmt, isPrepareStmt, planningInput)
 	if err != nil {
 		return nil, err
@@ -655,8 +661,12 @@ func buildExplainPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bo
 	}
 
 	// Ensure that the plan includes a query section
-	if plan.GetQuery() == nil {
+	query := plan.GetQuery()
+	if query == nil {
 		return nil, moerr.NewNotSupported(ctx.GetContext(), "the sql query plan does not support explain.")
+	}
+	if err := CheckDMLRewriteExplain(ctx.GetContext(), query); err != nil {
+		return nil, err
 	}
 
 	return plan, nil
@@ -782,14 +792,14 @@ func BuildPlan(ctx CompilerContext, stmt tree.Statement, isPrepareStmt bool, pla
 		if stmt.IsPerform && selectHasExportParam(stmt) {
 			return nil, moerr.NewNotSupported(ctx.GetContext(), "PERFORM SELECT INTO OUTFILE")
 		}
-		queryPlan, err := bindAndOptimizeSelectQueryWithValidatorAndCapture(plan.Query_SELECT, ctx, stmt, isPrepareStmt, false, nil, nil, false, "", planningInput)
+		queryPlan, err := bindAndOptimizeSelectQueryWithValidatorAndCapture(plan.Query_SELECT, ctx, stmt, isPrepareStmt, false, nil, nil, false, "", zeroScalarExecutable, planningInput)
 		if err != nil {
 			return nil, err
 		}
 		applySQLSelectLimit(stmt, queryPlan)
 		return queryPlan, nil
 	case *tree.ParenSelect:
-		queryPlan, err := bindAndOptimizeSelectQueryWithValidatorAndCapture(plan.Query_SELECT, ctx, stmt.Select, isPrepareStmt, false, nil, nil, false, "", planningInput)
+		queryPlan, err := bindAndOptimizeSelectQueryWithValidatorAndCapture(plan.Query_SELECT, ctx, stmt.Select, isPrepareStmt, false, nil, nil, false, "", zeroScalarExecutable, planningInput)
 		if err != nil {
 			return nil, err
 		}

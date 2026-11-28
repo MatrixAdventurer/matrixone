@@ -305,7 +305,20 @@ type PrepareStmt struct {
 	// plan was bound. A caller-owned procedure must rebind before using it.
 	directIndexReadAdmitted bool
 
-	params              *vector.Vector
+	// params is owned by the statement; paramsMP is the pool it was created
+	// with (the executing process's pool) and is freed with.
+	params   *vector.Vector
+	paramsMP *mpool.MPool
+	// typedParams is the typed form of params, owned by the statement and
+	// rewritten in place by every execution.
+	typedParams typedPrepareParams
+	// userParams holds SQL EXECUTE ... USING parameters, owned by the
+	// statement and rewritten in place by every execution.
+	userParams executeUserParams
+	// paramValues backs the planner's parameter values of an execution.
+	paramValues plan2.ParamValueStore
+	// bindings backs an execution's parameter source bindings.
+	bindings            []plan2.PreparedSourceBinding
 	getFromSendLongData map[int]struct{}
 	// COM_STMT_SEND_LONG_DATA owns its chunks until EXECUTE materializes each
 	// parameter once. The pool must be the one that allocated the buffers,
@@ -904,9 +917,14 @@ func (prepareStmt *PrepareStmt) Close() {
 		if prepareStmt.proc != nil && prepareStmt.proc.GetPrepareParams() == prepareStmt.params {
 			prepareStmt.proc.SetPrepareParams(nil)
 		}
-		prepareStmt.params.Free(prepareStmt.proc.Mp())
-		prepareStmt.params = nil
+		prepareStmt.params.Free(prepareStmt.paramsMP)
+		prepareStmt.params, prepareStmt.paramsMP = nil, nil
 	}
+	prepareStmt.typedParams.release(prepareStmt.proc)
+	prepareStmt.userParams.release()
+	// Drop the last execution's values, which may hold large payloads.
+	prepareStmt.paramValues = plan2.ParamValueStore{}
+	prepareStmt.bindings = nil
 
 	if prepareStmt.compile != nil {
 		prepareStmt.compile.FreeOperator()
@@ -966,6 +984,14 @@ func (prepareStmt *PrepareStmt) resetBinaryParamState() {
 		return
 	}
 	prepareStmt.clearBinaryParamState(prepareStmt.proc)
+	// An explicit reset also drops the previous execution's planner values,
+	// which can hold a large string payload, and returns the statement's
+	// parameter storage, which every execution otherwise keeps for the next one.
+	prepareStmt.paramValues.Clear()
+	if prepareStmt.params != nil {
+		prepareStmt.params.Free(prepareStmt.paramsMP)
+		prepareStmt.params, prepareStmt.paramsMP = nil, nil
+	}
 	prepareStmt.longDataErr = nil
 }
 
@@ -982,15 +1008,17 @@ func (prepareStmt *PrepareStmt) clearBinaryParamState(proc *process.Process) {
 	if proc == nil {
 		proc = prepareStmt.proc
 	}
-	if prepareStmt.params != nil && proc != nil {
+	if prepareStmt.params != nil {
 		if prepareStmt.proc != nil && prepareStmt.proc.GetPrepareParams() == prepareStmt.params {
 			prepareStmt.proc.SetPrepareParams(nil)
 		}
-		if proc.GetPrepareParams() == prepareStmt.params {
+		if proc != nil && proc.GetPrepareParams() == prepareStmt.params {
 			proc.SetPrepareParams(nil)
 		}
-		prepareStmt.params.Free(proc.Mp())
-		prepareStmt.params = nil
+		// The statement keeps its parameter storage for the next execution
+		// (Close frees it): only this execution's values are dropped. An empty
+		// vector reads as "no binary parameters" to every consumer.
+		prepareStmt.params.CleanOnlyData()
 	}
 	for k := range prepareStmt.getFromSendLongData {
 		delete(prepareStmt.getFromSendLongData, k)
@@ -1724,7 +1752,7 @@ func (ses *feSessionImpl) GetResultBatches() []*batch.Batch {
 func (ses *feSessionImpl) AppendResultBatch(bat *batch.Batch) error {
 	// Result batches belong to the session and can remain reachable after the
 	// producing statement has sealed its allocation account.
-	copied, err := bat.DupWithoutAllocationAccount(ses.pool)
+	copied, err := bat.Dup(ses.pool)
 	if err != nil {
 		return err
 	}
@@ -1976,8 +2004,9 @@ func (ses *Session) setSessionSysVar(ctx context.Context, name string, val inter
 	planDependencyVariable := name == "sql_mode" || name == "optimizer_hints" || name == "lc_time_names" || name == "time_zone" || name == "explicit_defaults_for_timestamp" || name == "mo_pk_check_by_cn" ||
 		name == "fulltext2_search_df_cutoff" || name == "fulltext2_threads_search" || name == "fulltext_bloom_filter_pushdown" ||
 		name == "join_spill_mem" || name == "agg_spill_mem" || name == "sort_spill_mem"
+	foreignKeyChecks := name == "foreign_key_checks"
 	var oldPlanDependency interface{}
-	if planDependencyVariable {
+	if planDependencyVariable || foreignKeyChecks {
 		oldValue, getErr := ses.GetSessionSysVar(name)
 		if getErr != nil {
 			return getErr
@@ -2048,7 +2077,7 @@ func (ses *Session) setSessionSysVar(ctx context.Context, name string, val inter
 	if err == nil && name == "sql_mode" {
 		ses.updateSqlModeNoAutoValueOnZero(val)
 	}
-	if err == nil && planDependencyVariable {
+	if err == nil && (planDependencyVariable || foreignKeyChecks) {
 		newValue, getErr := ses.GetSessionSysVar(name)
 		if getErr != nil {
 			return getErr
@@ -2058,7 +2087,11 @@ func (ses *Session) setSessionSysVar(ctx context.Context, name string, val inter
 			return getErr
 		}
 		if oldPlanDependency != newValue {
-			ses.invalidateCachedPlans(true)
+			if foreignKeyChecks {
+				ses.invalidateForeignKeyDeletePlans()
+			} else {
+				ses.invalidateCachedPlans(true)
+			}
 		}
 	}
 	if err == nil && name == "div_precision_increment" {

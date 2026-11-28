@@ -28,8 +28,9 @@ func (s *showImpl) Free() {
 // SHOW CREATE TABLE statement
 type ShowCreateTable struct {
 	showImpl
-	Name     *UnresolvedObjectName
-	AtTsExpr *AtTimeStamp
+	Name          *UnresolvedObjectName
+	AtTsExpr      *AtTimeStamp
+	RewriteOption *RewriteOption
 }
 
 func (node *ShowCreateTable) Format(ctx *FmtCtx) {
@@ -100,13 +101,14 @@ func NewShowCreateDatabase(i bool, n string) *ShowCreateDatabase {
 // SHOW COLUMNS statement.
 type ShowColumns struct {
 	showImpl
-	Ext     bool
-	Full    bool
-	Table   *UnresolvedObjectName
-	ColName *UnresolvedName
-	DBName  string
-	Like    *ComparisonExpr
-	Where   *Where
+	Ext           bool
+	Full          bool
+	Table         *UnresolvedObjectName
+	ColName       *UnresolvedName
+	DBName        string
+	Like          *ComparisonExpr
+	Where         *Where
+	RewriteOption *RewriteOption
 }
 
 func (node *ShowColumns) Format(ctx *FmtCtx) {
@@ -563,9 +565,10 @@ func NewShowStatus(g bool, l *ComparisonExpr, w *Where) *ShowStatus {
 // show index statement
 type ShowIndex struct {
 	showImpl
-	TableName *UnresolvedObjectName
-	DbName    string
-	Where     *Where
+	TableName     *UnresolvedObjectName
+	DbName        string
+	Where         *Where
+	RewriteOption *RewriteOption
 }
 
 func (node *ShowIndex) Format(ctx *FmtCtx) {
@@ -596,8 +599,9 @@ func NewShowIndex(t *UnresolvedObjectName, w *Where) *ShowIndex {
 // ShowIndexIgnored lists the rows the indexes of a table left out because they cannot store them.
 type ShowIndexIgnored struct {
 	showImpl
-	TableName *UnresolvedObjectName
-	Where     *Where
+	TableName     *UnresolvedObjectName
+	Where         *Where
+	RewriteOption *RewriteOption
 }
 
 func (node *ShowIndexIgnored) Format(ctx *FmtCtx) {
@@ -614,8 +618,9 @@ func (node *ShowIndexIgnored) GetQueryType() string     { return QueryTypeOth }
 // ShowIndexStatus shows the state of the indexes of a table that are kept in sync.
 type ShowIndexStatus struct {
 	showImpl
-	TableName *UnresolvedObjectName
-	Where     *Where
+	TableName     *UnresolvedObjectName
+	Where         *Where
+	RewriteOption *RewriteOption
 }
 
 func (node *ShowIndexStatus) Format(ctx *FmtCtx) {

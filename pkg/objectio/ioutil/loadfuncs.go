@@ -40,12 +40,32 @@ func LoadColumnsData(
 	policy fileservice.Policy,
 ) (dataMeta objectio.ObjectDataMeta, release func(), fromCache bool, err error) {
 	var meta objectio.ObjectMeta
-	var vectors fileservice.IOVector
 	if meta, err = objectio.FastLoadObjectMeta(ctx, &location, false, fs); err != nil {
 		return
 	}
-	name := location.Name().UnsafeString()
 	dataMeta = meta.MustGetMeta(objectio.SchemaData)
+	release, fromCache, err = LoadColumnsDataFromMeta(
+		ctx, dataMeta, columns, typs, fs, location, cacheVectors, m, policy,
+	)
+	return
+}
+
+// LoadColumnsDataFromMeta reads columns using the already loaded data metadata
+// for location. Its release and cache-vector ownership are the same as
+// LoadColumnsData.
+func LoadColumnsDataFromMeta(
+	ctx context.Context,
+	dataMeta objectio.ObjectDataMeta,
+	columns []uint16,
+	typs []types.Type,
+	fs fileservice.FileService,
+	location objectio.Location,
+	cacheVectors containers.Vectors,
+	m *mpool.MPool,
+	policy fileservice.Policy,
+) (release func(), fromCache bool, err error) {
+	var vectors fileservice.IOVector
+	name := location.Name().UnsafeString()
 	if vectors, err = objectio.ReadOneBlock(
 		ctx,
 		&dataMeta,
@@ -157,13 +177,14 @@ func LoadColumnsDataInto(
 	policy fileservice.Policy,
 ) (deleteMask objectio.Bitmap, fromCache bool, err error) {
 	return loadColumnsDataInto(ctx, columns, typs, fs, location, destinations,
-		sels, visibilityTS, m, policy, false, false, nil)
+		sels, visibilityTS, m, policy, false, nil, nil)
 }
 
 // LoadColumnsDataIntoReadonly materializes complete, non-appendable columns
-// into empty destinations. Varlen payloads have private retained backing so a
-// local pipeline can snapshot them without making another full payload copy.
-// Selected rows and appendable visibility keep LoadColumnsDataInto's owned path.
+// into empty destinations. Varlen payloads get a fresh, exactly-sized owned
+// area (stale scratch capacity is retired first) so one block's leftover
+// capacity does not count against the next block's budget. Selected rows and
+// appendable visibility keep LoadColumnsDataInto's owned path.
 func LoadColumnsDataIntoReadonly(
 	ctx context.Context,
 	columns []uint16,
@@ -175,16 +196,34 @@ func LoadColumnsDataIntoReadonly(
 	policy fileservice.Policy,
 ) (fromCache bool, err error) {
 	_, fromCache, err = loadColumnsDataInto(ctx, columns, typs, fs, location,
-		destinations, nil, nil, m, policy, true, false, nil)
+		destinations, nil, nil, m, policy, true, nil, nil)
 	return
 }
 
 // LoadColumnsDataIntoBorrowed borrows only entries with ObjectIO's immutable
 // validation capability and an admitted per-column borrow policy. A nil policy
 // preserves full borrowing; an incompatible policy conservatively copies owned.
-func LoadColumnsDataIntoBorrowed(ctx context.Context, columns []uint16, typs []types.Type, fs fileservice.FileService, location objectio.Location, destinations []*vector.Vector, m *mpool.MPool, policy fileservice.Policy, allowBorrow []bool) (bool, error) {
-	_, hit, err := loadColumnsDataInto(ctx, columns, typs, fs, location, destinations, nil, nil, m, policy, false, true, allowBorrow)
+// pins takes the cache pins of every borrowed destination for the lender, the
+// producer that published the destinations (for a scan, its reader request):
+// the producer releases them when it reuses or drops those vectors. Nil pins
+// copy every column.
+func LoadColumnsDataIntoBorrowed(ctx context.Context, columns []uint16, typs []types.Type, fs fileservice.FileService, location objectio.Location, destinations []*vector.Vector, m *mpool.MPool, policy fileservice.Policy, allowBorrow []bool, pins *objectio.CachePins) (bool, error) {
+	_, hit, err := loadColumnsDataInto(ctx, columns, typs, fs, location, destinations, nil, nil, m, policy, false, pins, allowBorrow)
 	return hit, err
+}
+
+// destinationMP returns the pool a load into vec must use: vec's own pool.
+// An empty read-only vec is first turned into an owned vector of m.
+func destinationMP(vec *vector.Vector, m *mpool.MPool) *mpool.MPool {
+	if vec.IsReadOnly() && vec.Length() == 0 && m != nil {
+		typ := *vec.GetType()
+		vec.Free(nil)
+		vec.InitVec(typ, m)
+	}
+	if mp := vec.MPool(); mp != nil {
+		return mp
+	}
+	return m
 }
 
 func loadColumnsDataInto(
@@ -199,7 +238,7 @@ func loadColumnsDataInto(
 	m *mpool.MPool,
 	policy fileservice.Policy,
 	readonlyArea bool,
-	borrowedColumns bool,
+	pins *objectio.CachePins,
 	allowBorrow []bool,
 ) (deleteMask objectio.Bitmap, fromCache bool, err error) {
 	if len(columns) != len(destinations) {
@@ -305,63 +344,42 @@ func loadColumnsDataInto(
 		}
 	}
 
-	publication := objectio.JSONReadSetFromContext(ctx)
 	for i := range columns {
-		if destinations[i].Length() != 0 && publication.Requested(columns[i]) && typs[i].Oid == types.T_json {
-			publication.Disable()
-		}
-		if publication.Requested(columns[i]) && typs[i].Oid == types.T_json {
-			reader, openErr := objectio.OpenJSONReader(ioVectors.Entries[i].CachedData, m, destinations[i].AllocationAccountSelection(), publication.CachePinAdmission())
-			if openErr != nil {
-				publication.Disable()
-				err = openErr
-				return
-			}
-			if sels != nil {
-				selected, selectErr := reader.Select(sels, m)
-				reader.Close()
-				if selectErr != nil {
-					publication.Disable()
-					err = selectErr
-					return
-				}
-				reader = selected
-			}
-			publication.Publish(columns[i], reader)
-		}
-		if borrowedColumns && (allowBorrow == nil || len(allowBorrow) == len(columns) && allowBorrow[i]) {
+		// A destination is filled through its own pool. An empty read-only
+		// destination (a column borrowed by an earlier block) becomes an owned
+		// vector of m again.
+		dm := destinationMP(destinations[i], m)
+		if pins != nil && (allowBorrow == nil || len(allowBorrow) == len(columns) && allowBorrow[i]) {
 			var borrowed bool
-			borrowed, err = objectio.TryBorrowCachedVector(destinations[i], ioVectors.Entries[i].CachedData, m)
+			borrowed, err = objectio.TryBorrowCachedVector(destinations[i], ioVectors.Entries[i].CachedData, dm, pins)
 			if err != nil {
-				publication.Disable()
 				return
 			}
 			if borrowed {
 				continue
 			}
-			err = objectio.CopyCachedVectorAll(destinations[i], ioVectors.Entries[i].CachedData, m)
+			err = objectio.CopyCachedVectorAll(destinations[i], ioVectors.Entries[i].CachedData, destinationMP(destinations[i], dm))
 		} else if readonlyArea {
 			err = objectio.CopyCachedVectorAllReadonly(
 				destinations[i],
 				ioVectors.Entries[i].CachedData,
-				m,
+				dm,
 			)
 		} else if sels == nil {
 			err = objectio.CopyCachedVectorAll(
 				destinations[i],
 				ioVectors.Entries[i].CachedData,
-				m,
+				dm,
 			)
 		} else {
 			err = objectio.CopyCachedVectorRows(
 				destinations[i],
 				ioVectors.Entries[i].CachedData,
 				sels,
-				m,
+				dm,
 			)
 		}
 		if err != nil {
-			publication.Disable()
 			logutil.Errorf("LoadColumnsDataInto %s error: %v", location.String(), err)
 			return
 		}
@@ -681,7 +699,7 @@ func LoadColumnsData2(
 		if err != nil {
 			for _, col := range vectors {
 				if col != nil {
-					col.Close()
+					containers.ReleaseVector(col)
 				}
 			}
 			vectors = nil
@@ -697,14 +715,14 @@ func LoadColumnsData2(
 			); err != nil {
 				for _, col := range vectors {
 					if col != nil {
-						col.Close()
+						containers.ReleaseVector(col)
 					}
 				}
 				vectors = nil
 				return
 			}
 		} else {
-			vec = containers.ToTNVector(obj.(*vector.Vector), nil)
+			vec = obj.(*vector.Vector)
 		}
 		vectors[i] = vec
 	}

@@ -108,12 +108,9 @@ func newLocalFS(
 	noChecksum bool,
 ) (*LocalFS, error) {
 
-	rootPath, rootFile, err := prepareLocalRoot(rootPath)
+	rootPath, err := prepareLocalRoot(rootPath)
 	if err != nil {
 		return nil, err
-	}
-	if rootFile != nil {
-		defer rootFile.Close()
 	}
 
 	fs := &LocalFS{
@@ -335,9 +332,12 @@ func (l *LocalFS) write(ctx context.Context, vector IOVector) (bytesWritten int,
 	if err != nil {
 		return 0, err
 	}
+	exclusive := exclusiveWrite(ctx)
 	defer func() {
 		if err != nil {
 			_ = f.Close()
+		}
+		if err != nil || exclusive {
 			_ = os.Remove(f.Name())
 		}
 	}()
@@ -381,8 +381,11 @@ func (l *LocalFS) write(ctx context.Context, vector IOVector) (bytesWritten int,
 		return 0, err
 	}
 
-	// move
-	if err := os.Rename(f.Name(), nativePath); err != nil {
+	if exclusive {
+		if err := linkLocalFile(f.Name(), nativePath, path.File); err != nil {
+			return 0, err
+		}
+	} else if err := os.Rename(f.Name(), nativePath); err != nil {
 		return 0, err
 	}
 
@@ -631,7 +634,10 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 	}
 	nativePath := l.toNativeFilePath(path.File)
 
+	wait := ReadWaitTrackerFromContext(ctx)
+	start := wait.Start()
 	file, err := os.Open(nativePath)
+	wait.Stop(start)
 	if os.IsNotExist(err) {
 		return moerr.NewFileNotFoundNoCtx(path.File)
 	}
@@ -658,6 +664,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 		if entry.WriterForRead != nil {
 			fileWithChecksum, put := l.newChecksumOSFile(ctx, file)
 			defer put.Put()
+			fileWithChecksum.readWait = wait
 
 			if entry.Offset > 0 {
 				_, err = fileWithChecksum.Seek(int64(entry.Offset), io.SeekStart)
@@ -724,6 +731,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 		} else {
 			fileWithChecksum, put := l.newChecksumOSFile(ctx, file)
 			defer put.Put()
+			fileWithChecksum.readWait = wait
 
 			if entry.Offset > 0 {
 				_, err = fileWithChecksum.Seek(int64(entry.Offset), io.SeekStart)
@@ -740,6 +748,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 				C: bytesCounter,
 			}
 
+			dataEntry := &entry
 			if entry.Size < 0 {
 				var data []byte
 				data, err = io.ReadAll(r)
@@ -750,24 +759,33 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 				entry.Size = int64(len(data))
 
 			} else {
-				finally := entry.prepareData(ctx)
+				if cap(entry.Data) < int(entry.Size) {
+					// Rollback must clear the vector entry that owns the allocated data.
+					dataEntry = &vector.Entries[i]
+				}
+				finally, prepareErr := dataEntry.prepareData(ctx)
+				if prepareErr != nil {
+					return prepareErr
+				}
 				defer finally(&err)
 				var n int
-				n, err = io.ReadFull(r, entry.Data)
+				n, err = io.ReadFull(r, dataEntry.Data)
 				if err != nil {
 					return err
 				}
-				if int64(n) != entry.Size {
+				if int64(n) != dataEntry.Size {
 					return moerr.NewUnexpectedEOFNoCtx(path.File)
 				}
 			}
 
-			if err = entry.setCachedData(ctx, l); err != nil {
+			if err = dataEntry.setCachedData(ctx, l); err != nil {
 				return err
 			}
-			fileWithChecksum.dontNeedContentRange(entry.Offset, entry.Size)
+			fileWithChecksum.dontNeedContentRange(dataEntry.Offset, dataEntry.Size)
 
-			vector.Entries[i] = entry
+			if dataEntry == &entry {
+				vector.Entries[i] = entry
+			}
 
 		}
 
@@ -793,7 +811,10 @@ func (l *LocalFS) handleReadCloserForRead(
 		}
 	}()
 
+	wait := ReadWaitTrackerFromContext(ctx)
+	start := wait.Start()
 	file, err = os.Open(nativePath)
+	wait.Stop(start)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return moerr.NewFileNotFoundNoCtx(path.File)
@@ -802,6 +823,7 @@ func (l *LocalFS) handleReadCloserForRead(
 	}
 
 	fileWithChecksum := l.newChecksumFile(ctx, file)
+	fileWithChecksum.readWait = wait
 
 	entry := vector.Entries[i]
 	if entry.Offset > 0 {
@@ -1235,27 +1257,25 @@ func syncLocalDir(mu *sync.RWMutex, dirFiles map[string]*os.File, nativePath str
 	return nil
 }
 
-// prepareLocalRoot keeps temporary writes on the same filesystem as their destination.
-// The caller closes the returned directory handle when its constructor returns.
-func prepareLocalRoot(rootPath string) (string, *os.File, error) {
+// prepareLocalRoot keeps temporary writes on the same filesystem as their
+// destination.
+func prepareLocalRoot(rootPath string) (string, error) {
 	if rootPath == "" {
 		rootPath = "."
 	}
 	rootPath, err := filepath.Abs(rootPath)
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	rootFile, err := os.Open(rootPath)
+	f, err := os.Open(rootPath)
 	if os.IsNotExist(err) {
-		if err := os.MkdirAll(rootPath, 0755); err != nil {
-			return "", nil, err
-		}
-		return rootPath, nil, nil
+		return rootPath, os.MkdirAll(rootPath, 0755)
 	}
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	return rootPath, rootFile, nil
+	_ = f.Close()
+	return rootPath, nil
 }
 
 func (l *LocalFS) toNativeFilePath(filePath string) string {

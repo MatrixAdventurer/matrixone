@@ -134,6 +134,23 @@ func GetFunctionArgTypeStrFromAst(arg tree.FunctionArg) (string, error) {
 	return GetFunctionTypeStrFromAst(argDecl.Type)
 }
 
+// GetFunctionTypeFromAst retains the full type attributes needed by external
+// routine ABIs. GetFunctionTypeStrFromAst intentionally returns only the
+// logical catalog name for legacy UDF overload identity.
+func GetFunctionTypeFromAst(typRef tree.ResolvableTypeReference) (types.Type, error) {
+	typ, err := getTypeFromAst(moerr.Context(), typRef)
+	if err != nil {
+		return types.Type{}, err
+	}
+	// The external routine descriptor has no numeric-attribute channel. Reject
+	// attributed DECIMAL declarations before narrowing to types.Type, whose
+	// native layout deliberately does not carry these plan-side flags.
+	if typ.NumericAttributes != 0 {
+		return types.Type{}, moerr.NewNotSupportedNoCtx("Python UDF does not support attributed DECIMAL declarations")
+	}
+	return types.NewWithCharset(types.T(typ.Id), typ.Width, typ.Scale, uint8(typ.Charset)), nil
+}
+
 func GetFunctionTypeStrFromAst(typRef tree.ResolvableTypeReference) (string, error) {
 	typ, err := getTypeFromAst(moerr.Context(), typRef)
 	if err != nil {
@@ -1238,7 +1255,7 @@ func buildDefaultExprWithColumnsForceDomain(
 	}
 
 	// try to calculate default value, return err if fails
-	newExpr, err := ConstantFold(batch.EmptyForConstFoldBatch, DeepCopyExpr(defaultExpr), proc, false, true)
+	newExpr, err := foldBoundConstant(bindCtx, DeepCopyExpr(defaultExpr), proc)
 	// cast_assign remains an executable expression because its behavior depends
 	// on sql_mode, so function.IsConstant rejects the outer function. Validate when
 	// its source value is constant, without eagerly evaluating volatile defaults.
@@ -1250,6 +1267,7 @@ func buildDefaultExprWithColumnsForceDomain(
 	}
 	if constantMediumIntDefault {
 		cast := newExpr.GetF()
+		proc := processForBoundExpr(bindCtx, cast.Args[0], proc)
 		strictExpr, strictErr := forceAssignmentCastExprWithName(
 			bindCtx, cast.Args[0], typ, "cast_strict")
 		if strictErr != nil {
@@ -1738,6 +1756,7 @@ func validateUnsignedDecimalStrictConstantDefault(ctx context.Context, proc *pro
 	if err != nil {
 		return err
 	}
+	proc = processForBoundExpr(ctx, strictExpr, proc)
 	executor, err := colexec.NewExpressionExecutor(proc, strictExpr)
 	if err != nil {
 		return err

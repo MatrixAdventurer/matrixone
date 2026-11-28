@@ -69,7 +69,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
 	"github.com/matrixorigin/matrixone/pkg/udf"
-	"github.com/matrixorigin/matrixone/pkg/udf/pythonservice"
 	"github.com/matrixorigin/matrixone/pkg/util/address"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
@@ -79,37 +78,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
-
-const (
-	rssCacheFamilyEvictTimeout   = 10 * time.Second
-	rssCacheAdmissionPressureTTL = 2 * time.Minute
-	rssCachePressureTargetOwner  = "cn-rss"
-	bootstrapRetryInterval       = 100 * time.Millisecond
-)
-
-var (
-	evictMemoryCachesToCapacityPercent = fileservice.EvictMemoryCachesToCapacityPercent
-)
-
-func makeRSSCacheEvictor(timeout time.Duration) func(context.Context, int64) {
-	return func(ctx context.Context, targetPercent int64) {
-		memoryCtx, cancel := context.WithTimeoutCause(ctx, timeout, moerr.CauseRSSCacheEvict)
-		defer cancel()
-		evictMemoryCachesToCapacityPercent(memoryCtx, targetPercent)
-	}
-}
-
-func setRSSCachePressureTarget(targetPercent int64) {
-	fileservice.SetMemoryCachePressureTargetPercentByOwner(
-		rssCachePressureTargetOwner,
-		targetPercent,
-		time.Now().Add(rssCacheAdmissionPressureTTL),
-	)
-}
-
-func clearRSSCachePressureTarget() {
-	fileservice.ClearMemoryCachePressureTargetByOwner(rssCachePressureTargetOwner)
-}
 
 func NewService(
 	cfg *Config,
@@ -193,7 +161,7 @@ func NewService(
 		lockService lockservice.LockService,
 		queryClient qclient.QueryClient,
 		hakeeper logservice.CNHAKeeperClient,
-		udfService udf.Service,
+		udfService udf.Runtime,
 		cli client.TxnClient,
 		aicm *defines.AutoIncrCacheManager,
 		messageAcquirer func() morpc.Message) error {
@@ -252,32 +220,22 @@ func NewService(
 		MaxSize:        pu.SV.AutoIncrCacheSize,
 	}
 
-	// init UdfService
-	var udfServices []udf.Service
-	// add python client to handle python udf
-	if srv.cfg.PythonUdfClient.ServerAddress != "" {
-		var pc *pythonservice.Client
-		pc, err = pythonservice.NewClient(srv.cfg.PythonUdfClient)
-		if err != nil {
-			return nil, err
-		}
-		udfServices = append(udfServices, pc)
-	}
-	srv.udfService, err = udf.NewService(udfServices...)
+	// init UdfService. Python is an opt-in feature and its transport or
+	// artifact dependencies must not turn an otherwise usable CN into a
+	// process-wide crash loop. buildCNRuntime keeps the language gate visible
+	// to CREATE/EXECUTE while ordinary SQL continues with the runtime in an
+	// explicit UNAVAILABLE state.
+	srv.udfService, err = buildCNRuntime(srv.cfg.PythonUdfClient, srv.fileService, srv.logger)
 	if err != nil {
 		return nil, err
 	}
 
+	srv.rssPressure = rscthrottler.NewRSSPressureSource()
 	srv.CNMemoryThrottler = rscthrottler.NewMemThrottler(
 		"CNFlushS3",
 		90.0/100.0,
 		rscthrottler.WithAcquirePolicy(rscthrottler.AcquirePolicyForCNFlushS3),
-		rscthrottler.WithRSSScavenging(),
-		rscthrottler.WithRSSCachePressureTarget(
-			setRSSCachePressureTarget,
-			clearRSSCachePressureTarget,
-		),
-		rscthrottler.WithRSSCacheEvictor(makeRSSCacheEvictor(rssCacheFamilyEvictTimeout)),
+		rscthrottler.WithRSSPressureSource(srv.rssPressure),
 	)
 
 	srv.pu.LockService = srv.lockService
@@ -609,6 +567,7 @@ func (s *service) startContext() context.Context {
 func (s *service) closeService() error {
 	s.closeOnce.Do(func() {
 		defer logutil.LogClose(s.logger, "cnservice")()
+		s.rssPressure.Close()
 
 		s.closeViewMetadataAdmission()
 		// Stop waits for any in-flight periodic heartbeat before teardown. Keep
@@ -898,6 +857,9 @@ func (s *service) stopRPCs() error {
 	}
 	if s.queryClient != nil {
 		err = errors.Join(err, s.queryClient.Close())
+	}
+	if closer, ok := s.udfService.(udf.RuntimeCloser); ok {
+		err = errors.Join(err, closer.Close())
 	}
 	if s.timestampWaiter != nil {
 		s.timestampWaiter.Close()

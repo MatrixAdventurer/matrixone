@@ -411,7 +411,8 @@ func TestIsDeleted(t *testing.T) {
 
 	t.Run("with_bitmap", func(t *testing.T) {
 		var bm bitmap.Bitmap
-		bm.InitWithSize(64)
+		bm.Init(bitmapTestMP)
+		mustBitmapOK(bm.InitWithSize(64, bitmapTestMP))
 		bm.Add(5)
 		bm.Add(42)
 
@@ -467,7 +468,7 @@ func TestJoinMapBuildPayloadChecks(t *testing.T) {
 		require.Zero(t, mp.CurrNB())
 	})
 	for i, width := range []int{32, 128, 512} {
-		build.Vecs[i] = vector.NewOffHeapVecWithType(types.T_text.ToType())
+		build.Vecs[i] = vector.NewVec(types.T_text.ToType(), mp)
 		require.NoError(t, vector.AppendBytes(build.Vecs[i], make([]byte, width), false, mp))
 	}
 	build.SetRowCount(1)

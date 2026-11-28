@@ -15,6 +15,7 @@
 package frontend
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -30,6 +31,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/udf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,7 +77,8 @@ func TestPreparedFieldRetryDeclarationGeneration(t *testing.T) {
 			prepared.proc, ctx.proc = cw.proc, cw.proc
 			prepared.defaultDatabase = "tpch"
 			t.Cleanup(func() { cw.proc.SetPrepareParams(nil); ses.Close() })
-			prepared.params = vector.NewVec(types.T_text.ToType())
+			prepared.params = vector.NewVec(types.T_text.ToType(), cw.proc.Mp())
+			prepared.paramsMP = cw.proc.Mp()
 			require.NoError(t, vector.AppendBytes(prepared.params, []byte("1"), false, cw.proc.Mp()))
 			require.NoError(t, vector.AppendBytes(prepared.params, []byte("a"), false, cw.proc.Mp()))
 			prepared.ParamTypes = []byte{byte(defines.MYSQL_TYPE_LONGLONG), 0, byte(defines.MYSQL_TYPE_VAR_STRING), 0}
@@ -231,7 +235,7 @@ func TestPreparedFieldRetryDeclarationGeneration(t *testing.T) {
 			require.Equal(t, plan2.GetResultColumnsFromPlan(fresh.Plan), plan2.GetResultColumnsFromPlan(next))
 			input := batch.NewWithSize(1)
 			t.Cleanup(func() { input.Clean(cw.proc.Mp()) })
-			input.Vecs[0] = vector.NewVec(types.T_varbinary.ToType())
+			input.Vecs[0] = vector.NewVec(types.T_varbinary.ToType(), cw.proc.Mp())
 			require.NoError(t, vector.AppendBytes(input.Vecs[0], []byte("a"), false, cw.proc.Mp()))
 			input.SetRowCount(1)
 			var expr *plan.Expr
@@ -251,5 +255,120 @@ func TestPreparedFieldRetryDeclarationGeneration(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, uint64(2), vector.GetFixedAtNoTypeCheck[uint64](result, 0), "the next execution generation consumes the new binary declaration")
 		})
+	}
+}
+
+// Routine revision metadata is outside table Schemas. Retry must validate an
+// immutable, bounded snapshot before applying retained FIELD or temporal facts.
+func TestPreparedFieldRoutineRetryGeneration(t *testing.T) {
+	setRoutineProtocolForTest(t, defines.MORPCMinVersion)
+	for _, historyCase := range []struct {
+		name, sql  string
+		values     []string
+		paramTypes []byte
+	}{
+		{"field", "select field(case when ? then ? else null end,'A','a')", []string{"1", "a"}, []byte{byte(defines.MYSQL_TYPE_LONGLONG), 0, byte(defines.MYSQL_TYPE_VAR_STRING), 0}},
+		{"temporal", "select date_add(?, interval 1 day)", []string{"2024-02-28 00:00:00"}, []byte{byte(defines.MYSQL_TYPE_VAR_STRING), 0}},
+	} {
+		for _, name := range []string{"unchanged", "revision", "catalog error", "nested immutable facts", "capture error"} {
+			t.Run(historyCase.name+"/"+name, func(t *testing.T) {
+				ses, prepared, cw, ec := newPreparedExecuteEnvForSQL(t, 312,
+					historyCase.sql)
+				prepared.proc = cw.proc
+				t.Cleanup(func() { cw.proc.SetPrepareParams(nil); ses.Close() })
+				prepared.paramsMP = cw.proc.Mp()
+				prepared.params = vector.NewVec(types.T_text.ToType(), prepared.paramsMP)
+				for _, value := range historyCase.values {
+					require.NoError(t, vector.AppendBytes(prepared.params, []byte(value), false, cw.proc.Mp()))
+				}
+				prepared.ParamTypes = historyCase.paramTypes
+				_, _, clone, _, owned, err := initExecuteStmtParam(ec, ses, cw, nil, prepared.Name)
+				if owned && clone != nil {
+					clone.Free()
+				}
+				require.NoError(t, err)
+				history := prepared.fieldTypes
+				temporalHistory := prepared.temporalTypes
+				if historyCase.name == "field" {
+					require.NotNil(t, history)
+				} else {
+					require.NotNil(t, temporalHistory)
+					require.Nil(t, history)
+				}
+				dependency := testRoutinePlanDependency()
+				dependency.Language, dependency.SecurityMode = udf.LanguageSQL, "DEFINER"
+				dependency.ArtifactDigest, dependency.EnvironmentDigest = "", ""
+				const body, args, ret = "$1", "[\"bigint\"]", "bigint"
+				dependency.DefinitionFingerprint, err = function.SQLRoutineFingerprint(body, args, ret)
+				require.NoError(t, err)
+				member := namespaceMember(41, args)
+				member[2], member[3] = uint64(7), uint64(12)
+				namespaces, err := decodeRoutineNamespaces(context.Background(), namespaceRows(member))
+				require.NoError(t, err)
+				dependency.NamespaceFingerprint = namespaces[41]
+				query := prepared.PreparePlan.GetDcl().GetPrepare().Plan.GetQuery()
+				if name == "nested immutable facts" {
+					query.BackgroundQueries = []*plan.Query{{RoutineDependencies: []*plan.RoutinePlanDependency{dependency}}}
+				} else {
+					query.RoutineDependencies = []*plan.RoutinePlanDependency{dependency}
+				}
+				if name == "capture error" {
+					query.BackgroundQueries = []*plan.Query{query}
+				}
+				retry := cw.preparedExecutionRetry()
+				require.NotNil(t, retry)
+				require.True(t, history == retry.fieldTypes)
+				require.True(t, temporalHistory == retry.temporalTypes)
+				query.BackgroundQueries = nil
+				query.RoutineDependencies = nil
+				row := []interface{}{uint64(41), uint64(7), uint64(12), uint64(8), uint64(7),
+					udf.LanguageSQL, "VOLATILE", dependency.DefinitionFingerprint, "", "",
+					"", "", int64(0), "", body, args, ret, int64(udf.SQLDefinitionSchemaVersion),
+					"", "", "", udf.NullCallHandler, "DEFINER", "DEFINER"}
+				catalog := &routinePlanValidationExec{catalogResultSets: []interface{}{routinePlanCatalogResultSet(row)}, namespaceResultSets: []interface{}{namespaceRows(member)}}
+				if name == "capture error" {
+					require.ErrorContains(t, retry.fieldRoutineErr, "cycle")
+				} else {
+					require.NoError(t, retry.fieldRoutineErr)
+					require.Len(t, retry.fieldRoutines, 1)
+					require.NotSame(t, dependency, retry.fieldRoutines[0])
+					require.NotSame(t, dependency.FunctionRef, retry.fieldRoutines[0].FunctionRef)
+					dependency.FunctionRef.Revision = 99
+					require.Equal(t, uint64(7), retry.fieldRoutines[0].FunctionRef.Revision)
+				}
+				switch name {
+				case "revision":
+					row[1], row[4] = uint64(8), uint64(8)
+				case "catalog error":
+					catalog.failOn = "mo_user_defined_function"
+				}
+				execution := &routinePlanValidationSession{FeSession: ses, exec: catalog}
+				compiler := ses.GetTxnCompileCtx()
+				originalContext := compiler.GetContext()
+				rebuilt, err := buildPlanForCompileRetry(ec.reqCtx, execution, compiler, prepared.PrepareStmt, false, retry, nil)
+				require.Equal(t, originalContext, compiler.GetContext())
+				require.True(t, history == prepared.fieldTypes, "retry cannot publish replacement FIELD history")
+				require.True(t, temporalHistory == prepared.temporalTypes, "retry cannot publish replacement temporal history")
+				require.True(t, history == retry.fieldTypes)
+				require.True(t, temporalHistory == retry.temporalTypes)
+				switch name {
+				case "unchanged", "nested immutable facts":
+					require.NoError(t, err)
+					require.NotNil(t, rebuilt)
+					require.NotEmpty(t, catalog.statements, "validate through the catalog, not table-only proofs")
+				case "capture error":
+					require.Same(t, retry.fieldRoutineErr, err)
+					require.Empty(t, catalog.statements)
+				case "catalog error":
+					require.ErrorContains(t, err, "injected routine catalog read failure")
+					require.Equal(t, "rollback;", catalog.statements[len(catalog.statements)-1])
+				default:
+					require.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnNeedRetryWithDefChanged), "%v", err)
+				}
+				if name != "unchanged" && name != "nested immutable facts" {
+					require.Nil(t, rebuilt)
+				}
+			})
+		}
 	}
 }

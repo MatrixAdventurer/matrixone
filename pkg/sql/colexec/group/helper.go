@@ -27,13 +27,10 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/common/util"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/hashtable"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/aggexec"
@@ -352,7 +349,7 @@ func (hr *ResHashRelated) IsEmpty() bool {
 func (hr *ResHashRelated) BuildHashTable(
 	ctx context.Context, mp *mpool.MPool,
 	rebuild bool,
-	isStrHash bool, keyNullable bool, groupingAware bool, preAllocated uint64,
+	isStrHash bool, keyNullable bool, preAllocated uint64,
 	hashAllocation *hashtable.AllocationAccountSelection,
 	iteratorAllocation *hashmap.IteratorAllocation,
 ) error {
@@ -392,12 +389,6 @@ func (hr *ResHashRelated) BuildHashTable(
 		}
 		if err != nil {
 			return err
-		}
-		if groupingAware {
-			if err = h.SetGroupingAware(); err != nil {
-				h.Free()
-				return err
-			}
 		}
 		hr.Hash = h
 		if !reuseIterator {
@@ -690,12 +681,6 @@ func (ctr *container) writeSpillRecord(
 			}
 		}
 	}
-	// The record keeps its retired row-metadata trailer flag; current writers
-	// never append the trailer.
-	if err := writeSpillBool(&record, false); err != nil {
-		return 0, 0, err
-	}
-
 	const lastMagic = uint64(0xDEADBEEF12345678)
 	if err := types.WriteInt64(&record, cnt); err != nil {
 		return 0, 0, err
@@ -1016,7 +1001,7 @@ func (ctr *container) prepareSpillReloadRecord(
 		ctr.spillGbBatch, err = ctr.createNewGroupByBatchWithAllocation(
 			nil,
 			record.rows,
-			ctr.spillGroupByAllocation,
+			ctr.spillGroupByMP(),
 		)
 		if err != nil {
 			return record, false, err
@@ -1024,7 +1009,7 @@ func (ctr *container) prepareSpillReloadRecord(
 	}
 	gbBatch := ctr.spillGbBatch
 	gbBatch.CleanOnlyData()
-	if err = unmarshalSpillGroupByRows(reader, gbBatch, record.rows, ctr.mp); err != nil {
+	if err = unmarshalSpillGroupByRows(reader, gbBatch, record.rows, ctr.spillGroupByMP()); err != nil {
 		return record, false, err
 	}
 
@@ -1073,23 +1058,6 @@ func (ctr *container) prepareSpillReloadRecord(
 	record.aggUnmarshalNanos = time.Since(aggStart).Nanoseconds()
 	if aggErr != nil {
 		return record, false, aggErr
-	}
-
-	hasRowMetadataTrailer, err := types.ReadBool(reader)
-	if err != nil {
-		return record, false, err
-	}
-	if hasRowMetadataTrailer {
-		// Written only by older writers; validated and discarded.
-		expectedRows := make([]int, len(ctr.spillAggList))
-		for i, ag := range ctr.spillAggList {
-			expectedRows[i] = ag.GetNumGroups()
-		}
-		if err := readRowMetadataTrailer(
-			proc.Ctx, reader, expectedRows, true, true,
-		); err != nil {
-			return record, false, err
-		}
 	}
 
 	checkMagic, err = types.ReadUint64(reader)
@@ -1518,30 +1486,18 @@ func (ctr *container) newRuntimeEmptyGroupingSetBatch(
 		rows = len(setIDs)
 		rollupColumns--
 	}
-	output := batch.NewOffHeapWithSize(len(groupTypes))
-	if err := output.SetAllocationAccount(ctr.groupByAllocation); err != nil {
-		output.Clean(ctr.mp)
-		return nil, err
-	}
+	output := batch.NewWithSize(len(groupTypes))
+	groupByMP := ctr.groupByMP()
 	for i := 0; i < rollupColumns; i++ {
-		vec, err := vector.NewRollupConstWithAllocation(
-			groupTypes[i], rows, ctr.mp, ctr.groupByAllocation)
-		if err != nil {
-			output.Clean(ctr.mp)
-			return nil, err
-		}
-		output.Vecs[i] = vec
+		output.Vecs[i] = vector.NewConstNull(
+			groupTypes[i], rows, groupByMP)
 	}
 	if setIDs != nil {
-		setIDVector, err := vector.NewOffHeapVecWithTypeAndAllocation(
-			groupTypes[len(groupTypes)-1], ctr.groupByAllocation)
-		if err != nil {
-			output.Clean(ctr.mp)
-			return nil, err
-		}
+		setIDVector := vector.NewVec(
+			groupTypes[len(groupTypes)-1], groupByMP)
 		output.Vecs[len(output.Vecs)-1] = setIDVector
-		if err = vector.AppendFixedList(setIDVector, setIDs, nil, ctr.mp); err != nil {
-			output.Clean(ctr.mp)
+		if err := vector.AppendFixedList(setIDVector, setIDs, nil, groupByMP); err != nil {
+			ctr.cleanGroupBatch(output)
 			return nil, err
 		}
 	}
@@ -1724,20 +1680,7 @@ func (ctr *container) makeAggListWithAllocationMode(
 		for j, arg := range agExpr.GetArgExpressions() {
 			typs[j] = types.MustTypeFromPlan(arg.Typ)
 		}
-		if ctr.legacyTextMinMax || ctr.legacyVarianceState ||
-			ctr.legacyDecimalSumState || ctr.legacyDecimalSumResult {
-			if singleGroup {
-				aggList[i], err = aggexec.MakeSingleGroupAggWithLegacyRemoteState(
-					ctr.mp, agExpr.GetAggID(), agExpr.IsDistinct(), ctr.legacyTextMinMax,
-					ctr.legacyVarianceState, ctr.legacyDecimalSumState, ctr.legacyDecimalSumResult,
-					allocation, agExpr.GetExtraInformation(), typs...)
-			} else {
-				aggList[i], err = aggexec.MakeGroupAggWithLegacyRemoteState(
-					ctr.mp, agExpr.GetAggID(), agExpr.IsDistinct(), ctr.legacyTextMinMax,
-					ctr.legacyVarianceState, ctr.legacyDecimalSumState, ctr.legacyDecimalSumResult,
-					allocation, agExpr.GetExtraInformation(), typs...)
-			}
-		} else if singleGroup {
+		if singleGroup {
 			aggList[i], err = aggexec.MakeSingleGroupAgg(
 				ctr.mp, agExpr.GetAggID(), agExpr.IsDistinct(), allocation,
 				agExpr.GetExtraInformation(), typs...)
@@ -1751,29 +1694,6 @@ func (ctr *container) makeAggListWithAllocationMode(
 			return nil, err
 		}
 		aggexec.ConfigureGroupConcatWarningRetention(aggList[i], limit)
-		if ctr.legacyApproxPercentileState {
-			aggexec.ConfigureApproxPercentileLegacyState(aggList[i])
-		}
-		if ctr.legacyHLLState {
-			if ctr.floatZeroHLLState && hllFloatZeroStateSupported(agExpr.GetAggID()) {
-				aggexec.ConfigureHLLFloatZeroState(aggList[i])
-			} else {
-				aggexec.ConfigureHLLLegacyState(aggList[i])
-			}
-		} else if (ctr.legacyVectorHLLState && hllVectorStateSupported(agExpr)) ||
-			(ctr.legacyTextHLLAddState && hllTextAddStateSupported(agExpr)) ||
-			(ctr.legacyFloatHLLAddState && hllFloatAddStateSupported(agExpr)) {
-			// Keep each producer on v2 until its type family's protocol contract
-			// is understood by every peer (vectors at v88, CHAR/JSON at v91,
-			// FLOAT/DOUBLE at v92).
-			aggexec.ConfigureHLLLegacyState(aggList[i])
-		}
-		if ctr.legacyDistinctFloatKeys {
-			if err := aggexec.ConfigureLegacyDistinctFloatKeys(aggList[i], true); err != nil {
-				freeAggListPartial(aggList, i+1)
-				return nil, err
-			}
-		}
 		aggexec.ConfigureGroupConcatWarningBudget(
 			aggList[i], ctr.groupConcatWarnings.WarningBudget())
 		aggexec.ConfigureGroupConcatTimeZone(aggList[i], ctr.timeZone)
@@ -1799,228 +1719,6 @@ func (ctr *container) makeAggListWithAllocationMode(
 	return aggList, nil
 }
 
-// hllFloatZeroStateSupported is deliberately limited to APPROX_COUNT
-// families. Protocol v76 introduced signed-zero canonicalization for those
-// newly versioned states; persisted HLL_ADD_AGG/HLL_MERGE_AGG states retain
-// their v2 raw-value wire contract until a future explicit migration.
-func hllFloatZeroStateSupported(aggID int64) bool {
-	return aggID == aggexec.AggIdOfApproxCount ||
-		aggID == aggexec.AggIdOfApproxCountDistinct
-}
-
-func hllVectorStateSupported(
-	agg aggexec.AggFuncExecExpression,
-) bool {
-	if agg.GetAggID() != aggexec.AggIdOfHllAdd {
-		return false
-	}
-	args := agg.GetArgExpressions()
-	if len(args) == 0 || args[0] == nil {
-		return false
-	}
-	switch types.T(args[0].Typ.Id) {
-	case types.T_array_float32, types.T_array_float64,
-		types.T_array_bf16, types.T_array_float16, types.T_array_float8, types.T_array_float4:
-		return true
-	default:
-		return false
-	}
-}
-
-func hllTextAddStateSupported(agg aggexec.AggFuncExecExpression) bool {
-	if agg.GetAggID() != aggexec.AggIdOfHllAdd {
-		return false
-	}
-	args := agg.GetArgExpressions()
-	if len(args) == 0 || args[0] == nil {
-		return false
-	}
-	return types.T(args[0].Typ.Id) == types.T_char ||
-		types.T(args[0].Typ.Id) == types.T_json
-}
-
-func hllFloatAddStateSupported(agg aggexec.AggFuncExecExpression) bool {
-	if agg.GetAggID() != aggexec.AggIdOfHllAdd {
-		return false
-	}
-	args := agg.GetArgExpressions()
-	if len(args) == 0 || args[0] == nil {
-		return false
-	}
-	return types.T(args[0].Typ.Id) == types.T_float32 ||
-		types.T(args[0].Typ.Id) == types.T_float64
-}
-
-func useLegacyTextMinMaxForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion14
-}
-
-func useLegacyVarianceStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion35
-}
-
-// Decimal SUM must use the pre-v73 state on every side of a distributed
-// aggregation while the cluster protocol is still mixed. Unlike the older
-// remote-only gates, this includes the coordinator's local MergeGroup: it may
-// consume a partial produced by an older CN.
-func useLegacyDecimalSumState(proc *process.Process) bool {
-	if proc == nil {
-		return true
-	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return true
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion73
-}
-
-func useLegacyApproxPercentileStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion76
-}
-
-// An old coordinator can send a final Group to an upgraded worker without
-// running the upgraded shuffle-plan gate. Below v73 that Group must preserve
-// the old Decimal128 result contract. Partial Groups still use the legacy wire
-// state, while local final Groups and coordinator MergeGroups publish the
-// widened result selected by the upgraded plan.
-func useLegacyDecimalSumResultForRemote(proc *process.Process, needEval bool) bool {
-	if !needEval || !useLegacyDecimalSumState(proc) || proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	return remote
-}
-
-func useLegacyHLLStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion77
-}
-
-func useLegacyVectorHLLStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion88
-}
-
-func useLegacyTextHLLAddStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion91
-}
-
-func useLegacyFloatHLLAddStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return !ok || !valid || version < defines.MORPCVersion92
-}
-
-func useFloatZeroHLLStateForRemote(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return false
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return false
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return ok && valid && version == defines.MORPCVersion76
-}
-
-func groupHashStringWireEnabled(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return true
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return true
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return ok && valid && version >= defines.MORPCVersion78
-}
-
-func canonicalDistinctKeyWireEnabled(proc *process.Process) bool {
-	if proc == nil || proc.Ctx == nil {
-		return true
-	}
-	remote, _ := proc.Ctx.Value(defines.RemoteRunContext{}).(bool)
-	if !remote {
-		return true
-	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return ok && valid && version >= defines.MORPCVersion79
-}
-
 // freeAggListPartial frees the first n aggregators in the list.
 func freeAggListPartial(aggList []aggexec.GroupAggFuncExec, n int) {
 	for i := 0; i < n && i < len(aggList); i++ {
@@ -2035,15 +1733,8 @@ func freeAggList(aggList []aggexec.GroupAggFuncExec) {
 	freeAggListPartial(aggList, len(aggList))
 }
 
-func (ctr *container) sanityCheck() {
-	if util.Debug {
-		originGroupCount := ctr.hr.Hash.GroupCount()
-		batchRowCount := 0
-		for _, batch := range ctr.groupByBatches {
-			batchRowCount += batch.RowCount()
-		}
-		if batchRowCount != int(originGroupCount) {
-			panic(moerr.NewInternalErrorNoCtx("group count mismatch"))
-		}
-	}
+// groupConcatSourceRowWireEnabled reports whether GROUP_CONCAT partials carry
+// their source rows: only when the statement trusts row provenance.
+func groupConcatSourceRowWireEnabled(proc *process.Process) bool {
+	return proc != nil && proc.GroupConcatSourceRowProvenanceTrusted()
 }

@@ -45,18 +45,6 @@ func returningFallbackFeature(err error, fallback string) string {
 	return ""
 }
 
-func returningUpdatePlannerFeature(err error) string {
-	route, reason, routedErr := classifyUpdatePlannerError(err)
-	if route == updatePlannerRejected && reason == updateRouteReasonIrregularIndex &&
-		routedErr != nil && strings.Contains(
-		routedErr.Error(),
-		"update primary key on a table with a synchronous full-text/vector index",
-	) {
-		return "primary-key UPDATE on synchronous full-text/vector index"
-	}
-	return ""
-}
-
 func returningBaseTableExpr(expr tree.TableExpr) bool {
 	switch table := expr.(type) {
 	case *tree.TableName:
@@ -331,6 +319,9 @@ func (builder *QueryBuilder) appendReturningProjection(exprs tree.SelectExprs, b
 	if len(exprs) == 0 {
 		return nil
 	}
+	previousReturningBinding := builder.bindingReturningProjection
+	builder.bindingReturningProjection = true
+	defer func() { builder.bindingReturningProjection = previousReturningBinding }()
 	if builder.returningSourceStep < 0 || builder.returningTableDef == nil {
 		return moerr.NewInternalError(builder.GetContext(), "DML RETURNING row image was not materialized")
 	}
@@ -429,6 +420,27 @@ func (builder *QueryBuilder) appendReturningProjection(exprs tree.SelectExprs, b
 	}
 	for _, col := range binding.cols {
 		returnCtx.bindingByCol[col] = binding
+	}
+	if target := builder.dmlReturningRewrite(); target != nil {
+		// Keep SINK_SCAN positions aligned with the final row image.
+		returnCtx.restrictDMLBinding(binding, target.visible)
+		if target.projection != nil {
+			binding.starColumnOrder = make([]int32, 0, len(target.projection))
+			for _, expr := range target.projection {
+				// Writable projections consist only of direct columns.
+				col := expr.Expr.(*tree.UnresolvedName)
+				pos, ok := binding.colIdByName[strings.ToLower(col.ColName())]
+				if !ok {
+					return moerr.NewInternalError(builder.GetContext(), "DML RETURNING cannot bind a visible role column")
+				}
+				heading := col.ColNameOrigin()
+				if expr.As != nil && !expr.As.Empty() {
+					heading = expr.As.Origin()
+				}
+				binding.starColumnOrder = append(binding.starColumnOrder, pos)
+				binding.originCols[pos] = heading
+			}
+		}
 	}
 
 	selectList, err := appendSelectList(builder, returnCtx, nil, exprs...)

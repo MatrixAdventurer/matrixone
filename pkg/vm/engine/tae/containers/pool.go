@@ -16,6 +16,7 @@ package containers
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	_ "unsafe"
 
@@ -67,7 +68,24 @@ type vectorPoolElement struct {
 	mp    *mpool.MPool
 	vec   *vector.Vector
 	inUse atomic.Bool
+	// lent is the vector holding vec's buffers while they are lent.
+	lent atomic.Pointer[vector.Vector]
 }
+
+// allocated is the memory of the element's buffers, lent or not. Reading a
+// lent vector's size races with its borrower; it is a statistic.
+func (e *vectorPoolElement) allocated() int {
+	if l := e.lent.Load(); l != nil {
+		return l.Allocated()
+	}
+	return e.vec.Allocated()
+}
+
+// lentVectors maps each vector a VectorPool has lent and not yet taken back
+// to its element. A lent vector is a fresh struct holding the element's
+// buffers (see lend), so a stale second release of it can never reach a
+// later borrower of the same buffers.
+var lentVectors sync.Map // *vector.Vector -> *vectorPoolElement
 
 func (e *vectorPoolElement) tryReuse(t *types.Type) bool {
 	if e.inUse.CompareAndSwap(false, true) {
@@ -77,15 +95,70 @@ func (e *vectorPoolElement) tryReuse(t *types.Type) bool {
 	return false
 }
 
+// lend moves the element's buffers into a new vector struct and records it
+// as lent. The element must be in use (tryReuse).
+func (e *vectorPoolElement) lend() *vector.Vector {
+	lent := new(vector.Vector)
+	*lent = *e.vec
+	*e.vec = vector.Vector{}
+	e.lent.Store(lent)
+	lentVectors.Store(lent, e)
+	return lent
+}
+
+// returnToPool returns vec to the VectorPool that lent it, and reports
+// whether it was lent by one.
+//
+// Releases of the same lent vector may overlap. The one that swaps the
+// element's lent pointer from vec to nil owns the take-back; any other finds
+// either the swap already done (and reports true, doing nothing) or, once the
+// take-back has finished, no entry and an empty vec, which frees nothing.
+// The entry is deleted only after vec has been emptied, so no release can
+// see vec unregistered while it still holds the element's buffers.
+func returnToPool(vec *vector.Vector) bool {
+	v, ok := lentVectors.Load(vec)
+	if !ok {
+		return false
+	}
+	e := v.(*vectorPoolElement)
+	if !e.lent.CompareAndSwap(vec, nil) {
+		// another release of vec is taking it back, or already has and the
+		// element has since been lent again as a different vector
+		return true
+	}
+	*e.vec = *vec
+	*vec = vector.Vector{}
+	lentVectors.Delete(vec)
+	e.put()
+	return true
+}
+
+// isLent reports whether vec was lent by a VectorPool and not yet returned.
+func isLent(vec *vector.Vector) bool {
+	_, ok := lentVectors.Load(vec)
+	return ok
+}
+
 func (e *vectorPoolElement) put() {
 	if e.vec.Allocated() > e.pool.maxAlloc {
-		newVec := vector.NewOffHeapVecWithType(*e.vec.GetType())
+		newVec := vector.NewVec(*e.vec.GetType(), e.mp)
 		e.vec.Free(e.mp)
 		e.vec = newVec
 		e.pool.resetStats.Add(1)
 	}
 	if !e.inUse.CompareAndSwap(true, false) {
 		panic("vectorPoolElement.put: vector is not in use")
+	}
+	// Close may have skipped this slot while it was checked out.
+	if e.pool.closed.Load() {
+		e.freeIfIdle()
+	}
+}
+
+func (e *vectorPoolElement) freeIfIdle() {
+	if e.inUse.CompareAndSwap(false, true) {
+		e.vec.Free(e.mp)
+		e.inUse.Store(false)
 	}
 }
 
@@ -95,6 +168,7 @@ func (e *vectorPoolElement) isIdle() bool {
 
 type VectorPool struct {
 	name           string
+	closed         atomic.Bool
 	maxAlloc       int
 	ratio          float64
 	fixSizedPool   []*vectorPoolElement
@@ -165,8 +239,13 @@ func (p *VectorPool) String() string {
 	return str
 }
 
-func (p *VectorPool) GetVector(t *types.Type) *vectorWrapper {
+// GetVector lends a vector of type t; release it with ReleaseVector, which
+// returns it to the pool.
+func (p *VectorPool) GetVector(t *types.Type) Vector {
 	p.totalStats.Add(1)
+	if p.closed.Load() {
+		return MakeVector(*t, p.mp)
+	}
 	if t.IsFixedLen() {
 		if len(p.fixSizedPool) > 0 {
 			for i := 0; i < 4; i++ {
@@ -174,11 +253,7 @@ func (p *VectorPool) GetVector(t *types.Type) *vectorWrapper {
 				element := p.fixSizedPool[idx]
 				if element.tryReuse(t) {
 					p.fixHitStats.Add(1)
-					return &vectorWrapper{
-						wrapped: element.vec,
-						mpool:   element.mp,
-						element: element,
-					}
+					return element.lend()
 				}
 			}
 		}
@@ -189,21 +264,42 @@ func (p *VectorPool) GetVector(t *types.Type) *vectorWrapper {
 				element := p.varlenPool[idx]
 				if element.tryReuse(t) {
 					p.varlenHitStats.Add(1)
-					return &vectorWrapper{
-						wrapped: element.vec,
-						mpool:   element.mp,
-						element: element,
-					}
+					return element.lend()
 				}
 			}
 		}
 	}
 
-	return NewVector(*t, Options{Allocator: p.mp})
+	return MakeVector(*t, p.mp)
+}
+
+// CloneWindow copies rows [offset, offset+length) of src into a vector lent
+// by p; release it with ReleaseVector.
+func (p *VectorPool) CloneWindow(src Vector, offset, length int) (Vector, error) {
+	cloned := p.GetVector(src.GetType())
+	if err := src.CloneWindowTo(cloned, offset, offset+length, cloned.MPool()); err != nil {
+		ReleaseVector(cloned)
+		return nil, err
+	}
+	return cloned, nil
 }
 
 func (p *VectorPool) GetMPool() *mpool.MPool {
 	return p.mp
+}
+
+// Close releases idle buffers. Checked-out vectors remain valid and release
+// their backing memory when returned; allocations after Close are unpooled.
+func (p *VectorPool) Close() {
+	if !p.closed.CompareAndSwap(false, true) {
+		return
+	}
+	for _, e := range p.fixSizedPool {
+		e.freeIfIdle()
+	}
+	for _, e := range p.varlenPool {
+		e.freeIfIdle()
+	}
 }
 
 func (p *VectorPool) Allocated() int {
@@ -216,7 +312,7 @@ func (p *VectorPool) Allocated() int {
 func (p *VectorPool) FixedSizeAllocated() int {
 	size := 0
 	for _, element := range p.fixSizedPool {
-		size += element.vec.Allocated()
+		size += element.allocated()
 	}
 	return size
 }
@@ -224,7 +320,7 @@ func (p *VectorPool) FixedSizeAllocated() int {
 func (p *VectorPool) VarlenaSizeAllocated() int {
 	size := 0
 	for _, element := range p.varlenPool {
-		size += element.vec.Allocated()
+		size += element.allocated()
 	}
 	return size
 }
@@ -237,7 +333,7 @@ func (p *VectorPool) FixedSizeUsed(isUnsafe bool) (int, int) {
 			continue
 		}
 		if isUnsafe {
-			size += element.vec.Allocated()
+			size += element.allocated()
 		}
 		cnt++
 	}
@@ -252,7 +348,7 @@ func (p *VectorPool) VarlenUsed(isUnsafe bool) (int, int) {
 			continue
 		}
 		if isUnsafe {
-			size += element.vec.Allocated()
+			size += element.allocated()
 		}
 		cnt++
 	}
@@ -286,11 +382,30 @@ func (p *VectorPool) Destory() {
 }
 
 func newVectorElement(pool *VectorPool, t *types.Type, mp *mpool.MPool) *vectorPoolElement {
-	vec := vector.NewOffHeapVecWithType(*t)
+	vec := vector.NewVec(*t, mp)
 	element := &vectorPoolElement{
 		pool: pool,
 		mp:   mp,
 		vec:  vec,
 	}
 	return element
+}
+
+// ReleaseVector releases vec: a vector lent by a VectorPool goes back to its
+// pool, any other vector is freed. Releasing a vector again, or the shared
+// EMPTY_VECTOR, does nothing.
+func ReleaseVector(vec Vector) {
+	if vec == nil || vec == EMPTY_VECTOR {
+		return
+	}
+	if returnToPool(vec) {
+		return
+	}
+	// A vector without a pool owns nothing: a read-only view, or a lent
+	// vector already taken back. Leave it untouched, so a late release that
+	// overlaps others writes nothing.
+	if vec.MPool() == nil {
+		return
+	}
+	vec.Free(vec.MPool())
 }

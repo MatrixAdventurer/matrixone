@@ -15,7 +15,6 @@
 package dispatch
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -31,7 +30,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	mock_morpc "github.com/matrixorigin/matrixone/pkg/common/morpc/mock_morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -48,30 +46,6 @@ import (
 type emptyDispatchChild struct {
 	*value_scan.ValueScan
 	called chan struct{}
-}
-
-func TestMarshalRemoteBatchGroupingProtocolGate(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	defer proc.Free()
-	bat := batch.NewWithSize(1)
-	bat.Vecs[0] = vector.NewRollupConst(types.T_int32.ToType(), 2, proc.Mp())
-	bat.SetRowCount(2)
-	defer bat.Clean(proc.Mp())
-	runtime := moruntime.ServiceRuntime(proc.GetService())
-	original, _ := runtime.GetGlobalVariables(moruntime.MOProtocolVersion)
-	t.Cleanup(func() { runtime.SetGlobalVariables(moruntime.MOProtocolVersion, original) })
-	for _, version := range []any{nil, "unknown", int64(86)} {
-		runtime.SetGlobalVariables(moruntime.MOProtocolVersion, version)
-		_, err := marshalRemoteBatch(proc, bat, &bytes.Buffer{})
-		require.ErrorContains(t, err, "MORPCVersion87")
-	}
-	runtime.SetGlobalVariables(moruntime.MOProtocolVersion, int64(87))
-	data, err := marshalRemoteBatch(proc, bat, &bytes.Buffer{})
-	require.NoError(t, err)
-	decoded := batch.NewOffHeapEmpty()
-	defer decoded.Clean(proc.Mp())
-	require.NoError(t, decoded.UnmarshalBinaryForPipeline(data, proc.Mp()))
-	require.Equal(t, 2, decoded.Vecs[0].GetGrouping().Count())
 }
 
 func (child *emptyDispatchChild) Call(*process.Process) (vm.CallResult, error) {
@@ -218,22 +192,58 @@ func TestMarshalRemoteBatchUnknownServiceFailsClosed(t *testing.T) {
 	}
 
 	legacy := batch.NewWithSize(1)
-	legacy.Vecs[0] = vector.NewVec(types.T_text.ToType())
+	legacy.Vecs[0] = vector.NewVec(types.T_text.ToType(), proc.Mp())
 	require.NoError(t, vector.AppendBytes(legacy.Vecs[0], []byte("plain"), false, proc.Mp()))
 	legacy.SetRowCount(1)
 	defer legacy.Clean(proc.Mp())
 
-	buf := bytes.NewBufferString("sentinel")
+	mp := mpool.MustNewZero()
+	buf := mpool.NewMessageBuffer(mp, maxRetainedSendBuffer)
+	_, err := buf.Write([]byte("sentinel"))
+	require.NoError(t, err)
 	var encoded []byte
-	var err error
 	require.NotPanics(t, func() {
-		encoded, err = marshalRemoteBatch(proc, legacy, buf)
+		encoded, err = marshalRemoteBatch(proc, legacy, &buf)
 	})
 	require.NoError(t, err)
 	expected, err := legacy.MarshalBinary()
 	require.NoError(t, err)
 	require.Equal(t, expected, encoded,
 		"unknown service without metadata keeps the legacy wire format")
+
+	// The next batch reuses the buffer: no new allocation from its pool.
+	allocated := mp.Stats().NumAlloc.Load()
+	again, err := marshalRemoteBatch(proc, legacy, &buf)
+	require.NoError(t, err)
+	require.Equal(t, expected, again)
+	require.True(t, &encoded[0] == &again[0])
+	require.Equal(t, allocated, mp.Stats().NumAlloc.Load())
+	buf.Free()
+	require.Zero(t, mp.CurrNB())
+}
+
+// A dispatch operator keeps its send buffer across executions and frees it
+// when it is freed or released.
+func TestDispatchSendBufferLifetime(t *testing.T) {
+	proc := testutil.NewProcess(t)
+	defer proc.Free()
+	bat := batch.NewWithSize(1)
+	bat.Vecs[0] = vector.NewVec(types.T_int64.ToType(), proc.Mp())
+	require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(1), false, proc.Mp()))
+	bat.SetRowCount(1)
+	defer bat.Clean(proc.Mp())
+
+	d := NewArgument()
+	before := dispatchSendPool.CurrNB()
+	_, err := marshalRemoteBatch(proc, bat, &d.sendBuf)
+	require.NoError(t, err)
+	require.Greater(t, dispatchSendPool.CurrNB(), before)
+	d.Free(proc, false, nil)
+	require.Equal(t, before, dispatchSendPool.CurrNB())
+	_, err = marshalRemoteBatch(proc, bat, &d.sendBuf)
+	require.NoError(t, err)
+	d.Release()
+	require.Equal(t, before, dispatchSendPool.CurrNB())
 }
 
 func TestPrepareRemote(t *testing.T) {
@@ -1106,23 +1116,23 @@ func testDispatchAllocationClearFinalizesSpool(t *testing.T, abort bool) {
 	require.NoError(t, err)
 	account, err := registry.Open(1 << 20)
 	require.NoError(t, err)
-	selection, err := vector.NewAllocationAccountSelection(
-		account,
-		1,
-		102,
-		103,
-	)
+	producerMP, err := mp.WithAccount(account, 1, 102, mpool.AllocationCapacityClassDefault)
 	require.NoError(t, err)
-	src := batch.NewOffHeapWithSize(1)
-	require.NoError(t, src.SetAllocationAccount(selection))
-	src.SetVector(0, vector.NewOffHeapVecWithType(types.T_int64.ToType()))
-	require.NoError(t, vector.AppendFixed(src.Vecs[0], int64(1), false, mp))
+	src := batch.NewWithSize(1)
+	src.SetVector(0, vector.NewVec(types.T_int64.ToType(), producerMP))
+	require.NoError(t, vector.AppendFixed(src.Vecs[0], int64(1), false, producerMP))
 	src.SetRowCount(1)
+	sourceUsed := account.Snapshot().Used
 
-	sp := pSpool.InitMyPipelineSpool(mp, 1)
+	// The spool is built on the bound account's view, as Prepare does.
+	spoolMP, err := mp.WithAccount(account, mpool.AllocationOwnerSelection,
+		dispatchAllocationSiteSpool, mpool.AllocationCapacityClassDefault)
+	require.NoError(t, err)
+	sp := pSpool.InitMyPipelineSpool(spoolMP, 1)
 	done, err := sp.SendBatch(context.Background(), 0, src, nil)
 	require.NoError(t, err)
 	require.False(t, done)
+	require.Greater(t, account.Snapshot().Used, sourceUsed)
 
 	d := &Dispatch{}
 	require.NoError(t, d.SetAllocationAccount(account))
@@ -1136,7 +1146,7 @@ func testDispatchAllocationClearFinalizesSpool(t *testing.T, abort bool) {
 		sp.ReleaseCurrent(0)
 	} else {
 		d.cleanupSpool = sp
-		sp.ForceCleanupAfterTerminalSignal()
+		sp.ReleaseCache()
 	}
 	d.CleanupDeferredSpool()
 	require.Same(t, sp, d.cleanupSpool)
@@ -1147,7 +1157,7 @@ func testDispatchAllocationClearFinalizesSpool(t *testing.T, abort bool) {
 	require.NoError(t, d.ClearAllocationAccount(account))
 	require.Nil(t, d.cleanupSpool)
 
-	src.Clean(mp)
+	src.Clean(producerMP)
 	snapshot := account.Seal()
 	require.Zero(t, snapshot.Used)
 	_, err = registry.Finalize(account)
@@ -1169,7 +1179,7 @@ func TestShuffleRetiresCertifiedStopWithoutDataLoss(t *testing.T) {
 		remoteToIdx:     map[uuid.UUID]int{uid: 0},
 	}}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	done, err := sendBatToIndexOutcome(d, proc, bat, 0)
@@ -1286,7 +1296,7 @@ func TestSendBatchRetiresCertifiedStop(t *testing.T) {
 func newDispatchSpoolTestBatch(t *testing.T, mp *mpool.MPool, rows int) *batch.Batch {
 	t.Helper()
 	src := batch.NewWithSize(1)
-	src.Vecs[0] = vector.NewVec(types.New(types.T_int64, 0, 0))
+	src.Vecs[0] = vector.NewVec(types.New(types.T_int64, 0, 0), mp)
 	values := make([]int64, rows)
 	for i := range values {
 		values[i] = int64(i + 1)
@@ -1318,7 +1328,7 @@ func Test_sendBatToMultiMatchedReg_ReceiverRemoved(t *testing.T) {
 		},
 	}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	// shuffleIndex=0, localRegsCnt=2, remoteToIdx[uid]=0
@@ -1530,7 +1540,7 @@ func TestSendToAllRemoteFunc_ReceiverFailure(t *testing.T) {
 		},
 	}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	// SendToAll should fail when any receiver is done
@@ -1563,7 +1573,7 @@ func TestSendToAnyRemoteFunc_ReceiverFailure(t *testing.T) {
 		},
 	}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	end, err := sendToAnyRemoteFunc(bat, d, proc)
@@ -1590,7 +1600,7 @@ func Test_sendToAnyRemoteFunc_RemoteRegsCntZero(t *testing.T) {
 		},
 	}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	// Should hit the error path: if ap.ctr.remoteRegsCnt == 0
@@ -1623,7 +1633,7 @@ func Test_sendToAnyRemoteFunc_NetworkError(t *testing.T) {
 
 func TestSendToAnyFunc_PropagatesLocalError(t *testing.T) {
 	proc := testutil.NewProcess(t)
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 	want := moerr.NewInternalErrorNoCtx("local send failed")
 
@@ -1646,7 +1656,7 @@ func TestSendToAnyFunc_PropagatesLocalError(t *testing.T) {
 
 func TestSendToAnyFunc_PropagatesRemoteError(t *testing.T) {
 	proc := testutil.NewProcess(t)
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 	want := moerr.NewInternalErrorNoCtx("remote send failed")
 
@@ -1669,7 +1679,7 @@ func TestSendToAnyFunc_PropagatesRemoteError(t *testing.T) {
 
 func TestSendToAnyFunc_FallbackFromLocalToRemote(t *testing.T) {
 	proc := testutil.NewProcess(t)
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 
 	localStub := gostub.Stub(&sendToAnyLocal, func(*batch.Batch, *Dispatch, *process.Process) (bool, error) {
@@ -1699,7 +1709,7 @@ func TestSendToAnyFunc_FallbackFromLocalToRemote(t *testing.T) {
 
 func TestSendToAnyFunc_FallbackRemoteErrorIsPropagated(t *testing.T) {
 	proc := testutil.NewProcess(t)
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 	want := moerr.NewInternalErrorNoCtx("fallback remote failed")
 	localCalled := false
@@ -1750,7 +1760,7 @@ func TestShuffleScenario_TargetReceiverFailed(t *testing.T) {
 		},
 	}
 
-	bat := batch.New(nil)
+	bat := batch.NewWithSize(0)
 	bat.SetRowCount(1)
 	bat.ShuffleIDX = 0 // This batch should go to receiver 0
 
@@ -1969,4 +1979,26 @@ func TestShuffleLocalReceiverTermination(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestDispatchSpoolChargesBoundAccount(t *testing.T) {
+	proc := testutil.NewProcessWithOwnedMPool(t, "", mpool.MustNewZero())
+	defer proc.Free()
+	d := &Dispatch{}
+	unbound, err := d.spoolMP(proc)
+	require.NoError(t, err)
+	require.Same(t, proc.Mp(), unbound)
+
+	registry, err := mpool.NewAllocationAccountRegistry(1, 16)
+	require.NoError(t, err)
+	account, err := registry.Open(1 << 20)
+	require.NoError(t, err)
+	require.NoError(t, d.SetAllocationAccount(account))
+	bound, err := d.spoolMP(proc)
+	require.NoError(t, err)
+	require.Same(t, account, bound.ViewAccount())
+	require.NoError(t, d.ClearAllocationAccount(account))
+	require.Zero(t, account.Seal().Used)
+	_, err = registry.Finalize(account)
+	require.NoError(t, err)
 }

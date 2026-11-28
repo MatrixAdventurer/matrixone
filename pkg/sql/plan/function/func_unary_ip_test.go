@@ -304,7 +304,7 @@ func TestIPFunctionRegisteredExecutors(t *testing.T) {
 	makeInput := func(typ types.Type, values any, flags []bool, constant bool) *vector.Vector {
 		var nsp *nulls.Nulls
 		if len(flags) > 0 {
-			nsp = nulls.NewWithSize(len(flags))
+			nsp = mustNullsOK(nulls.NewWithSize(len(flags), bitmapTestMP))
 			for i, isNull := range flags {
 				if isNull {
 					nsp.Add(uint64(i))
@@ -663,7 +663,7 @@ func TestInetNtoaDynamicRejectsNonNullAny(t *testing.T) {
 	proc := testutil.NewProcess(t)
 	data, err := proc.Mp().Alloc(types.VarlenaSize, false)
 	require.NoError(t, err)
-	input := vector.NewVecWithData(types.T_any.ToType(), 1, data, nil)
+	input := vector.NewVecWithData(types.T_any.ToType(), 1, data, nil, proc.Mp())
 	input.SetClass(vector.CONSTANT)
 	defer input.Free(proc.Mp())
 

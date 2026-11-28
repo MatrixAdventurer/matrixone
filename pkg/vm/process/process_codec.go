@@ -230,7 +230,7 @@ func NewCodecService(
 	partitionService partitionservice.PartitionService,
 	queryClient qclient.QueryClient,
 	hakeeper logservice.CNHAKeeperClient,
-	udfService udf.Service,
+	udfService udf.Runtime,
 	engine engine.Engine,
 ) ProcessCodecService {
 	mp, err := mpool.NewMPool("codec", 1<<40, mpool.NoFixed)
@@ -257,7 +257,7 @@ type codecService struct {
 	partitionService partitionservice.PartitionService
 	queryClient      qclient.QueryClient
 	hakeeper         logservice.CNHAKeeperClient
-	udfService       udf.Service
+	udfService       udf.Runtime
 	mp               *mpool.MPool
 	engine           engine.Engine
 }
@@ -454,7 +454,7 @@ func decodeTypedPrepareParams(encoded [][]byte, paramCount int, mp *mpool.MPool)
 		if len(data) == 0 {
 			continue
 		}
-		vec := new(vector.Vector)
+		vec := vector.NewVec(types.T_any.ToType(), mp)
 		if err := vec.UnmarshalBinaryWithCopy(data, mp); err != nil {
 			typed.Clean(mp)
 			return nil, err

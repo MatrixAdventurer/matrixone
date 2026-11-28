@@ -53,7 +53,7 @@ func TestSortRollupLaterDecimalFinalizerFailure(t *testing.T) {
 	require.NoError(t, err)
 	input := batch.NewWithSize(2)
 	input.Vecs[0] = testutil.MakeInt32Vector([]int32{1, 1}, nil, proc.Mp())
-	input.Vecs[1] = vector.NewVec(typ)
+	input.Vecs[1] = vector.NewVec(typ, proc.Mp())
 	require.NoError(t, vector.AppendFixed(input.Vecs[1], max, false, proc.Mp()))
 	require.NoError(t, vector.AppendFixed(input.Vecs[1], types.Decimal256FromInt64(1), false, proc.Mp()))
 	input.SetRowCount(2)
@@ -117,11 +117,11 @@ func TestSortRollupSingleGroupReuseAndMixedFallback(t *testing.T) {
 			require.Equal(t, []int32{1, 2, 3, 0}, vector.MustFixedColNoTypeCheck[int32](out.Vecs[0]))
 			require.Equal(t, []int64{2, 1, 1, 4}, vector.MustFixedColNoTypeCheck[int64](out.Vecs[1]))
 			for row, sum := range []int64{6, 0, 2, 8} {
-				require.Equal(t, row == 3, out.Vecs[0].GetGrouping().Contains(uint64(row)))
+				require.Equal(t, row == 3, out.Vecs[0].IsNull(uint64(row)))
 				require.Equal(t, row == 1, out.Vecs[2].IsNull(uint64(row)))
 				require.Equal(t, row == 1, out.Vecs[3].IsNull(uint64(row)))
 				if row != 1 {
-					require.Equal(t, sum, vector.GetFixedAtNoTypeCheck[int64](out.Vecs[2], row))
+					require.Equal(t, types.Decimal128FromInt64(sum), vector.GetFixedAtNoTypeCheck[types.Decimal128](out.Vecs[2], row))
 					avg := vector.GetFixedAtNoTypeCheck[types.Decimal128](out.Vecs[3], row)
 					require.Equal(t, []string{"3.0000", "", "2.0000", "2.6667"}[row], avg.Format(out.Vecs[3].GetType().Scale))
 				}
@@ -227,7 +227,8 @@ func TestSortRollupAppendFailureAbortsAndReprepares(t *testing.T) {
 				} else {
 					require.Zero(t, s.outputRows)
 				}
-				oldSelection := s.output.Vecs[1].AllocationAccountSelection()
+				oldAccount := g.ctr.groupByAllocation.ViewAccount()
+				require.NotNil(t, oldAccount)
 				_, rejected := controller.snapshot()
 				require.True(t, rejected)
 				g.Reset(proc, true, err)
@@ -253,7 +254,8 @@ func TestSortRollupAppendFailureAbortsAndReprepares(t *testing.T) {
 				result, err = vm.Exec(g, proc)
 				require.NoError(t, err)
 				require.NotNil(t, result.Batch)
-				require.False(t, vector.AllocationAccountSelectionsEqual(oldSelection, result.Batch.Vecs[1].AllocationAccountSelection()))
+				require.NotSame(t, oldAccount, g.ctr.groupByAllocation.ViewAccount())
+				require.Same(t, allocation.account, g.ctr.groupByAllocation.ViewAccount())
 				require.Equal(t, []int64{1, 1}, vector.MustFixedColNoTypeCheck[int64](result.Batch.Vecs[1]))
 				for row := 0; row < 2; row++ {
 					require.Equal(t, types.Decimal128FromInt64(7), vector.GetFixedAtNoTypeCheck[types.Decimal128](result.Batch.Vecs[2], row))

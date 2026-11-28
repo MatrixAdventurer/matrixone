@@ -1677,6 +1677,8 @@ func getNumOfCharacters(str string) int {
 	return len(strRune)
 }
 
+// Preserve every input until binding and execution. SQL formatting is lossy,
+// and even identical inputs may produce different rows or have side effects.
 func getUnionSelects(ctx context.Context, stmt *tree.UnionClause, selects *[]tree.Statement, unionTypes *[]plan.Node_NodeType) error {
 	switch leftStmt := stmt.Left.(type) {
 	case *tree.UnionClause:
@@ -1697,24 +1699,10 @@ func getUnionSelects(ctx context.Context, stmt *tree.UnionClause, selects *[]tre
 	// right is not UNION always
 	switch rightStmt := stmt.Right.(type) {
 	case *tree.SelectClause:
-		if stmt.Type == tree.UNION && !stmt.All {
-			rightStr := tree.String(rightStmt, dialect.MYSQL)
-			if len(*selects) == 1 && tree.String((*selects)[0], dialect.MYSQL) == rightStr {
-				return nil
-			}
-		}
-
 		*selects = append(*selects, rightStmt)
 	case *tree.ValuesClause:
 		*selects = append(*selects, rightStmt)
 	case *tree.ParenSelect:
-		if stmt.Type == tree.UNION && !stmt.All {
-			rightStr := tree.String(rightStmt.Select, dialect.MYSQL)
-			if len(*selects) == 1 && tree.String((*selects)[0], dialect.MYSQL) == rightStr {
-				return nil
-			}
-		}
-
 		*selects = append(*selects, rightStmt.Select)
 	default:
 		return moerr.NewParseErrorf(ctx, "unexpected statement in union2: '%v'", tree.String(rightStmt, dialect.MYSQL))
@@ -1918,6 +1906,41 @@ func ConstantFold(bat *batch.Batch, expr *plan.Expr, proc *process.Process, varA
 		bat, expr, proc, varAndParamIsConst, foldInExpr, containsDynamicParam(expr), false, false)
 }
 
+func foldBoundConstant(ctx context.Context, expr *plan.Expr, proc *process.Process) (*plan.Expr, error) {
+	return ConstantFold(batch.EmptyForConstFoldBatch, expr, processForBoundExpr(ctx, expr, proc), false, true)
+}
+
+func processForBoundExpr(ctx context.Context, expr *plan.Expr, proc *process.Process) *process.Process {
+	if proc != nil && ctx != nil && containsJSONExtraction(expr) {
+		// A binder fold can run after the previous pipeline has stopped.
+		// Use the current request for this expression, including any JSON
+		// extraction the executor still has to evaluate inside a parent call.
+		proc = proc.NewNoContextChildProc(0)
+		proc.Ctx = ctx
+	}
+	return proc
+}
+
+func containsJSONExtraction(expr *plan.Expr) bool {
+	if fn := expr.GetF(); fn != nil {
+		id, _ := function.DecodeOverloadID(fn.GetFunc().GetObj())
+		if id == function.JSON_EXTRACT {
+			return true
+		}
+		for _, arg := range fn.Args {
+			if containsJSONExtraction(arg) {
+				return true
+			}
+		}
+	}
+	for _, item := range expr.GetList().GetList() {
+		if containsJSONExtraction(item) {
+			return true
+		}
+	}
+	return false
+}
+
 func constantFoldWithPreparedExactSource(
 	bat *batch.Batch,
 	expr *plan.Expr,
@@ -2013,6 +2036,11 @@ func constantFoldWithPreparedExactSource(
 
 	fn := expr.GetF()
 	if fn == nil || proc == nil {
+		return expr, nil
+	}
+	// Typed external routines are execute-time calls. Do not let statistics or
+	// binder-side folding execute or replace a captured FunctionRef/revision.
+	if fn.RoutineCall != nil {
 		return expr, nil
 	}
 
@@ -3772,6 +3800,9 @@ func resetPreparePlan(
 				}
 			}
 		}
+		if transientQuery != nil {
+			subqueryRoots.pending = append(subqueryRoots.pending, transientQuery.Steps...)
+		}
 		visitedRoots := make(map[int32]struct{})
 		for len(subqueryRoots.pending) > 0 {
 			root := subqueryRoots.pending[0]
@@ -3820,6 +3851,7 @@ func resetPreparePlan(
 			querySchemas = appendPrepareSchemas(
 				querySchemas, transientQuery.GetCatalogDependencies()...)
 		}
+		querySchemas = appendPrepareSchemas(nil, querySchemas...)
 		return querySchemas, getParamRule.paramTypes, nil
 	}
 
@@ -4574,7 +4606,7 @@ func (rule *preparedRuntimeTextComparisonScanRule) paramTypeIsText(position int)
 }
 
 func preparedParamValueIsNull(param ParamValue) bool {
-	return param.Value == nil && param.MaterializedValue == ""
+	return param.Value == nil
 }
 
 func preparedGeometrySRIDParamPositionsInExpr(expr *plan.Expr) []int32 {
@@ -4868,7 +4900,7 @@ func specializePreparedGenerateSeries(ctx context.Context, plan0 *Plan, values [
 			if marker.Pos < 0 || int(marker.Pos) >= len(values) {
 				continue
 			}
-			param, ok := values[marker.Pos].(ParamValue)
+			param, ok := AsParamValue(values[marker.Pos])
 			if !ok {
 				continue
 			}
@@ -5488,9 +5520,9 @@ func collectPreparedParamPositions(expr *Expr, positions map[int32]struct{}) {
 func validatePreparedPaginationValue(value any) (valid bool, negative bool) {
 	kind := types.StringConversionString
 	isBinaryProtocol := false
-	if param, ok := value.(ParamValue); ok {
+	if param, ok := AsParamValue(value); ok {
 		value = param.Value
-		kind = param.PrepareParamKind
+		kind = ParamValueKind(param)
 		isBinaryProtocol = param.IsBinaryProtocol
 	}
 	if value == nil {
@@ -5514,15 +5546,14 @@ func validatePreparedPaginationValue(value any) (valid bool, negative bool) {
 	case uint, uint8, uint16, uint32, uint64, types.MoYear, bool:
 		return true, false
 	case string:
-		if kind == types.StringConversionBoolean {
-			return value == "0" || value == "1", false
-		}
-		// Connector/ODBC converts SQL_INTEGER and SQL_BIGINT values to their
-		// decimal text form and binds them as MYSQL_TYPE_STRING for server-side
-		// prepared statements. Accept that wire representation only when the
-		// value came from COM_STMT_EXECUTE. SQL PREPARE user variables and
-		// other non-binary-protocol text values keep the stricter validation.
-		if kind != types.StringConversionInteger && !isBinaryProtocol {
+		// Integer and Boolean parameters arrive as native values. Text is valid
+		// only in one form: Connector/ODBC converts SQL_INTEGER and SQL_BIGINT
+		// values to their decimal text form and binds them as MYSQL_TYPE_STRING
+		// for server-side prepared statements. Accept that wire representation
+		// only when the value came from COM_STMT_EXECUTE. SQL PREPARE user
+		// variables and other non-binary-protocol text values keep the stricter
+		// validation.
+		if !isBinaryProtocol || kind != types.StringConversionString {
 			return false, false
 		}
 		if strings.HasPrefix(value, "-") {
@@ -5556,7 +5587,7 @@ func PreparedParamValueHasNumericRuntime(value any) bool {
 // direct SELECT ? remains TEXT unless the protocol supplied an explicit
 // numeric type; this helper is only used while rebinding a function argument.
 func PreparedParamValueNumericReprepareType(value any) (types.Type, bool) {
-	if param, ok := value.(ParamValue); ok {
+	if param, ok := AsParamValue(value); ok {
 		if param.Value == nil {
 			return types.Type{}, false
 		}
@@ -5566,20 +5597,8 @@ func PreparedParamValueNumericReprepareType(value any) (types.Type, bool) {
 		if param.HasSourceType && preparedRuntimeTypeIsNumeric(param.SourceType) {
 			return preparedNumericReprepareType(param.SourceType)
 		}
-		switch param.PrepareParamKind {
-		case types.StringConversionInteger:
-			if typ, ok := PreparedRuntimeTypeFromString(strings.TrimSpace(fmt.Sprint(param.Value))); ok && typ.Oid.IsInteger() {
-				return preparedNumericReprepareType(typ)
-			}
-			// Preserve the protocol domain even for an internally malformed value;
-			// materialization remains responsible for returning the existing error.
-			return types.T_int64.ToType(), true
-		case types.StringConversionFloat:
-			return types.T_float64.ToType(), true
-		case types.StringConversionDecimal:
+		if ParamValueKind(param) == types.StringConversionDecimal {
 			return mysqlPreparedDecimalReprepareType(), true
-		case types.StringConversionBoolean:
-			return types.T_int64.ToType(), true
 		}
 		return PreparedParamValueNumericReprepareType(param.Value)
 	}
@@ -6142,7 +6161,7 @@ func preparedNumericPrefixParamPositions(preparePlan *Plan, paramVals []any) map
 	positions := make(map[int]bool)
 	candidates := make([]any, len(paramVals))
 	for i, value := range paramVals {
-		param, ok := value.(ParamValue)
+		param, ok := AsParamValue(value)
 		if !ok {
 			candidates[i] = value
 			continue
@@ -6168,7 +6187,7 @@ func preparedNumericPrefixParamPositions(preparePlan *Plan, paramVals []any) map
 		return positions
 	}
 	for i, value := range candidates {
-		param, ok := value.(ParamValue)
+		param, ok := AsParamValue(value)
 		if ok && param.EnableNumericPrefix {
 			positions[i] = true
 		}
@@ -6383,9 +6402,9 @@ func preparedWindowArgumentParamPosition(expr *Expr) (int32, bool) {
 
 func isPositivePreparedInteger(value any) bool {
 	kind := types.StringConversionString
-	if paramValue, ok := value.(ParamValue); ok {
+	if paramValue, ok := AsParamValue(value); ok {
 		value = paramValue.Value
-		kind = paramValue.PrepareParamKind
+		kind = ParamValueKind(paramValue)
 	}
 	if value == nil || kind != types.StringConversionString && kind != types.StringConversionInteger {
 		return false
@@ -6414,12 +6433,6 @@ func isPositivePreparedInteger(value any) bool {
 		return value > 0 && value <= uint64(math.MaxInt64)
 	case types.MoYear:
 		return value > 0
-	case string:
-		if kind != types.StringConversionInteger {
-			return false
-		}
-		parsed, err := strconv.ParseUint(value, 10, 63)
-		return err == nil && parsed > 0
 	default:
 		return false
 	}
@@ -6666,30 +6679,23 @@ func preparedRuntimeParamExpr(ctx context.Context, value any, isBin bool, runtim
 
 func isNonNegativePreparedInteger(value any) bool {
 	kind := types.StringConversionString
-	if paramValue, ok := value.(ParamValue); ok {
+	if paramValue, ok := AsParamValue(value); ok {
 		value = paramValue.Value
-		kind = paramValue.PrepareParamKind
+		kind = ParamValueKind(paramValue)
 	}
 	if value == nil || kind == types.StringConversionFloat || kind == types.StringConversionDecimal {
 		return false
 	}
 	if kind == types.StringConversionBoolean {
-		switch value := value.(type) {
-		case bool:
-			return true
-		case string:
-			return value == "0" || value == "1"
-		default:
-			return false
-		}
+		_, isBool := value.(bool)
+		return isBool
 	}
 	if _, ok := value.(bool); ok {
 		return true
 	}
-	valid, negative := validatePreparedPaginationValue(ParamValue{
-		Value:            value,
-		PrepareParamKind: kind,
-	})
+	// Validate the bare value: the COM_STMT integer-text form accepted for
+	// LIMIT/OFFSET (see validatePreparedPaginationValue) is not accepted here.
+	valid, negative := validatePreparedPaginationValue(value)
 	return valid && !negative
 }
 
@@ -6746,11 +6752,8 @@ func replaceParamValsWithSelection(
 		numericPrefixSource := false
 		retainParamRef := false
 		runtimeStringDomain := types.RuntimeStringInherit
-		if param, ok := val.(ParamValue); ok {
+		if param, ok := AsParamValue(val); ok {
 			val = param.Value
-			if param.MaterializedValue != "" {
-				val = param.MaterializedValue
-			}
 			isBin = param.IsBin
 			runtimeType = param.RuntimeType
 			hasRuntimeType = param.HasRuntimeType
@@ -6865,7 +6868,7 @@ func replaceParamValsWithSelection(
 		if selected != nil && (i >= len(selected) || !selected[i]) {
 			continue
 		}
-		param, ok := val.(ParamValue)
+		param, ok := AsParamValue(val)
 		if !ok {
 			continue
 		}
@@ -6875,7 +6878,7 @@ func replaceParamValsWithSelection(
 			}
 			continue
 		}
-		if param.PrepareParamKind == types.StringConversionBoolean {
+		if ParamValueKind(param) == types.StringConversionBoolean {
 			// database/sql encodes bool as MYSQL_TYPE_TINY. Keep the Boolean
 			// literal for functions such as JSON_SET, but retain its numeric
 			// protocol domain while selecting comparison coercion.
@@ -6896,7 +6899,7 @@ func replaceParamValsWithSelection(
 		if selected != nil && (i >= len(selected) || !selected[i]) {
 			continue
 		}
-		if param, ok := val.(ParamValue); ok {
+		if param, ok := AsParamValue(val); ok {
 			if param.IsBinaryProtocol {
 				paramRule.inferTextParamPositions[i] = true
 			}
@@ -6905,7 +6908,7 @@ func replaceParamValsWithSelection(
 			}
 			if param.EnableNumericPrefix && numericPrefixPositions[i] {
 				paramRule.numericPrefixParamPositions[i] = true
-				paramRule.numericPrefixParamKinds[i] = param.PrepareParamKind
+				paramRule.numericPrefixParamKinds[i] = ParamValueKind(param)
 				// The numeric-prefix capability is the stronger execute-time
 				// contract only when this position is selected by the
 				// decimal-aware common-type path. Do not also route that marker
@@ -7730,6 +7733,18 @@ func preparedSetOperationCommonType(
 		original := makeTypeByPlan2Expr(&plan.Expr{Typ: currentOutputType})
 		return original, original.Oid != types.T_any, nil
 	}
+	// Recompute the string domain and bound when EXECUTE replaces provisional
+	// input types. A raw binary-character output still belongs to the original
+	// grouping or expression producer rather than a materialized set column.
+	oldType := makeTypeByPlan2Type(currentOutputType)
+	if oldType.Oid.IsMySQLString() && !function.IsBinaryCharacterType(oldType) &&
+		slices.ContainsFunc(argTypes, function.IsBinaryCharacterType) {
+		target, err := setOperationMaterializedStringType(ctx, argExprs, currentOutputType)
+		if err != nil {
+			return types.Type{}, false, err
+		}
+		return makeTypeByPlan2Type(target), true, nil
+	}
 	if pureCharType, ok := setOperationPureCharCommonType(argTypes); ok {
 		return pureCharType, true, nil
 	}
@@ -8508,7 +8523,7 @@ func refreshPreparedPlanProjectionTypes(
 }
 
 func runtimeParamHasExplicitType(value any) bool {
-	param, ok := value.(ParamValue)
+	param, ok := AsParamValue(value)
 	return ok && param.HasRuntimeType
 }
 

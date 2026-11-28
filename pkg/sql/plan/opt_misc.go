@@ -247,15 +247,10 @@ func (builder *QueryBuilder) canRemoveProject(parentType plan.Node_NodeType, nod
 		// residual and enumerate every duplicate-key match.
 		return false
 	}
-	if _, protected := builder.materializedLockKeyProjects[node.NodeId]; protected {
-		// The barrier CHECK/FK FILTER consumes this project's computed
-		// unique lock-key columns positionally, and the restored row image
-		// exports them as columns to every downstream writer. Inlining the
-		// project would re-evaluate the key expression once per consumer
-		// after arbitration rows were already filtered.
+	if _, protected := builder.materializedDMLProjects[node.NodeId]; protected {
 		return false
 	}
-	if node.NodeType != plan.Node_PROJECT || node.Limit != nil || node.Offset != nil {
+	if node.NodeType != plan.Node_PROJECT || node.Limit != nil || node.Offset != nil || node.ValuesWarningRow() != 0 {
 		return false
 	}
 	if _, groupingSetExpand := DecodeGroupingSetExpandOption(node.ExtraOptions); groupingSetExpand {
@@ -1889,7 +1884,7 @@ func comparisonEvaluationIsTotal(functionID int32, left, right plan.Type) bool {
 	}
 
 	switch leftID {
-	case types.T_bool,
+	case types.T_bool, types.T_bit,
 		types.T_uint8, types.T_uint16, types.T_uint32, types.T_uint64,
 		types.T_int8, types.T_int16, types.T_int32, types.T_int64,
 		types.T_float32, types.T_float64,
@@ -1903,11 +1898,6 @@ func comparisonEvaluationIsTotal(functionID int32, left, right plan.Type) bool {
 		types.T_array_int8, types.T_array_uint8,
 		types.T_year:
 		return true
-	case types.T_bit:
-		// notEqualFn currently routes BIT through the varlena executor even
-		// though BIT is fixed-width.  Keep that resolved overload behind the
-		// blocking Aggregate; equality and ordering use fixed-width executors.
-		return functionID != function.NOT_EQUAL
 	case types.T_geometry, types.T_geometry32:
 		return isTruncationSafeEquality(functionID)
 	case types.T_enum:

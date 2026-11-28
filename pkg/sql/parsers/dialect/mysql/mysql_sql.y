@@ -199,6 +199,8 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 }
 
 %union {
+    renameUserPairs []tree.RenameUserPair
+
     statement tree.Statement
     statements []tree.Statement
 
@@ -256,6 +258,7 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
     funcArgs tree.FunctionArgs
     funcArgDecl *tree.FunctionArgDecl
     funcReturn *tree.ReturnType
+    pythonFunctionOptions tree.PythonFunctionOptions
 
     procName *tree.ProcedureName
     procArg tree.ProcedureArg
@@ -479,6 +482,8 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 
 %token LEX_ERROR
 %token <str> JSON_TABLE JSON_TABLE_PATH JSON_TABLE_NESTED JSON_TABLE_ORDINALITY JSON_TABLE_EMPTY JSON_TABLE_ERROR
+%type <renameUserPairs> rename_user_pairs
+
 %type <jsonTableColumn> json_table_column json_table_policies
 %type <jsonTableColumns> json_table_columns
 %type <jsonTableResponse> json_table_response json_table_on_empty json_table_on_error
@@ -617,6 +622,7 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 // Revoke
 %token <str> REVOKE FUNCTION PRIVILEGES TABLESPACE EXECUTE SUPER GRANT OPTION REFERENCES REPLICATION
 %token <str> SLAVE CLIENT USAGE RELOAD FILE FILES TEMPORARY ROUTINE EVENT SHUTDOWN
+%token <str> CALLED INPUT SCALAR VECTOR
 
 // Type Modifiers
 %token <str> NULLX AUTO_INCREMENT APPROXNUM SIGNED UNSIGNED ZEROFILL ENGINES LOW_CARDINALITY AUTOEXTEND_SIZE
@@ -790,7 +796,7 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 %type <statement> revoke_stmt grant_stmt
 %type <statement> load_data_stmt load_table_stmt dump_table_stmt
 %type <statement> analyze_stmt check_table_stmt show_profile_stmt
-%type <statement> prepare_stmt prepareable_stmt deallocate_stmt execute_stmt reset_stmt
+%type <statement> prepare_stmt prepareable_stmt deallocate_stmt execute_stmt reset_stmt flush_privileges_stmt
 %type <statement> replace_stmt
 %type <statement> do_stmt perform_stmt
 %type <statement> declare_stmt
@@ -881,7 +887,8 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 %type <funcArgDecl> func_arg_decl
 %type <funcReturn> func_return
 %type <boolVal> func_body_import internal_opt
-%type <str> func_lang extension_lang extension_name
+%type <str> func_lang extension_lang extension_name func_null_policy func_mode
+%type <pythonFunctionOptions> func_python_options_opt
 
 %type <procName> proc_name
 %type <procArgs> proc_args_list_opt proc_args_list
@@ -1002,6 +1009,7 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 %type <roles> role_spec_list using_roles_opt
 %type <role> role_spec
 %type <cstr> role_name
+%type <str> id_only_bare_name generic_function_name
 %type <usernameRecord> user_name
 %type <user> user_spec drop_user_spec user_spec_with_identified
 %type <users> user_spec_list drop_user_spec_list user_spec_list_of_create_user
@@ -1164,10 +1172,10 @@ func makeWindowSpec(refName *tree.CStr, partitionBy tree.Exprs, orderBy tree.Ord
 %token <str> AUTO_ID_CACHE
 // Shift the contextual SOUNDS LIKE phrase before reducing a bare select alias.
 %left <str> SOUNDS
-// MySQL SERIAL column-alias type. Declared last so every existing token
-// keeps its generated lexer constant number, per the append-to-end contract
-// above.
+// MySQL SERIAL column-alias type. Keep new tokens after this append-only
+// boundary so existing generated lexer constants remain stable.
 %token <str> SERIAL
+%token <str> FLUSH
 %type<tableLock> table_lock_elem
 %type<tableLocks> table_lock_list
 %type<tableLockType> table_lock_type
@@ -1203,12 +1211,21 @@ stmt_list:
             yylex.(*Lexer).AppendStmt($1)
         }
     }
+|   flush_privileges_stmt
+    {
+        yylex.(*Lexer).AppendStmt($1)
+    }
 |   stmt_list ';' stmt
     {
         yylex.(*Lexer).AppendTopLevelSemicolon($<pos>2)
         if $3 != nil {
             yylex.(*Lexer).AppendStmt($3)
         }
+    }
+|   stmt_list ';' flush_privileges_stmt
+    {
+        yylex.(*Lexer).AppendTopLevelSemicolon($<pos>2)
+        yylex.(*Lexer).AppendStmt($3)
     }
 
 block_stmt:
@@ -1314,6 +1331,12 @@ normal_stmt:
 |   resume_ccpr_subscription_stmt
 |   pause_ccpr_subscription_stmt
 |   branch_stmt
+
+flush_privileges_stmt:
+    FLUSH PRIVILEGES
+    {
+        $$ = &tree.FlushPrivileges{}
+    }
 
 backup_stmt:
     BACKUP STRING FILESYSTEM STRING PARALLELISM STRING backup_type_opt backup_timestamp_opt
@@ -4305,6 +4328,15 @@ rename_stmt:
         renameTables := tree.NewRenameTable(alterTables)
         $$ = renameTables
     }
+
+|   RENAME USER rename_user_pairs
+    { $$ = &tree.RenameUser{Pairs: $3} }
+
+rename_user_pairs:
+    drop_user_spec TO drop_user_spec
+    { $$ = []tree.RenameUserPair{{From: $1, To: $3}} }
+|   rename_user_pairs ',' drop_user_spec TO drop_user_spec
+    { $$ = append($1, tree.RenameUserPair{From: $3, To: $5}) }
 
 rename_table_list:
     rename_option
@@ -8192,7 +8224,7 @@ where_expression_opt:
     }
 |   WHERE expression
     {
-        $$ = &tree.Where{Type: tree.AstWhere, Expr: $2}
+        $$ = yylex.(*Lexer).whereClause($2, $<pos>1, yyrcvr.Lookahead() >= 0)
     }
 
 select_expression_list:
@@ -9044,7 +9076,7 @@ opt_lang:
     }
 
 create_function_stmt:
-    CREATE replace_opt FUNCTION func_name '(' func_args_list_opt ')' RETURNS func_return LANGUAGE func_lang func_body_import STRING func_handler_opt
+    CREATE replace_opt FUNCTION func_name '(' func_args_list_opt ')' RETURNS func_return LANGUAGE func_lang func_body_import STRING func_handler_opt func_python_options_opt
     {
     	if $13 == "" {
             yylex.Error("no function body error")
@@ -9063,8 +9095,9 @@ create_function_stmt:
         var Import = $12
         var Body = $13
         var Handler = $14
+        var Options = $15
 
-        $$ = tree.NewCreateFunction(
+        node := tree.NewCreateFunction(
             Replace,
             Name,
             Args,
@@ -9074,6 +9107,9 @@ create_function_stmt:
             Body,
             Handler,
         )
+        node.Mode = Options.Mode
+        node.NullPolicy = Options.NullPolicy
+        $$ = node
     }
 
 func_name:
@@ -9157,6 +9193,47 @@ func_handler:
     HANDLER STRING
     {
     	$$ = $2
+    }
+
+func_python_options_opt:
+    {
+        $$ = tree.PythonFunctionOptions{}
+    }
+|   MODE func_mode
+    {
+        $$ = tree.PythonFunctionOptions{Mode: $2}
+    }
+|   func_null_policy
+    {
+        $$ = tree.PythonFunctionOptions{NullPolicy: $1}
+    }
+|   MODE func_mode func_null_policy
+    {
+        $$ = tree.PythonFunctionOptions{Mode: $2, NullPolicy: $3}
+    }
+|   func_null_policy MODE func_mode
+    {
+        $$ = tree.PythonFunctionOptions{Mode: $3, NullPolicy: $1}
+    }
+
+func_mode:
+    SCALAR
+    {
+        $$ = "SCALAR"
+    }
+|   VECTOR
+    {
+        $$ = "VECTOR"
+    }
+
+func_null_policy:
+    CALLED ON NULL INPUT
+    {
+        $$ = "CALLED_ON_NULL_INPUT"
+    }
+|   RETURNS NULL ON NULL INPUT
+    {
+        $$ = "RETURNS_NULL_ON_NULL_INPUT"
     }
 
 create_view_stmt:
@@ -10033,10 +10110,30 @@ role_spec:
         )
     }
 
-role_name:
+// Keep the words that were bare IDs before they became Python function
+// options usable in ordinary calls, role names and Iceberg refs.
+generic_function_name:
     ID
+|   CALLED
+|   INPUT
+|   SCALAR
+|   VECTOR
+
+// The bitmap aggregate names were also bare IDs before they needed dedicated
+// tokens for window calls. Their call syntax is handled separately.
+id_only_bare_name:
+    generic_function_name
+|   BITMAP_CONSTRUCT_AGG
+|   BITMAP_OR_AGG
+
+role_name:
+    id_only_bare_name
 	{
 		$$ = tree.NewCStr($1, 1)
+    }
+|   FLUSH
+    {
+        $$ = tree.NewCStr($1, 1)
     }
 |   QUOTE_ID
 	{
@@ -12298,11 +12395,11 @@ row_format_options:
     }
 
 charset_name:
-    name_string
+    name_string { $$ = yylex.(*Lexer).rewriteMergeName($1) }
 |   BINARY
 
 collate_name:
-    name_string
+    name_string { $$ = yylex.(*Lexer).rewriteMergeName($1) }
 |   BINARY
 
 table_name_list:
@@ -12362,7 +12459,11 @@ iceberg_ref_opt:
     }
 
 iceberg_ref_name:
-    ID
+    id_only_bare_name
+    {
+        $$ = $1
+    }
+|   FLUSH
     {
         $$ = $1
     }
@@ -14739,7 +14840,17 @@ std_dev_pop:
 |   STDDEV_POP
 
 function_call_generic:
-    ID '(' expression_list_opt ')'
+    generic_function_name '(' expression_list_opt ')'
+    {
+        name := tree.NewUnresolvedColName($1)
+        $$ = &tree.FuncExpr{
+            Func: tree.FuncName2ResolvableFunctionReference(name),
+            FuncName: tree.NewCStr($1, 1),
+            IsGeneric: isSQLModeSensitiveFunctionName($1),
+            Exprs: $3,
+        }
+    }
+|   FLUSH '(' expression_list_opt ')'
     {
         name := tree.NewUnresolvedColName($1)
         $$ = &tree.FuncExpr{
@@ -14754,7 +14865,7 @@ function_call_generic:
         // `serial` is a keyword (SERIAL column-alias type, see column_def) but
         // the serial(...)/serial_extract(serial(...))/composite-index consumers
         // use it as an ordinary generic function. Keep the generic-call shape
-        // of the ID arm above so the write/spellings, nesting and arity are
+        // of the first arm above so the write/spellings, nesting and arity are
         // byte-identical to what `serial` parsed as before the keyword was
         // introduced (#31748).
         name := tree.NewUnresolvedColName($1)
@@ -17017,7 +17128,8 @@ equal_opt:
 //|   MYSQL_COMPATIBILITY_MODE
 
 non_reserved_keyword:
-    ACCOUNT
+    FLUSH
+|   ACCOUNT
 |   JSON_TABLE_PATH
 |   JSON_TABLE_NESTED
 |   JSON_TABLE_ORDINALITY
@@ -17040,6 +17152,7 @@ non_reserved_keyword:
 |   BLOB
 |   BOOL
 |   BITS_PER_CODE
+|   CALLED
 |   BRANCH
 |   CATALOG
 |   CATALOGS
@@ -17121,6 +17234,7 @@ non_reserved_keyword:
 |   PERSIST
 |   GRANT
 |   INCLUDE
+|   INPUT
 |   INT
 |   INTEGER
 |   INDEXES
@@ -17221,6 +17335,7 @@ non_reserved_keyword:
 |   PROFILES
 |   PROFILE
 |   ROLE
+|   SCALAR
 |   RULE
 |   RULES
 |   RANGE
@@ -17280,6 +17395,7 @@ non_reserved_keyword:
 |   VARBINARY
 |   VARCHAR
 |   VARIABLES
+|   VECTOR
 |   VIEW
 |   VIRTUAL
 |   WRITE
@@ -17560,7 +17676,9 @@ not_keyword:
 |   BIT_CAST
 |   BITMAP_BIT_POSITION
 |   BITMAP_BUCKET_NUMBER
+|   BITMAP_CONSTRUCT_AGG
 |   BITMAP_COUNT
+|   BITMAP_OR_AGG
 |   PERCENTILE_CONT
 |   PERCENTILE_DISC
 |   EWM_MEAN

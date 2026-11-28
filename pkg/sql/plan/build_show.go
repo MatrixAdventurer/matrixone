@@ -149,7 +149,7 @@ func buildShowCreateTable(stmt *tree.ShowCreateTable, ctx CompilerContext) (*Pla
 		}()
 	}
 
-	_, tableDef, err := ctx.Resolve(dbName, tblName, snapshot, nil)
+	obj, tableDef, err := ctx.Resolve(dbName, tblName, snapshot, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +157,10 @@ func buildShowCreateTable(stmt *tree.ShowCreateTable, ctx CompilerContext) (*Pla
 		return nil, moerr.NewNoSuchTable(ctx.GetContext(), dbName, tblName)
 	}
 	if err = ValidateSnapshotScope(snapshot, dbName, tblName, tableDef.DbId, SnapshotTableID(tableDef)); err != nil {
+		return nil, err
+	}
+	if err = checkShowRewriteMetadata(ctx, stmt.RewriteOption, dbName, tblName, tableDef,
+		snapshot == nil && sub == nil && obj.GetPubInfo() == nil); err != nil {
 		return nil, err
 	}
 	if tableDef.TableType == catalog.SystemViewRel {
@@ -680,6 +684,9 @@ func buildShowColumns(stmt *tree.ShowColumns, ctx CompilerContext, isPrepareStmt
 	if tableDef == nil {
 		return nil, moerr.NewNoSuchTable(ctx.GetContext(), dbName, tblName)
 	}
+	if err = checkShowRewriteMetadata(ctx, stmt.RewriteOption, dbName, tblName, tableDef, obj.GetPubInfo() == nil); err != nil {
+		return nil, err
+	}
 	catalogTblName := tblName
 	if tableDef.IsTemporary {
 		catalogTblName = tableDef.Name
@@ -856,7 +863,7 @@ func buildShowColumns(stmt *tree.ShowColumns, ctx CompilerContext, isPrepareStmt
 	}
 	var result *Plan
 	if stmt.Where != nil {
-		result, err = returnByWhereAndBaseSQLWithPrepare(ctx, sql, stmt.Where, ddlType, isPrepareStmt)
+		result, err = buildShowWhereSelect(ctx, sql, stmt.Where, isPrepareStmt, stmt.RewriteOption)
 	} else if stmt.Like != nil {
 		likeExpr := stmt.Like
 		likeExpr.Left = tree.NewUnresolvedColName("attname")
@@ -1086,6 +1093,10 @@ func buildShowIndex(stmt *tree.ShowIndex, ctx CompilerContext) (*Plan, error) {
 		return nil, moerr.NewNoSuchTable(ctx.GetContext(), dbName, tblName)
 	}
 
+	if err = checkShowRewriteMetadata(ctx, stmt.RewriteOption, dbName, tblName, tableDef,
+		subscription == nil && obj.GetPubInfo() == nil); err != nil {
+		return nil, err
+	}
 	ddlType := plan.DataDefinition_SHOW_INDEX
 
 	if obj.PubInfo != nil {
@@ -1168,7 +1179,7 @@ func buildShowIndex(stmt *tree.ShowIndex, ctx CompilerContext) (*Plan, error) {
 	showIndexSql := fmt.Sprintf(sql, sqlquote.String(displayTblName), MO_CATALOG_DB_NAME, MO_CATALOG_DB_NAME, sqlquote.String(dbName), sqlquote.String(tblName), sqlquote.String(catalog.AliasPrefix+"%"))
 
 	if stmt.Where != nil {
-		return returnByWhereAndBaseSQL(ctx, showIndexSql, stmt.Where, ddlType)
+		return buildShowWhereSelect(ctx, showIndexSql, stmt.Where, false, stmt.RewriteOption)
 	}
 	return returnByRewriteSQL(ctx, showIndexSql, ddlType)
 }
@@ -1197,7 +1208,24 @@ func buildShowGrants(stmt *tree.ShowGrants, ctx CompilerContext) (*Plan, error) 
 		stmt.Hostname = MO_DEFUALT_HOSTNAME
 	}
 	if stmt.Username == "" {
-		stmt.Username = ctx.GetUserName()
+		identity, ok := ctx.(interface{ GetCurrentUserID() (uint32, error) })
+		if !ok {
+			// The internal SQL executor uses its compiler username.
+			return returnByRewriteSQL(ctx, buildShowGrantsUserSQL(accountId, ctx.GetUserName(), stmt.Hostname), ddlType)
+		}
+		id, err := identity.GetCurrentUserID()
+		if err != nil {
+			return nil, err
+		}
+		currentUser, ok := ctx.(interface{ GetCurrentUserName() (string, error) })
+		if !ok {
+			return nil, moerr.NewInternalError(ctx.GetContext(), "current user identity is unavailable")
+		}
+		userName, err := currentUser.GetCurrentUserName()
+		if err != nil {
+			return nil, err
+		}
+		return returnByRewriteSQL(ctx, buildShowGrantsCurrentUserSQL(accountId, id, userName), ddlType)
 	}
 	return returnByRewriteSQL(ctx, buildShowGrantsUserSQL(accountId, stmt.Username, stmt.Hostname), ddlType)
 }
@@ -1253,6 +1281,19 @@ func buildShowGrantsUserSQL(accountId uint32, username, hostname string) string 
 	return fmt.Sprintf(sql, sqlquote.String(" `"+username+"`"), sqlquote.String("`"+hostname+"`"),
 		sqlquote.Ident("Grants for "+username+"@localhost"), MO_CATALOG_DB_NAME, MO_CATALOG_DB_NAME, MO_CATALOG_DB_NAME,
 		showGrantsObjectScopeJoins(accountId), sqlquote.String(username), sqlquote.String(hostname))
+}
+
+// buildShowGrantsCurrentUserSQL preserves the session's stable user identity
+// while resolving each grant's current object scope from the catalog.
+func buildShowGrantsCurrentUserSQL(accountId, userId uint32, userName string) string {
+	sql := "select concat('GRANT ', p.privilege_name, ' ON ', p.obj_type, ' ', case p.obj_type when 'account' then '' else " +
+		showGrantsObjectScope + " end, ' `', u.user_name, '`@`', u.user_host, '`') as %s from %s.mo_user as u join %s.mo_user_grant as g on g.user_id = u.user_id join %s.mo_role_privs as p on p.role_id = g.role_id %s where u.user_id = %d order by p.role_id, p.privilege_id, p.obj_type, p.obj_id, p.privilege_level;"
+	return fmt.Sprintf(sql, currentUserShowGrantsColumnName(userName), MO_CATALOG_DB_NAME, MO_CATALOG_DB_NAME, MO_CATALOG_DB_NAME,
+		showGrantsObjectScopeJoins(accountId), userId)
+}
+
+func currentUserShowGrantsColumnName(userName string) string {
+	return sqlquote.Ident(fmt.Sprintf("Grants for %s@localhost", userName))
 }
 
 func buildShowRoles(stmt *tree.ShowRolesStmt, ctx CompilerContext) (*Plan, error) {
@@ -1427,11 +1468,11 @@ func showSnapshotSpec(atTsExpr *tree.AtTimeStamp, snapshot *Snapshot) string {
 
 func returnByWhereAndBaseSQL(ctx CompilerContext, baseSQL string,
 	where *tree.Where, ddlType plan.DataDefinition_DdlType) (*Plan, error) {
-	return returnByWhereAndBaseSQLWithPrepare(ctx, baseSQL, where, ddlType, false)
+	return buildShowWhereSelect(ctx, baseSQL, where, false, nil)
 }
 
-func returnByWhereAndBaseSQLWithPrepare(ctx CompilerContext, baseSQL string,
-	where *tree.Where, ddlType plan.DataDefinition_DdlType, isPrepareStmt bool) (*Plan, error) {
+func buildShowWhereSelect(ctx CompilerContext, baseSQL string, where *tree.Where,
+	isPrepareStmt bool, rewrite *tree.RewriteOption) (*Plan, error) {
 	sql := fmt.Sprintf("SELECT * FROM (%s) tbl", baseSQL)
 	newStmt, err := getRewriteSQLStmt(ctx, sql)
 	if err != nil {
@@ -1440,8 +1481,10 @@ func returnByWhereAndBaseSQLWithPrepare(ctx CompilerContext, baseSQL string,
 	defer newStmt.Free()
 	// The predicate belongs to the authored SHOW. Preserve its prepare mode
 	// when binding it as part of the rewritten SELECT.
-	newStmt.(*tree.Select).Select.(*tree.SelectClause).Where = where
-	return BuildPlan(ctx, newStmt, isPrepareStmt, nil)
+	selectStmt := newStmt.(*tree.Select)
+	selectStmt.Select.(*tree.SelectClause).Where = where
+	selectStmt.RewriteOption = rewrite
+	return BuildPlan(ctx, selectStmt, isPrepareStmt, nil)
 }
 
 func returnByLikeAndSQL(ctx CompilerContext, sql string, like *tree.ComparisonExpr,

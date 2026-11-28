@@ -558,91 +558,67 @@ func (bc *BindContext) addUsingColForCrossL2(col string, typ plan.Node_JoinType,
 }
 
 func (bc *BindContext) unfoldStar(ctx context.Context, table string, isSysAccount bool) ([]tree.SelectExpr, []string, headingProvenanceMap, error) {
-	if len(table) == 0 {
-		// unfold *
-		var exprs []tree.SelectExpr
-		var names []string
-		var provenances headingProvenanceMap
+	var exprs []tree.SelectExpr
+	var names []string
+	var provenances headingProvenanceMap
 
-		bc.doUnfoldStar(ctx, bc.bindingTree, make(map[string]bool), &exprs, &names, &provenances, isSysAccount)
-
-		return exprs, names, provenances, nil
+	if table == "" {
+		bc.doUnfoldStar(bc.bindingTree, make(map[string]bool), &exprs, &names, &provenances, isSysAccount)
 	} else {
-		// unfold tbl.*
 		binding, ok := bc.bindingByTable[table]
 		if !ok {
 			return nil, nil, nil, moerr.NewInvalidInputf(ctx, "missing FROM-clause entry for table '%s'", table)
 		}
+		exprs = make([]tree.SelectExpr, 0)
+		names = make([]string, 0)
+		bc.appendBindingStar(binding, table, nil, &exprs, &names, &provenances, isSysAccount)
+	}
+	return exprs, names, provenances, nil
+}
 
-		displayCols := binding.originCols
-		if len(displayCols) != len(binding.cols) {
-			displayCols = binding.cols
+func (bc *BindContext) appendBindingStar(binding *Binding, table string, visitedUsingCols map[string]bool, exprs *[]tree.SelectExpr, names *[]string, provenances *headingProvenanceMap, isSysAccount bool) {
+	displayCols := binding.originCols
+	if len(displayCols) != len(binding.cols) {
+		displayCols = binding.cols
+	}
+
+	count := len(binding.cols)
+	order := binding.starColumnOrder
+	if order != nil {
+		count = len(order)
+	}
+	for i := range count {
+		if order != nil {
+			i = int(order[i])
 		}
-
-		exprs := make([]tree.SelectExpr, 0)
-		names := make([]string, 0)
-		var provenances headingProvenanceMap
-
-		for i, col := range binding.cols {
-			if binding.colIsHidden[i] {
-				continue
-			}
-			if catalog.ContainExternalHidenCol(col) {
-				continue
-			}
-			//the non-sys account skips the column account_id for the cluster table
-			if !isSysAccount && binding.isClusterTable && util.IsClusterTableAttribute(col) {
-				continue
-			}
-			expr := tree.NewUnresolvedName(tree.NewCStr(table, bc.lower), tree.NewCStr(col, 1))
-			exprs = append(exprs, tree.SelectExpr{Expr: expr})
-			names = append(names, displayCols[i])
-			if provenance, ok := binding.headingProvenance[int32(i)]; ok {
-				if provenances == nil {
-					provenances = make(headingProvenanceMap)
-				}
-				provenances[int32(len(exprs)-1)] = cloneHeadingProvenance(provenance)
-			}
+		col := binding.cols[i]
+		if binding.colIsHidden[i] || catalog.ContainExternalHidenCol(col) {
+			continue
 		}
-
-		return exprs, names, provenances, nil
+		if !isSysAccount && binding.isClusterTable && util.IsClusterTableAttribute(col) {
+			continue
+		}
+		if visitedUsingCols[col] {
+			continue
+		}
+		expr := tree.NewUnresolvedName(tree.NewCStr(table, bc.lower), tree.NewCStr(col, 1))
+		*exprs = append(*exprs, tree.SelectExpr{Expr: expr})
+		*names = append(*names, displayCols[i])
+		if provenance, ok := binding.headingProvenance[int32(i)]; ok {
+			if *provenances == nil {
+				*provenances = make(headingProvenanceMap)
+			}
+			(*provenances)[int32(len(*exprs)-1)] = cloneHeadingProvenance(provenance)
+		}
 	}
 }
 
-func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, visitedUsingCols map[string]bool, exprs *[]tree.SelectExpr, names *[]string, provenances *headingProvenanceMap, isSysAccount bool) {
+func (bc *BindContext) doUnfoldStar(root *BindingTreeNode, visitedUsingCols map[string]bool, exprs *[]tree.SelectExpr, names *[]string, provenances *headingProvenanceMap, isSysAccount bool) {
 	if root == nil {
 		return
 	}
 	if root.binding != nil {
-		displayCols := root.binding.originCols
-		if len(displayCols) != len(root.binding.cols) {
-			displayCols = root.binding.cols
-		}
-
-		for i, col := range root.binding.cols {
-			if root.binding.colIsHidden[i] {
-				continue
-			}
-			if catalog.ContainExternalHidenCol(col) {
-				continue
-			}
-			//the non-sys account skips the column account_id for the cluster table
-			if !isSysAccount && root.binding.isClusterTable && util.IsClusterTableAttribute(col) {
-				continue
-			}
-			if !visitedUsingCols[col] {
-				expr := tree.NewUnresolvedName(tree.NewCStr(root.binding.table, bc.lower), tree.NewCStr(col, 1))
-				*exprs = append(*exprs, tree.SelectExpr{Expr: expr})
-				*names = append(*names, displayCols[i])
-				if provenance, ok := root.binding.headingProvenance[int32(i)]; ok {
-					if *provenances == nil {
-						*provenances = make(headingProvenanceMap)
-					}
-					(*provenances)[int32(len(*exprs)-1)] = cloneHeadingProvenance(provenance)
-				}
-			}
-		}
-
+		bc.appendBindingStar(root.binding, root.binding.table, visitedUsingCols, exprs, names, provenances, isSysAccount)
 		return
 	}
 
@@ -682,11 +658,11 @@ func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, 
 	}
 
 	if root.rightJoinUsingStar {
-		bc.doUnfoldStar(ctx, root.right, visitedUsingCols, exprs, names, provenances, isSysAccount)
-		bc.doUnfoldStar(ctx, root.left, visitedUsingCols, exprs, names, provenances, isSysAccount)
+		bc.doUnfoldStar(root.right, visitedUsingCols, exprs, names, provenances, isSysAccount)
+		bc.doUnfoldStar(root.left, visitedUsingCols, exprs, names, provenances, isSysAccount)
 	} else {
-		bc.doUnfoldStar(ctx, root.left, visitedUsingCols, exprs, names, provenances, isSysAccount)
-		bc.doUnfoldStar(ctx, root.right, visitedUsingCols, exprs, names, provenances, isSysAccount)
+		bc.doUnfoldStar(root.left, visitedUsingCols, exprs, names, provenances, isSysAccount)
+		bc.doUnfoldStar(root.right, visitedUsingCols, exprs, names, provenances, isSysAccount)
 	}
 
 	for _, col := range handledUsingCols {
@@ -1101,7 +1077,7 @@ func sameHavingColumnReference(ctx *BindContext, left, right *tree.UnresolvedNam
 		if leftOK && rightOK {
 			return leftBinding.tag == rightBinding.tag && leftPos == rightPos
 		}
-		if leftOK || rightOK {
+		if leftOK || rightOK || leftPos == AmbiguousName || rightPos == AmbiguousName {
 			return false
 		}
 	}
@@ -1118,21 +1094,42 @@ func sameHavingColumnReference(ctx *BindContext, left, right *tree.UnresolvedNam
 }
 
 // resolveTableBinding resolves only this scope. A different explicit database
-// is a miss, so the binder can continue through its existing parent traversal.
-func (bc *BindContext) resolveTableBinding(db, table string) *Binding {
-	binding := bc.bindingByTable[table]
-	if db == "" {
-		return binding
-	}
-	if binding != nil && binding.db != "" &&
+// is a miss, while multiple implicit system table matches end parent lookup.
+func (bc *BindContext) resolveTableBinding(db, table string) (binding *Binding, ambiguous bool) {
+	binding = bc.bindingByTable[table]
+	if binding != nil && (db == "" || binding.db != "" &&
 		(db == binding.db || db == tree.NewCStr(binding.db, bc.lower).Compare() ||
-			(slices.Contains(mysql.CaseInsensitiveDbs, binding.db) && strings.EqualFold(db, binding.db))) {
-		return binding
+			(slices.Contains(mysql.CaseInsensitiveDbs, binding.db) && strings.EqualFold(db, binding.db)))) {
+		return binding, false
 	}
-	if bc.remapOption != nil {
-		return bc.bindingByTable[db+"."+table]
+	if db != "" && bc.remapOption != nil {
+		if binding = bc.bindingByTable[db+"."+table]; binding != nil {
+			return binding, false
+		}
 	}
-	return nil
+
+	if bc.lower != 0 {
+		return nil, false
+	}
+	db = strings.ToLower(db)
+	if db != "" && !slices.Contains(mysql.CaseInsensitiveDbs, db) {
+		return nil, false
+	}
+	// Catalog case folding applies to implicit table names, while explicit
+	// aliases retain the spelling that was registered in the scope.
+	table = strings.ToLower(table)
+	var match *Binding
+	for _, candidate := range bc.bindings {
+		if !candidate.caseInsensitiveTable || table != strings.ToLower(candidate.table) ||
+			db != "" && db != strings.ToLower(candidate.db) {
+			continue
+		}
+		if match != nil {
+			return nil, true
+		}
+		match = candidate
+	}
+	return match, false
 }
 
 func resolveColumnIdentity(ctx *BindContext, ref *tree.UnresolvedName) (*Binding, int32, bool) {
@@ -1144,7 +1141,11 @@ func resolveColumnIdentity(ctx *BindContext, ref *tree.UnresolvedName) (*Binding
 	if ref.TblName() == "" {
 		binding = ctx.bindingByCol[ref.ColName()]
 	} else {
-		binding = ctx.resolveTableBinding(ref.DbName(), ref.TblName())
+		var ambiguous bool
+		binding, ambiguous = ctx.resolveTableBinding(ref.DbName(), ref.TblName())
+		if ambiguous {
+			return nil, AmbiguousName, false
+		}
 	}
 	if binding == nil {
 		return nil, 0, false

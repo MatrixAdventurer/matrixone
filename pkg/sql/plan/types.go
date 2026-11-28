@@ -395,6 +395,8 @@ type updateTargetScope struct {
 }
 
 type QueryBuilder struct {
+	dmlRewriteTargets map[*tree.TableName]*dmlTargetRewrite
+	dmlRewriteFilters map[int32]struct{}
 	// mixedDomainCoalesce is set when the statement binds a binary-typed
 	// COALESCE that can return a text value; see coalesce_text_domain.go.
 	mixedDomainCoalesce bool
@@ -404,6 +406,7 @@ type QueryBuilder struct {
 	// DELETE owns these generated scan identities. Optimizer consumers must
 	// revalidate the binding and table after join rewrites.
 	deleteIndexScanTables    map[int32]deleteIndexScan
+	equalityRowBounds        map[*plan.Expr]float64
 	planningInput            *PlanningInput
 	scanBorrows              []scanBorrow
 	borrowResolutionDisabled bool
@@ -418,12 +421,9 @@ type QueryBuilder struct {
 	pendingExistentials     map[uint64]*pendingExistential
 	hadPendingExistentials  bool
 	existentialGateProjects map[int32]struct{}
-	// Lock-key materializations built for the pass-through CHECK/FK barrier
-	// FILTER keep their PROJECT physical: the barrier FILTER hands computed
-	// unique lock-key vectors through positionally, and the restored row
-	// image must export those vectors as columns instead of re-evaluating
-	// the key expression in every downstream consumer.
-	materializedLockKeyProjects map[int32]struct{}
+	// DML projects that must export physical columns for downstream consumers,
+	// including lock keys across CHECK/FK barriers and conflict-action slots.
+	materializedDMLProjects map[int32]struct{}
 
 	qry     *plan.Query
 	compCtx CompilerContext
@@ -459,13 +459,14 @@ type QueryBuilder struct {
 	// Synthetic scalar reaggregations preserve earlier scalar outputs as
 	// grouping keys. Each alias keeps its original column identity through
 	// final column pruning without changing the executable plan format.
-	scalarReaggAliases      map[int32][]scalarReaggAlias
-	headingProvenanceByNode map[int32]headingProvenanceMap
-	windowValidationScans   []*plan.Node
-	nameByColRef            map[[2]int32]string
-	protectedScans          map[int32]int
-	updateTargetScans       map[int32]struct{}
-	projectSpecialGuards    map[int32]*specialIndexGuard
+	scalarReaggAliases             map[int32][]scalarReaggAlias
+	headingProvenanceByNode        map[int32]headingProvenanceMap
+	validationPrivilegeCarriers    []*plan.Node
+	validationPrivilegeCarrierKeys map[string]struct{}
+	nameByColRef                   map[[2]int32]string
+	protectedScans                 map[int32]int
+	updateTargetScans              map[int32]struct{}
+	projectSpecialGuards           map[int32]*specialIndexGuard
 	// projectAnchoredSorts holds Top-K SORT node ids that a PROJECT directly above them
 	// will anchor the vector rewrite on. applyIndices walks children first, so without
 	// this the SORT-anchored entry point would claim the classic
@@ -536,12 +537,29 @@ type QueryBuilder struct {
 	// synthetic bindings must not make arbitrary carried estimates authoritative.
 	syntheticNDVCols map[[2]int32]struct{}
 
-	nextBindTag      int32
-	nextMsgTag       int32
-	nextSQLUdfCallID uint64
+	nextBindTag                 int32
+	nextMsgTag                  int32
+	nextSQLUdfCallID            uint64
+	udfResolutionCount          uint64
+	udfExpansionDepth           uint32
+	zeroScalarRewriteGeneration uint64
+	zeroScalarArgumentWrappers  []int32
+	// Tracks discarded scalar sources even when their carrier was deduplicated.
+	zeroScalarRetentionGeneration uint64
+	// Tracks special checks in isolated validation builders nested in a scalar.
+	zeroScalarValidationSpecialGeneration uint64
+	zeroScalarPrograms                    map[uint32]struct{}
+	zeroScalarPolicy                      zeroScalarPolicy
+	zeroScalarRequiredLiveNodes           map[int32]zeroScalarLiveRequirement
+	hasZeroScalarSourceCandidate          bool
 	// Negative AuxIds identify memoized expression sources across every bind
 	// context that can contribute expressions to this query.
 	nextVolatileExprMemoID int32
+	// nextRoutineCallID gives every typed routine expression a plan-local
+	// callsite identity. It is deliberately separate from the SQL body
+	// substitution counter: lowering must not make a callsite depend on the
+	// number of generated parameter markers.
+	nextRoutineCallID uint64
 
 	isPrepareStatement     bool
 	mysqlCompatible        bool
@@ -616,6 +634,9 @@ type QueryBuilder struct {
 	// common input can be shared after CTE reuse has established any nested
 	// producer boundaries.
 	groupingSetCandidates []groupingSetCandidate
+	// groupingFlags records each aggregate group tag's active GROUP BY keys,
+	// for foldGroupingFunctions.
+	groupingFlags map[int32][]bool
 	// splitGroupingSetCoarseAggs marks the large coarser half of a direct
 	// ROLLUP split. Keep its partial aggregation local: shuffling a key that
 	// the coarser sets roll up creates a hot owner for those sets.
@@ -663,6 +684,9 @@ type QueryBuilder struct {
 	irregularMaintObjRef                  *plan.ObjectRef
 	irregularMaintSkipInsert              bool
 	irregularUpdateMaints                 []irregularUpdateMaintenance
+	// queryCreated is set once createQuery has run. Irregular-index
+	// maintenance planned before it is queued for finishIrregularIndexMaintenance.
+	queryCreated bool
 
 	// DML RETURNING consumes an attempt-local row image from a dedicated sink.
 	// The mutation plan and the returning projection use independent SINK_SCAN
@@ -671,12 +695,13 @@ type QueryBuilder struct {
 	// returningFilterPos identifies an optional semantic eligibility selector in
 	// the materialized row image. It filters only the RETURNING reader; mutation
 	// readers continue to consume implicit FK action rows.
-	returningFilterPos int32
-	returningRequested bool
-	returningTableDef  *plan.TableDef
-	returningTableName string
-	returningAlias     string
-	returningColPos    map[string]int32
+	returningFilterPos         int32
+	returningRequested         bool
+	bindingReturningProjection bool
+	returningTableDef          *plan.TableDef
+	returningTableName         string
+	returningAlias             string
+	returningColPos            map[string]int32
 	// updateParentActionStack bounds recursive ON UPDATE actions by the active
 	// physical-table path. Acyclic multi-layer cascades recurse normally; a
 	// cycle is rejected before any mutation step is appended.
@@ -734,6 +759,7 @@ type irregularUpdateMaintenance struct {
 	valueChangedSourceSteps map[string]int32
 	tableDef                *plan.TableDef
 	objRef                  *plan.ObjectRef
+	skipInsert              bool
 }
 
 type OptimizerHints struct {
@@ -921,6 +947,8 @@ type BindContext struct {
 	// observes the session's virtual-column value.
 	physicalGeneratedRefs    map[*tree.UnresolvedName]struct{}
 	physicalMySQLSpecialRefs map[*tree.UnresolvedName]struct{}
+	// Only the generated write projection can address policy-pruned columns.
+	dmlPhysicalRefs map[*tree.UnresolvedName]struct{}
 	// Tags whose rows can be NULL-extended by a join in this query block.
 	nullExtendedTags map[int32]bool
 	// The grouping/window rewrite owns this exact generated source. Neither
@@ -1108,6 +1136,9 @@ type BindContext struct {
 	projectColByAst map[string]int32
 
 	projectByAst []SelectField
+	// sampledProjectFields means the visible fields came from a grouping
+	// branch whose SAMPLE executor can rearrange the physical slots.
+	sampledProjectFields bool
 	// projectSemanticKeys is populated only when preserveOrderSemanticKeys is
 	// set, keeping the ordinary-query projection path allocation-free.
 	projectSemanticKeys []string
@@ -1139,6 +1170,10 @@ type BindContext struct {
 	// names for its $n parameters; resolving those markers from a child query
 	// block turns the argument's column references into correlated references.
 	sqlUdfArgs map[string]*plan.Expr
+	// zeroScalarRootSourceSafe is set only after the original AST and the
+	// complete binding pass prove the narrow LIMIT 0 source has no hidden
+	// dependency or UDF expansion.
+	zeroScalarRootSourceSafe bool
 
 	// for join tables
 	bindingTree *BindingTreeNode
@@ -1340,6 +1375,7 @@ type TableBinder struct {
 
 type WhereBinder struct {
 	baseBinder
+	preparedSetSubqueries map[*tree.Subquery][]int32
 }
 
 type GroupBinder struct {
@@ -1416,10 +1452,13 @@ type Binding struct {
 	db                     string
 	table                  string
 	tableID                uint64
+	caseInsensitiveTable   bool // unaliased relation in a case-insensitive system schema
 	// lower case: used for binding/lookup
 	cols []string
 	// original case: only for SELECT * display, must be same length as cols (or empty)
 	originCols []string
+	// Optional logical order of star expansion over the binding's physical columns.
+	starColumnOrder []int32
 	// headingProvenance carries expression-heading syntax through a derived
 	// table/CTE so SELECT * can retain the original literal spelling. It is
 	// sparse and keyed by column ordinal.
@@ -1440,6 +1479,8 @@ type Binding struct {
 	colIdByName    map[string]int32
 	isClusterTable bool
 	defaults       []string
+
+	dmlStorageColumns map[string]int32
 }
 
 const (

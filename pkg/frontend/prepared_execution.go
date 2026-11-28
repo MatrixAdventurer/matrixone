@@ -24,6 +24,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
@@ -34,11 +35,23 @@ import (
 // category must never change another occurrence's SQL source type.
 func preparedExecutionBindings(ctx context.Context, values []any, protocolTypes []byte,
 	bitCountTypes []types.Type) ([]plan2.PreparedSourceBinding, error) {
-	bindings := make([]plan2.PreparedSourceBinding, len(values))
+	var bindings []plan2.PreparedSourceBinding
+	return preparedExecutionBindingsInto(ctx, &bindings, values, protocolTypes, bitCountTypes)
+}
+
+// preparedExecutionBindingsInto computes the bindings of an execution into
+// *dst, the prepared statement's storage, reusing it once it is large enough.
+// The result is valid until the statement's next execution.
+func preparedExecutionBindingsInto(ctx context.Context, dst *[]plan2.PreparedSourceBinding, values []any,
+	protocolTypes []byte, bitCountTypes []types.Type) ([]plan2.PreparedSourceBinding, error) {
+	if cap(*dst) < len(values) {
+		*dst = make([]plan2.PreparedSourceBinding, len(values))
+	}
+	bindings := (*dst)[:len(values)]
 	for i, value := range values {
 		binding := &bindings[i]
-		binding.Position = int32(i)
-		param, ok := value.(plan2.ParamValue)
+		*binding = plan2.PreparedSourceBinding{Position: int32(i)}
+		param, ok := plan2.AsParamValue(value)
 		if !ok {
 			binding.Type, _ = preparedConversionRuntimeType(value)
 			continue
@@ -56,7 +69,7 @@ func preparedExecutionBindings(ctx context.Context, values []any, protocolTypes 
 					return nil, moerr.NewInvalidInput(ctx, "prepared parameter has no protocol source type")
 				}
 				mysqlType := defines.MysqlType(protocolTypes[i*2])
-				if param.PrepareParamKind == types.StringConversionBoolean {
+				if plan2.ParamValueKind(param) == types.StringConversionBoolean {
 					binding.Type = types.T_bool.ToType()
 				} else if mysqlType == defines.MYSQL_TYPE_DECIMAL || mysqlType == defines.MYSQL_TYPE_NEWDECIMAL {
 					binding.Type, binding.NumericType = param.DirectResultType, param.RuntimeType
@@ -112,8 +125,8 @@ func preparedExecutionBindingKey(bindings []plan2.PreparedSourceBinding, values 
 		writeType(binding.Type)
 		writeType(binding.NumericType)
 		writeType(binding.BitCountType)
-		if param, ok := values[i].(plan2.ParamValue); ok {
-			writeInt(int64(param.PrepareParamKind), ':')
+		if param, ok := plan2.AsParamValue(values[i]); ok {
+			writeInt(int64(plan2.ParamValueKind(param)), ':')
 			writeBool(param.IsBinaryProtocol, ':')
 			writeBool(param.IsBin, ':')
 			writeBool(param.IsBinaryString, ':')
@@ -196,6 +209,8 @@ func (cwft *TxnComputationWrapper) preparedExecutionRetry() *preparedExecutionRe
 	var fieldTypes *plan2.PreparedFieldTypes
 	var temporalTypes *plan2.PreparedTemporalTypes
 	var fieldSchemas []*plan2.ObjectRef
+	var fieldRoutines []*plan.RoutinePlanDependency
+	var fieldRoutineErr error
 	if cwft.preparedStmt != nil {
 		fieldTypes = cwft.preparedStmt.fieldTypes
 		temporalTypes = cwft.preparedStmt.temporalTypes
@@ -209,6 +224,18 @@ func (cwft *TxnComputationWrapper) preparedExecutionRetry() *preparedExecutionRe
 					fieldSchemas[i] = proto.Clone(schema).(*plan2.ObjectRef)
 				}
 			}
+			// Include nested background-query dependencies under the existing
+			// count/byte/depth bounds. Retry must retain facts, not the mutable plan.
+			var routines []*plan.RoutinePlanDependency
+			routines, fieldRoutineErr = routinePlanDependencies(cwft.preparedStmt.PreparePlan.GetDcl().GetPrepare().Plan)
+			if fieldRoutineErr == nil {
+				fieldRoutines = make([]*plan.RoutinePlanDependency, len(routines))
+				for i, dependency := range routines {
+					if dependency != nil {
+						fieldRoutines[i] = proto.Clone(dependency).(*plan.RoutinePlanDependency)
+					}
+				}
+			}
 		}
 	}
 	if cwft.preparedStmt != nil && strings.IndexByte(cwft.preparedStmt.Sql, '@') >= 0 {
@@ -218,7 +245,9 @@ func (cwft *TxnComputationWrapper) preparedExecutionRetry() *preparedExecutionRe
 		fieldTypes:         fieldTypes,
 		temporalTypes:      temporalTypes,
 		fieldSchemas:       fieldSchemas,
-		paramVals:          append([]any(nil), cwft.paramVals...),
+		fieldRoutines:      fieldRoutines,
+		fieldRoutineErr:    fieldRoutineErr,
+		paramVals:          plan2.CopyParamValues(cwft.paramVals),
 		bindings:           append([]plan2.PreparedSourceBinding(nil), cwft.paramBindings...),
 		preparedPlan:       preparedPlan,
 		diagnosticFreeJoin: cwft.preparedJoinDiagnosticFree,
@@ -243,7 +272,7 @@ func (prepareStmt *PrepareStmt) rememberIntegerArithmeticBindings(p *plan2.Plan,
 			continue
 		}
 		value := values[pos]
-		if param, ok := value.(plan2.ParamValue); ok {
+		if param, ok := plan2.AsParamValue(value); ok {
 			value = param.Value
 		}
 		if value == nil {

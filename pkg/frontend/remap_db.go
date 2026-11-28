@@ -299,6 +299,7 @@ func remapDbInStmt(stmt tree.Statement, remap remapDbContext) bool {
 		remapDbInOrderBy(s.OrderBy, scoped)
 		remapDbInLimit(s.Limit, scoped)
 		remapDbInSelectExprs(s.Returning, scoped)
+		remap.fail(remapRewriteOption(s.RewriteOption, remap))
 	case *tree.Delete:
 		scoped := remapDbInWithScope(s.With, remap)
 		remapDbInTableExprs(s.Tables, scoped)
@@ -307,6 +308,7 @@ func remapDbInStmt(stmt tree.Statement, remap remapDbContext) bool {
 		remapDbInOrderBy(s.OrderBy, scoped)
 		remapDbInLimit(s.Limit, scoped)
 		remapDbInSelectExprs(s.Returning, scoped)
+		remap.fail(remapRewriteOption(s.RewriteOption, remap))
 	case *tree.ValuesStatement:
 		for _, row := range s.Rows {
 			remapDbInExprs(row, remap)
@@ -368,6 +370,9 @@ func remapDbInStmt(stmt tree.Statement, remap remapDbContext) bool {
 		if s.AtTsExpr != nil {
 			remapDbInExpr(s.AtTsExpr.Expr, remap)
 		}
+		if len(remap.databases) > 0 {
+			remap.fail(remapRewriteOption(s.RewriteOption, remap))
+		}
 	case *tree.ShowCreateView:
 		remapObjectName(s.Name, remap)
 		if s.AtTsExpr != nil {
@@ -389,16 +394,22 @@ func remapDbInStmt(stmt tree.Statement, remap remapDbContext) bool {
 		remapDatabaseName(&s.DBName, remap)
 		remapDbInOptionalComparisonExpr(s.Like, remap)
 		remapDbInWhere(s.Where, remap)
+		if len(remap.databases) > 0 {
+			remap.fail(remapRewriteOption(s.RewriteOption, remap))
+		}
 	case *tree.ShowIndex:
 		remapObjectName(s.TableName, remap)
 		remapDatabaseName(&s.DbName, remap)
 		remapDbInWhere(s.Where, remap)
+		remap.fail(remapRewriteOption(s.RewriteOption, remap))
 	case *tree.ShowIndexIgnored:
 		remapObjectName(s.TableName, remap)
 		remapDbInWhere(s.Where, remap)
+		remap.fail(remapRewriteOption(s.RewriteOption, remap))
 	case *tree.ShowIndexStatus:
 		remapObjectName(s.TableName, remap)
 		remapDbInWhere(s.Where, remap)
+		remap.fail(remapRewriteOption(s.RewriteOption, remap))
 	case *tree.ShowColumnNumber:
 		remapObjectName(s.Table, remap)
 		remapDatabaseName(&s.DbName, remap)

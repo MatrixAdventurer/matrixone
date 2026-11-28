@@ -380,50 +380,6 @@ func TestServiceCloseWithdrawalErrorIsLocallyComplete(t *testing.T) {
 	}
 }
 
-func TestMakeRSSCacheEvictorEvictsMemoryCacheOnly(t *testing.T) {
-	oldMemoryEvictor := evictMemoryCachesToCapacityPercent
-	defer func() {
-		evictMemoryCachesToCapacityPercent = oldMemoryEvictor
-	}()
-
-	memoryStarted := make(chan struct{})
-	releaseMemory := make(chan struct{})
-
-	evictMemoryCachesToCapacityPercent = func(ctx context.Context, targetPercent int64) map[string]int64 {
-		close(memoryStarted)
-		select {
-		case <-releaseMemory:
-		case <-ctx.Done():
-		}
-		return nil
-	}
-
-	done := make(chan struct{})
-	go func() {
-		makeRSSCacheEvictor(time.Second)(context.Background(), 50)
-		close(done)
-	}()
-
-	require.Eventually(t, func() bool {
-		select {
-		case <-memoryStarted:
-			return true
-		default:
-			return false
-		}
-	}, time.Second, time.Millisecond)
-
-	close(releaseMemory)
-	require.Eventually(t, func() bool {
-		select {
-		case <-done:
-			return true
-		default:
-			return false
-		}
-	}, time.Second, time.Millisecond)
-}
-
 func Test_InitServer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -458,7 +414,7 @@ func Test_InitServer(t *testing.T) {
 		lockService lockservice.LockService,
 		queryClient qclient.QueryClient,
 		hakeeper logservice.CNHAKeeperClient,
-		udfService udf.Service,
+		udfService udf.Runtime,
 		cli client.TxnClient,
 		aicm *defines.AutoIncrCacheManager,
 		mAcquirer func() morpc.Message) error {
@@ -1068,7 +1024,7 @@ func TestPipelineAdmissionRejectsRequestAlreadyReadDuringClose(t *testing.T) {
 			lockservice.LockService,
 			qclient.QueryClient,
 			logservice.CNHAKeeperClient,
-			udf.Service,
+			udf.Runtime,
 			client.TxnClient,
 			*defines.AutoIncrCacheManager,
 			func() morpc.Message,
@@ -1168,7 +1124,7 @@ func TestFragmentedPipelineCacheSurvivesHandlerRelease(t *testing.T) {
 			_ lockservice.LockService,
 			_ qclient.QueryClient,
 			_ logservice.CNHAKeeperClient,
-			_ udf.Service,
+			_ udf.Runtime,
 			_ client.TxnClient,
 			_ *defines.AutoIncrCacheManager,
 			_ func() morpc.Message,
@@ -1294,7 +1250,7 @@ func TestServiceCloseCancelsAdmittedPipeline(t *testing.T) {
 			_ lockservice.LockService,
 			_ qclient.QueryClient,
 			_ logservice.CNHAKeeperClient,
-			_ udf.Service,
+			_ udf.Runtime,
 			_ client.TxnClient,
 			_ *defines.AutoIncrCacheManager,
 			_ func() morpc.Message,
@@ -1375,7 +1331,7 @@ func TestHandleRequestPropagatesConfiguredRPCMaxMessageSize(t *testing.T) {
 		_ lockservice.LockService,
 		_ qclient.QueryClient,
 		_ logservice.CNHAKeeperClient,
-		_ udf.Service,
+		_ udf.Runtime,
 		_ client.TxnClient,
 		_ *defines.AutoIncrCacheManager,
 		_ func() morpc.Message,

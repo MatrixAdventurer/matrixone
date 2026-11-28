@@ -16,8 +16,8 @@ package vector
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"io"
 	"math"
 	"slices"
 	"strings"
@@ -26,71 +26,80 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/bitmap"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
 )
 
-func TestLength(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	err := AppendFixedList(vec, []int8{0, 1, 2}, nil, mp)
-	require.NoError(t, err)
-	require.Equal(t, 3, vec.Length())
-	vec.length = 2
-	require.Equal(t, 2, vec.Length())
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-
-	{
-		//Array Float32
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float32, 3, 0))
-		err := AppendArrayList[float32](vec, [][]float32{{1, 2, 3}, {4, 5, 6}}, nil, mp)
-		require.NoError(t, err)
-		require.Equal(t, 2, vec.Length())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{
-		//Array Float64
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float64, 3, 0))
-		err := AppendArrayList[float64](vec, [][]float64{{1, 2, 3}, {4, 5, 6}}, nil, mp)
-		require.NoError(t, err)
-		require.Equal(t, 2, vec.Length())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
 func TestAppendCheckpointRollback(t *testing.T) {
 	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_varchar.ToType())
+	vec := NewVec(types.T_varchar.ToType(), mp)
 	defer vec.Free(mp)
 	first := strings.Repeat("a", 64)
 	require.NoError(t, AppendBytes(vec, []byte(first), false, mp))
-	vec.GetGrouping().Set(0)
 	vec.SetSorted(true)
 	checkpoint := vec.MakeAppendCheckpoint()
 
 	require.NoError(t, AppendBytes(vec, []byte(strings.Repeat("b", 96)), false, mp))
 	vec.GetNulls().Set(1)
-	vec.GetGrouping().Set(1)
-	// Grouping publication can precede a failed varlen copy and therefore can
-	// extend beyond the length reached by the copy itself.
-	vec.GetGrouping().Set(2)
 	vec.SetSorted(false)
 	vec.RollbackAppend(checkpoint, 2)
 
 	require.Equal(t, 1, vec.Length())
 	require.Equal(t, []string{first}, InefficientMustStrCol(vec))
+	require.False(t, vec.GetNulls().Contains(0))
 	require.False(t, vec.GetNulls().Contains(1))
-	require.True(t, vec.GetGrouping().Contains(0))
-	require.False(t, vec.GetGrouping().Contains(1))
-	require.False(t, vec.GetGrouping().Contains(2))
 	require.True(t, vec.GetSorted())
+}
+
+// An invalid checkpoint is rejected before any mutation, with an invariant
+// error that callers never treat as a retryable capacity failure.
+func TestRollbackAppendRejectsBeforeMutation(t *testing.T) {
+	for _, name := range []string{"length", "area", "negative", "overflow"} {
+		t.Run(name, func(t *testing.T) {
+			mp := mpool.MustNewZero()
+			v := NewVec(types.T_varchar.ToType(), mp)
+			defer func() { v.Free(mp); require.Zero(t, mp.CurrNB()); require.Zero(t, mp.OnHeapCurrNB()) }()
+			require.NoError(t, AppendBytes(v, []byte(strings.Repeat("a", 64)), false, mp))
+			v.SetSorted(true)
+			cp := v.MakeAppendCheckpoint()
+			attempted := 1
+			switch name {
+			case "length":
+				cp.length++
+			case "area":
+				cp.areaLength++
+			case "negative":
+				attempted = -1
+			case "overflow":
+				attempted = math.MaxInt
+			}
+			err := v.RollbackAppend(cp, attempted)
+			require.ErrorIs(t, err, mpool.ErrAllocationAccountInvariant)
+			require.False(t, mpool.IsRetryableAllocationCapacity(errors.Join(mpool.ErrAllocationAccountCapacity, err)))
+			require.Equal(t, 1, v.Length())
+			require.Equal(t, 64, len(v.GetArea()))
+			require.True(t, v.GetSorted())
+			require.Equal(t, strings.Repeat("a", 64), v.GetStringAt(0))
+		})
+	}
+}
+
+// An append beyond the allocator size limit keeps the error's identity
+// through the rollback and keeps the rows already appended.
+func TestAppendAllocatorLimitReturnsErrorAndKeepsPrefix(t *testing.T) {
+	old := mpool.CapLimit
+	mpool.CapLimit = 128
+	t.Cleanup(func() { mpool.CapLimit = old })
+	mp := mpool.MustNewZero()
+	v := NewVec(types.T_varchar.ToType(), mp)
+	defer func() { v.Free(mp); require.Zero(t, mp.CurrNB()); require.Zero(t, mp.OnHeapCurrNB()) }()
+	first := strings.Repeat("a", 64)
+	require.NoError(t, AppendBytes(v, []byte(first), false, mp))
+	err := AppendBytes(v, []byte(strings.Repeat("b", 64)), false, mp)
+	require.ErrorIs(t, err, mpool.ErrAllocationAllocatorLimit)
+	require.Equal(t, 1, v.Length())
+	require.Equal(t, first, v.GetStringAt(0))
 }
 
 func TestAppendCheckpointScratch(t *testing.T) {
@@ -120,307 +129,27 @@ func TestAppendCheckpointScratch(t *testing.T) {
 	require.ErrorIs(t, err, mpool.ErrAllocationAccountInvalid)
 }
 
-func TestCapacityForUntypedNull(t *testing.T) {
-	vec := NewVec(types.T_any.ToType())
-	require.Equal(t, 0, vec.Capacity())
-}
-
-func TestDupOffHeap(t *testing.T) {
+func TestSizeAndCapacity(t *testing.T) {
 	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_varchar.ToType())
-	require.NoError(t, AppendBytesList(vec, [][]byte{[]byte("a"), []byte("longer value")}, nil, mp))
+	fixed := NewVec(types.T_int32.ToType(), mp)
+	require.Zero(t, fixed.Size())
+	require.NoError(t, AppendFixedList(fixed, []int32{1, 2, 3}, nil, mp))
+	require.Equal(t, 3*4, fixed.Size())
+	require.GreaterOrEqual(t, fixed.Capacity(), 3)
 
-	dup, err := vec.DupOffHeap(mp)
-	require.NoError(t, err)
-	require.True(t, dup.offHeap)
-	require.Equal(t, vec.Length(), dup.Length())
-	require.Equal(t, vec.GetBytesAt(0), dup.GetBytesAt(0))
-	require.Equal(t, vec.GetBytesAt(1), dup.GetBytesAt(1))
+	long := strings.Repeat("x", types.VarlenaInlineSize+1)
+	varlen := NewVec(types.T_varchar.ToType(), mp)
+	require.NoError(t, AppendBytes(varlen, []byte(long), false, mp))
+	require.Equal(t, types.VarlenaSize+len(long), varlen.Size())
 
-	dup.Free(mp)
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
+	// T_any has no physical width; Capacity must not divide by it.
+	untyped := NewVec(types.T_any.ToType(), mp)
+	require.Zero(t, untyped.Capacity())
 
-func TestSize(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	require.Equal(t, 0, vec.Size())
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-	{
-		//Array Float32
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float32, 4, 0))
-		require.Equal(t, 0, vec.Size())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{
-		//Array Float64
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float64, 4, 0))
-		require.Equal(t, 0, vec.Size())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
-func TestUnionOne(t *testing.T) {
-	{ // test const vector
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int8.ToType())
-		w := NewVec(types.T_int8.ToType())
-		err := AppendFixed(w, int8(0), false, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		w.Free(mp)
-		v.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // test const vector
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_varchar.ToType())
-		w := NewVec(types.T_varchar.ToType())
-		err := AppendBytes(w, []byte("x"), false, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		w.Free(mp)
-		v.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // test const Array Float32 vector
-		mp := mpool.MustNewZero()
-		v := NewVec(types.New(types.T_array_float32, 4, 0))
-		w := NewVec(types.New(types.T_array_float32, 4, 0))
-		err := AppendArrayList(w, [][]float32{{1, 2, 3, 0}, {4, 5, 6, 0}}, nil, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		w.Free(mp)
-		v.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-
-	}
-	{ // test const Array Float64 vector
-		mp := mpool.MustNewZero()
-		v := NewVec(types.New(types.T_array_float64, 4, 0))
-		w := NewVec(types.New(types.T_array_float64, 4, 0))
-		err := AppendArrayList(w, [][]float64{{1, 2, 3, 0}, {4, 5, 6, 0}}, nil, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		w.Free(mp)
-		v.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // test bit vector
-		mp := mpool.MustNewZero()
-		v := NewVec(types.New(types.T_bit, 10, 0))
-		w := NewVec(types.New(types.T_bit, 10, 0))
-		err := AppendFixedList(w, []uint64{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColWithTypeCheck[uint64](v)
-		require.Equal(t, uint64(1), vs[0])
-
-		w.Free(mp)
-		v.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // bool
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_bool.ToType())
-		w := NewVec(types.T_bool.ToType())
-		err := AppendFixedList(w, []bool{true, false, true, false}, nil, mp)
-		require.NoError(t, err)
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[bool](v)
-		require.Equal(t, true, vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // int8
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int8.ToType())
-		w := NewVec(types.T_int8.ToType())
-		err := AppendFixedList(w, []int8{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[int8](v)
-		require.Equal(t, int8(1), vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // int16
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int16.ToType())
-		w := NewVec(types.T_int16.ToType())
-		err := AppendFixedList(w, []int16{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[int16](v)
-		require.Equal(t, int16(1), vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // int32
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int32.ToType())
-		w := NewVec(types.T_int32.ToType())
-		err := AppendFixedList(w, []int32{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[int32](v)
-		require.Equal(t, int32(1), vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // int64
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int64.ToType())
-		w := NewVec(types.T_int64.ToType())
-		err := AppendFixedList(w, []int64{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[int64](v)
-		require.Equal(t, int64(1), vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // uint8
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_uint8.ToType())
-		w := NewVec(types.T_uint8.ToType())
-		err := AppendFixedList(w, []uint8{1, 2, 3, 4}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs := MustFixedColNoTypeCheck[uint8](v)
-		require.Equal(t, uint8(1), vs[0])
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{ // text
-		mp := mpool.MustNewZero()
-		v := NewVec(types.T_text.ToType())
-		w := NewVec(types.T_text.ToType())
-		err := AppendBytesList(w, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
-		require.NoError(t, err)
-
-		err = v.UnionOne(w, 0, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, v.Length())
-		vs, area := MustVarlenaRawData(v)
-		require.Equal(t, "1", vs[0].GetString(area))
-
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
-func TestConst(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewConstNull(types.T_int8.ToType(), 1, mp)
-	require.Equal(t, true, vec.IsConst())
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
-
-func TestAppend(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	err := AppendFixed(vec, int8(0), false, mp)
-	require.NoError(t, err)
-	err = AppendFixed(vec, int8(0), true, mp)
-	require.NoError(t, err)
-	err = AppendFixedList(vec, []int8{0, 1, 2}, nil, mp)
-	require.NoError(t, err)
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-
-	{
-		// Array Float32
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float32, 4, 0))
-		err := AppendArray[float32](vec, []float32{1, 2, 3, 0}, false, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, vec.Length())
-		err = AppendArray[float32](vec, []float32{2, 4, 5, 6}, true, mp)
-		require.NoError(t, err)
-		require.Equal(t, 2, vec.Length())
-		err = AppendArrayList[float32](vec, [][]float32{{4, 4, 4, 6}, {2, 5, 5, 3}}, nil, mp)
-		require.NoError(t, err)
-		require.Equal(t, 4, vec.Length())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{
-		// Array Float64
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.New(types.T_array_float64, 4, 0))
-		err := AppendArray[float64](vec, []float64{1, 2, 3, 0}, false, mp)
-		require.NoError(t, err)
-		require.Equal(t, 1, vec.Length())
-		err = AppendArray[float64](vec, []float64{2, 4, 5, 6}, true, mp)
-		require.NoError(t, err)
-		require.Equal(t, 2, vec.Length())
-		err = AppendArrayList[float64](vec, [][]float64{{4, 4, 4, 6}, {2, 5, 5, 3}}, nil, mp)
-		require.NoError(t, err)
-		require.Equal(t, 4, vec.Length())
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
-func TestAppendBytes(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_varchar.ToType())
-	err := AppendBytes(vec, []byte("x"), false, mp)
-	require.NoError(t, err)
-	err = AppendBytes(vec, nil, true, mp)
-	require.NoError(t, err)
-	err = AppendBytesList(vec, [][]byte{[]byte("x"), []byte("y")}, nil, mp)
-	require.NoError(t, err)
-	vs, data := MustVarlenaRawData(vec)
-	for _, v := range vs {
-		v.GetByteSlice(data)
-	}
-	vec.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
+	fixed.Free(mp)
+	varlen.Free(mp)
+	untyped.Free(mp)
+	require.Zero(t, mp.CurrNB())
 }
 
 func TestAppendBytesNullUsesVectorPhysicalType(t *testing.T) {
@@ -431,7 +160,7 @@ func TestAppendBytesNullUsesVectorPhysicalType(t *testing.T) {
 	} {
 		t.Run(typ.String(), func(t *testing.T) {
 			mp := mpool.MustNewZero()
-			vec := NewVec(typ)
+			vec := NewVec(typ, mp)
 
 			// AppendBytes is the generic null path used by expression
 			// evaluation, including for fixed-width result vectors.
@@ -445,58 +174,6 @@ func TestAppendBytesNullUsesVectorPhysicalType(t *testing.T) {
 			require.Zero(t, mp.CurrNB())
 		})
 	}
-}
-
-func TestAppendArray(t *testing.T) {
-	{
-		// Array Float32
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.T_array_float32.ToType())
-		err := AppendArray[float32](vec, []float32{1, 1, 1}, false, mp)
-		require.NoError(t, err)
-		err = AppendArray[float32](vec, nil, true, mp)
-		require.NoError(t, err)
-		err = AppendArrayList[float32](vec, [][]float32{{2, 2, 2}, {3, 3, 3}}, nil, mp)
-		require.NoError(t, err)
-		vs, data := MustVarlenaRawData(vec)
-		for _, v := range vs {
-			types.GetArray[float32](&v, data)
-		}
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-	{
-		// Array Float64
-		mp := mpool.MustNewZero()
-		vec := NewVec(types.T_array_float64.ToType())
-		err := AppendArray[float64](vec, []float64{1, 1, 1}, false, mp)
-		require.NoError(t, err)
-		err = AppendArray[float64](vec, nil, true, mp)
-		require.NoError(t, err)
-		err = AppendArrayList[float64](vec, [][]float64{{2, 2, 2}, {3, 3, 3}}, nil, mp)
-		require.NoError(t, err)
-		vs, data := MustVarlenaRawData(vec)
-		for _, v := range vs {
-			types.GetArray[float64](&v, data)
-		}
-		vec.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
-func TestDup(t *testing.T) {
-	mp := mpool.MustNewZero()
-	v := NewVec(types.T_int8.ToType())
-	err := AppendFixedList(v, []int8{0, 1, 2}, nil, mp)
-	require.NoError(t, err)
-	w, err := v.Dup(mp)
-	require.NoError(t, err)
-	vs := MustFixedColWithTypeCheck[int8](v)
-	ws := MustFixedColWithTypeCheck[int8](w)
-	require.Equal(t, vs, ws)
-	v.Free(mp)
-	w.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
 }
 
 func TestNewVecWithDataCopyOwnsBackingData(t *testing.T) {
@@ -520,7 +197,7 @@ func TestNewVecWithDataCopyOwnsBackingData(t *testing.T) {
 func TestShrink(t *testing.T) {
 	mp := mpool.MustNewZero()
 	{ // Array Float32
-		v := NewVec(types.T_array_float32.ToType())
+		v := NewVec(types.T_array_float32.ToType(), mp)
 		err := AppendArrayList[float32](v, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -529,7 +206,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float64
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		err := AppendArrayList[float64](v, [][]float64{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -538,7 +215,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bool
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixedList(v, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -548,7 +225,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int8
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -558,7 +235,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int16
-		v := NewVec(types.T_int16.ToType())
+		v := NewVec(types.T_int16.ToType(), mp)
 		err := AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{0, 3}, false, mp))
@@ -568,7 +245,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int32
-		v := NewVec(types.T_int32.ToType())
+		v := NewVec(types.T_int32.ToType(), mp)
 		err := AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -578,7 +255,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int64
-		v := NewVec(types.T_int64.ToType())
+		v := NewVec(types.T_int64.ToType(), mp)
 		err := AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -588,7 +265,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint8
-		v := NewVec(types.T_uint8.ToType())
+		v := NewVec(types.T_uint8.ToType(), mp)
 		err := AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -598,7 +275,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint16
-		v := NewVec(types.T_uint16.ToType())
+		v := NewVec(types.T_uint16.ToType(), mp)
 		err := AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{0, 3}, false, mp))
@@ -608,7 +285,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint32
-		v := NewVec(types.T_uint32.ToType())
+		v := NewVec(types.T_uint32.ToType(), mp)
 		err := AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -618,7 +295,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint64
-		v := NewVec(types.T_uint64.ToType())
+		v := NewVec(types.T_uint64.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -628,7 +305,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float32
-		v := NewVec(types.T_float32.ToType())
+		v := NewVec(types.T_float32.ToType(), mp)
 		err := AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -638,7 +315,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float64
-		v := NewVec(types.T_float64.ToType())
+		v := NewVec(types.T_float64.ToType(), mp)
 		err := AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -648,7 +325,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // text
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -659,7 +336,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // date
-		v := NewVec(types.T_date.ToType())
+		v := NewVec(types.T_date.ToType(), mp)
 		err := AppendFixedList(v, []types.Date{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -669,7 +346,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // datetime
-		v := NewVec(types.T_datetime.ToType())
+		v := NewVec(types.T_datetime.ToType(), mp)
 		err := AppendFixedList(v, []types.Datetime{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -679,7 +356,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // time
-		v := NewVec(types.T_time.ToType())
+		v := NewVec(types.T_time.ToType(), mp)
 		err := AppendFixedList(v, []types.Time{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -689,7 +366,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // timestamp
-		v := NewVec(types.T_timestamp.ToType())
+		v := NewVec(types.T_timestamp.ToType(), mp)
 		err := AppendFixedList(v, []types.Timestamp{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -700,7 +377,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // decimal64
 		vs := make([]types.Decimal64, 4)
-		v := NewVec(types.T_decimal64.ToType())
+		v := NewVec(types.T_decimal64.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -710,7 +387,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // decimal128
 		vs := make([]types.Decimal128, 4)
-		v := NewVec(types.T_decimal128.ToType())
+		v := NewVec(types.T_decimal128.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -720,7 +397,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // uuid
 		vs := make([]types.Uuid, 4)
-		v := NewVec(types.T_uuid.ToType())
+		v := NewVec(types.T_uuid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -730,7 +407,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // ts
 		vs := make([]types.TS, 4)
-		v := NewVec(types.T_TS.ToType())
+		v := NewVec(types.T_TS.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -740,7 +417,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // rowid
 		vs := make([]types.Rowid, 4)
-		v := NewVec(types.T_Rowid.ToType())
+		v := NewVec(types.T_Rowid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -750,7 +427,7 @@ func TestShrink(t *testing.T) {
 	}
 	{ // blockid
 		vs := make([]types.Blockid, 4)
-		v := NewVec(types.T_Blockid.ToType())
+		v := NewVec(types.T_Blockid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -759,7 +436,7 @@ func TestShrink(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.Shrink([]int64{1, 2}, false, mp))
@@ -773,10 +450,10 @@ func TestShrink(t *testing.T) {
 func TestShrinkByMask(t *testing.T) {
 	mp := mpool.MustNewZero()
 	var bm bitmap.Bitmap
-	bm.InitWithSize(2)
+	require.NoError(t, bm.InitWithSize(2, mpool.MustNewZero()))
 	bm.AddMany([]uint64{0, 1})
 	var bmask bitmap.Bitmap
-	bmask.InitWith(&bm)
+	require.NoError(t, bmask.InitWith(&bm, bm.MPool()))
 
 	//{ // Array Float32
 	//	v := NewVec(types.T_array_float32.ToType())
@@ -796,7 +473,7 @@ func TestShrinkByMask(t *testing.T) {
 	//	require.Equal(t, int64(0), mp.CurrNB())
 	//}
 	{ // Array Float64
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		err := AppendArrayList[float64](v, [][]float64{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -804,7 +481,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_array_float64.ToType())
+		v = NewVec(types.T_array_float64.ToType(), mp)
 		err = AppendArrayList[float64](v, [][]float64{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -813,7 +490,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bool
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixedList(v, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -822,7 +499,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_bool.ToType())
+		v = NewVec(types.T_bool.ToType(), mp)
 		err = AppendFixedList(v, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -832,7 +509,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int8
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -841,7 +518,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_int8.ToType())
+		v = NewVec(types.T_int8.ToType(), mp)
 		err = AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -851,7 +528,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int16
-		v := NewVec(types.T_int16.ToType())
+		v := NewVec(types.T_int16.ToType(), mp)
 		err := AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -860,7 +537,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_int16.ToType())
+		v = NewVec(types.T_int16.ToType(), mp)
 		err = AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -870,7 +547,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int32
-		v := NewVec(types.T_int32.ToType())
+		v := NewVec(types.T_int32.ToType(), mp)
 		err := AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -879,7 +556,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_int32.ToType())
+		v = NewVec(types.T_int32.ToType(), mp)
 		err = AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -889,7 +566,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int64
-		v := NewVec(types.T_int64.ToType())
+		v := NewVec(types.T_int64.ToType(), mp)
 		err := AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -898,7 +575,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_int64.ToType())
+		v = NewVec(types.T_int64.ToType(), mp)
 		err = AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -908,7 +585,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint8
-		v := NewVec(types.T_uint8.ToType())
+		v := NewVec(types.T_uint8.ToType(), mp)
 		err := AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -917,7 +594,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_uint8.ToType())
+		v = NewVec(types.T_uint8.ToType(), mp)
 		err = AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -927,7 +604,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint16
-		v := NewVec(types.T_uint16.ToType())
+		v := NewVec(types.T_uint16.ToType(), mp)
 		err := AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -936,7 +613,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_uint16.ToType())
+		v = NewVec(types.T_uint16.ToType(), mp)
 		err = AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -946,7 +623,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint32
-		v := NewVec(types.T_uint32.ToType())
+		v := NewVec(types.T_uint32.ToType(), mp)
 		err := AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -955,7 +632,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_uint32.ToType())
+		v = NewVec(types.T_uint32.ToType(), mp)
 		err = AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -965,7 +642,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint64
-		v := NewVec(types.T_uint64.ToType())
+		v := NewVec(types.T_uint64.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -974,7 +651,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_uint64.ToType())
+		v = NewVec(types.T_uint64.ToType(), mp)
 		err = AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -984,7 +661,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float32
-		v := NewVec(types.T_float32.ToType())
+		v := NewVec(types.T_float32.ToType(), mp)
 		err := AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -993,7 +670,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_float32.ToType())
+		v = NewVec(types.T_float32.ToType(), mp)
 		err = AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1003,7 +680,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float64
-		v := NewVec(types.T_float64.ToType())
+		v := NewVec(types.T_float64.ToType(), mp)
 		err := AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1012,7 +689,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_float64.ToType())
+		v = NewVec(types.T_float64.ToType(), mp)
 		err = AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1022,7 +699,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // text
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1032,7 +709,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_text.ToType())
+		v = NewVec(types.T_text.ToType(), mp)
 		err = AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1043,7 +720,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // date
-		v := NewVec(types.T_date.ToType())
+		v := NewVec(types.T_date.ToType(), mp)
 		err := AppendFixedList(v, []types.Date{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1052,7 +729,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_date.ToType())
+		v = NewVec(types.T_date.ToType(), mp)
 		err = AppendFixedList(v, []types.Date{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1062,7 +739,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // datetime
-		v := NewVec(types.T_datetime.ToType())
+		v := NewVec(types.T_datetime.ToType(), mp)
 		err := AppendFixedList(v, []types.Datetime{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1071,7 +748,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_datetime.ToType())
+		v = NewVec(types.T_datetime.ToType(), mp)
 		err = AppendFixedList(v, []types.Datetime{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1081,7 +758,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // time
-		v := NewVec(types.T_time.ToType())
+		v := NewVec(types.T_time.ToType(), mp)
 		err := AppendFixedList(v, []types.Time{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1090,7 +767,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_time.ToType())
+		v = NewVec(types.T_time.ToType(), mp)
 		err = AppendFixedList(v, []types.Time{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1100,7 +777,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // timestamp
-		v := NewVec(types.T_timestamp.ToType())
+		v := NewVec(types.T_timestamp.ToType(), mp)
 		err := AppendFixedList(v, []types.Timestamp{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1109,7 +786,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_timestamp.ToType())
+		v = NewVec(types.T_timestamp.ToType(), mp)
 		err = AppendFixedList(v, []types.Timestamp{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1120,7 +797,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // decimal64
 		vs := make([]types.Decimal64, 4)
-		v := NewVec(types.T_decimal64.ToType())
+		v := NewVec(types.T_decimal64.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1129,7 +806,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.Decimal64, 4)
-		v = NewVec(types.T_decimal64.ToType())
+		v = NewVec(types.T_decimal64.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1139,7 +816,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // decimal128
 		vs := make([]types.Decimal128, 4)
-		v := NewVec(types.T_decimal128.ToType())
+		v := NewVec(types.T_decimal128.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1148,7 +825,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.Decimal128, 4)
-		v = NewVec(types.T_decimal128.ToType())
+		v = NewVec(types.T_decimal128.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1158,7 +835,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // uuid
 		vs := make([]types.Uuid, 4)
-		v := NewVec(types.T_uuid.ToType())
+		v := NewVec(types.T_uuid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1167,7 +844,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.Uuid, 4)
-		v = NewVec(types.T_uuid.ToType())
+		v = NewVec(types.T_uuid.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1177,7 +854,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // ts
 		vs := make([]types.TS, 4)
-		v := NewVec(types.T_TS.ToType())
+		v := NewVec(types.T_TS.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1186,7 +863,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.TS, 4)
-		v = NewVec(types.T_TS.ToType())
+		v = NewVec(types.T_TS.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1196,7 +873,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // rowid
 		vs := make([]types.Rowid, 4)
-		v := NewVec(types.T_Rowid.ToType())
+		v := NewVec(types.T_Rowid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1205,7 +882,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.Rowid, 4)
-		v = NewVec(types.T_Rowid.ToType())
+		v = NewVec(types.T_Rowid.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1215,7 +892,7 @@ func TestShrinkByMask(t *testing.T) {
 	}
 	{ // blockid
 		vs := make([]types.Blockid, 4)
-		v := NewVec(types.T_Blockid.ToType())
+		v := NewVec(types.T_Blockid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1224,7 +901,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		vs = make([]types.Blockid, 4)
-		v = NewVec(types.T_Blockid.ToType())
+		v = NewVec(types.T_Blockid.ToType(), mp)
 		err = AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1233,7 +910,7 @@ func TestShrinkByMask(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, false, 1, mp))
@@ -1242,7 +919,7 @@ func TestShrinkByMask(t *testing.T) {
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 
-		v = NewVec(types.T_bit.ToType())
+		v = NewVec(types.T_bit.ToType(), mp)
 		err = AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.NoError(t, v.ShrinkByMask(&bmask, true, 1, mp))
@@ -1256,11 +933,11 @@ func TestShrinkByMask(t *testing.T) {
 func TestShrinkByMaskKeepsNullsAlignedWithOffset(t *testing.T) {
 	mp := mpool.MustNewZero()
 	var mask bitmap.Bitmap
-	mask.InitWithSize(3)
+	require.NoError(t, mask.InitWithSize(3, mpool.MustNewZero()))
 	mask.AddMany([]uint64{0, 2})
 
 	t.Run("negate", func(t *testing.T) {
-		vec := NewVec(types.T_int32.ToType())
+		vec := NewVec(types.T_int32.ToType(), mp)
 		defer vec.Free(mp)
 		require.NoError(t, AppendFixedList(
 			vec,
@@ -1268,16 +945,14 @@ func TestShrinkByMaskKeepsNullsAlignedWithOffset(t *testing.T) {
 			[]bool{false, false, false, true, false, true, false, false},
 			mp,
 		))
-		vec.GetGrouping().Add(3, 4)
 
 		require.NoError(t, vec.ShrinkByMask(&mask, true, 2, mp))
 		require.Equal(t, []int32{10, 11, 0, 0, 16, 17}, MustFixedColWithTypeCheck[int32](vec))
 		require.Equal(t, []uint64{2, 3}, vec.GetNulls().ToArray())
-		require.Equal(t, []uint64{2}, vec.GetGrouping().ToArray())
 	})
 
 	t.Run("select", func(t *testing.T) {
-		vec := NewVec(types.T_int32.ToType())
+		vec := NewVec(types.T_int32.ToType(), mp)
 		defer vec.Free(mp)
 		require.NoError(t, AppendFixedList(
 			vec,
@@ -1285,12 +960,10 @@ func TestShrinkByMaskKeepsNullsAlignedWithOffset(t *testing.T) {
 			[]bool{false, false, true, false, false, false, false, false},
 			mp,
 		))
-		vec.GetGrouping().Add(2, 4)
 
 		require.NoError(t, vec.ShrinkByMask(&mask, false, 2, mp))
 		require.Equal(t, []int32{0, 14}, MustFixedColWithTypeCheck[int32](vec))
 		require.Equal(t, []uint64{0}, vec.GetNulls().ToArray())
-		require.Equal(t, []uint64{0, 1}, vec.GetGrouping().ToArray())
 	})
 }
 
@@ -1298,7 +971,7 @@ func TestShuffle(t *testing.T) {
 	mp := mpool.MustNewZero()
 
 	{ // Array Float32
-		v := NewVec(types.T_array_float32.ToType())
+		v := NewVec(types.T_array_float32.ToType(), mp)
 		err := AppendArrayList[float32](v, [][]float32{{1, 1}, {2, 2}, {3, 3}}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1308,7 +981,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float64
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		err := AppendArrayList[float64](v, [][]float64{{1, 1}, {2, 2}, {3, 3}}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1318,7 +991,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bool
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixedList(v, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{2, 1}, mp)
@@ -1329,7 +1002,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int8
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1340,7 +1013,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int16
-		v := NewVec(types.T_int16.ToType())
+		v := NewVec(types.T_int16.ToType(), mp)
 		err := AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{0, 3}, mp)
@@ -1351,7 +1024,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int32
-		v := NewVec(types.T_int32.ToType())
+		v := NewVec(types.T_int32.ToType(), mp)
 		err := AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1362,7 +1035,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int64
-		v := NewVec(types.T_int64.ToType())
+		v := NewVec(types.T_int64.ToType(), mp)
 		err := AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1373,7 +1046,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint8
-		v := NewVec(types.T_uint8.ToType())
+		v := NewVec(types.T_uint8.ToType(), mp)
 		err := AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1384,7 +1057,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint16
-		v := NewVec(types.T_uint16.ToType())
+		v := NewVec(types.T_uint16.ToType(), mp)
 		err := AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{0, 3}, mp)
@@ -1395,7 +1068,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint32
-		v := NewVec(types.T_uint32.ToType())
+		v := NewVec(types.T_uint32.ToType(), mp)
 		err := AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1406,7 +1079,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint64
-		v := NewVec(types.T_uint64.ToType())
+		v := NewVec(types.T_uint64.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1417,7 +1090,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float32
-		v := NewVec(types.T_float32.ToType())
+		v := NewVec(types.T_float32.ToType(), mp)
 		err := AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1428,7 +1101,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float64
-		v := NewVec(types.T_float64.ToType())
+		v := NewVec(types.T_float64.ToType(), mp)
 		err := AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1439,7 +1112,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // text
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1451,7 +1124,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // date
-		v := NewVec(types.T_date.ToType())
+		v := NewVec(types.T_date.ToType(), mp)
 		err := AppendFixedList(v, []types.Date{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1462,7 +1135,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // datetime
-		v := NewVec(types.T_datetime.ToType())
+		v := NewVec(types.T_datetime.ToType(), mp)
 		err := AppendFixedList(v, []types.Datetime{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1473,7 +1146,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // time
-		v := NewVec(types.T_time.ToType())
+		v := NewVec(types.T_time.ToType(), mp)
 		err := AppendFixedList(v, []types.Time{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1484,7 +1157,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // timestamp
-		v := NewVec(types.T_timestamp.ToType())
+		v := NewVec(types.T_timestamp.ToType(), mp)
 		err := AppendFixedList(v, []types.Timestamp{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1496,7 +1169,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // decimal64
 		vs := make([]types.Decimal64, 4)
-		v := NewVec(types.T_decimal64.ToType())
+		v := NewVec(types.T_decimal64.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1507,7 +1180,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // decimal128
 		vs := make([]types.Decimal128, 4)
-		v := NewVec(types.T_decimal128.ToType())
+		v := NewVec(types.T_decimal128.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1518,7 +1191,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // uuid
 		vs := make([]types.Uuid, 4)
-		v := NewVec(types.T_uuid.ToType())
+		v := NewVec(types.T_uuid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1529,7 +1202,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // ts
 		vs := make([]types.TS, 4)
-		v := NewVec(types.T_TS.ToType())
+		v := NewVec(types.T_TS.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1540,7 +1213,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // rowid
 		vs := make([]types.Rowid, 4)
-		v := NewVec(types.T_Rowid.ToType())
+		v := NewVec(types.T_Rowid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1551,7 +1224,7 @@ func TestShuffle(t *testing.T) {
 	}
 	{ // blockid
 		vs := make([]types.Blockid, 4)
-		v := NewVec(types.T_Blockid.ToType())
+		v := NewVec(types.T_Blockid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		v.Shuffle([]int64{1, 2}, mp)
@@ -1561,7 +1234,7 @@ func TestShuffle(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		err = v.Shuffle([]int64{1, 2}, mp)
@@ -1576,25 +1249,24 @@ func TestShuffle(t *testing.T) {
 
 func TestCopy(t *testing.T) {
 	mp := mpool.MustNewZero()
-	{ // fixed grouping provenance
-		dst := NewVec(types.T_int32.ToType())
-		src := NewVec(types.T_int32.ToType())
-		require.NoError(t, AppendFixedList(dst, []int32{0, 0}, nil, mp))
-		require.NoError(t, AppendFixedList(src, []int32{1, 2}, nil, mp))
-		src.GetGrouping().Add(0)
-		dst.GetGrouping().Add(1)
+	{ // fixed null provenance
+		dst := NewVec(types.T_int32.ToType(), mp)
+		src := NewVec(types.T_int32.ToType(), mp)
+		require.NoError(t, AppendFixedList(dst, []int32{0, 0}, []bool{false, true}, mp))
+		require.NoError(t, AppendFixedList(src, []int32{1, 2}, []bool{true, false}, mp))
 		require.NoError(t, dst.Copy(src, 0, 0, mp))
 		require.NoError(t, dst.Copy(src, 1, 1, mp))
-		require.True(t, dst.GetGrouping().Contains(0))
-		require.False(t, dst.GetGrouping().Contains(1))
+		require.True(t, dst.GetNulls().Contains(0))
+		require.False(t, dst.GetNulls().Contains(1))
+		require.Equal(t, int32(2), GetFixedAtNoTypeCheck[int32](dst, 1))
 		dst.Free(mp)
 		src.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // fixed
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		AppendFixedList(v, []int8{0, 0, 1, 0}, nil, mp)
-		w := NewVec(types.T_int8.ToType())
+		w := NewVec(types.T_int8.ToType(), mp)
 		AppendFixedList(w, []int8{0, 0, 0, 0}, nil, mp)
 		err := v.Copy(w, 2, 0, mp)
 		require.NoError(t, err)
@@ -1604,10 +1276,10 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		err := AppendFixedList(v, []uint64{0, 0, 1, 0}, nil, mp)
 		require.NoError(t, err)
-		w := NewVec(types.T_bit.ToType())
+		w := NewVec(types.T_bit.ToType(), mp)
 		err = AppendFixedList(w, []uint64{0, 0, 0, 0}, nil, mp)
 		require.NoError(t, err)
 		err = v.Copy(w, 2, 0, mp)
@@ -1618,9 +1290,9 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float32
-		v := NewVec(types.New(types.T_array_float32, 10, 0))
+		v := NewVec(types.New(types.T_array_float32, 10, 0), mp)
 		AppendArrayList[float32](v, [][]float32{{0, 0}, {0, 0}, {1, 1}, {0, 0}}, nil, mp)
-		w := NewVec(types.New(types.T_array_float32, 10, 0))
+		w := NewVec(types.New(types.T_array_float32, 10, 0), mp)
 		AppendArrayList[float32](w, [][]float32{{0, 0}, {0, 0}, {0, 0}, {0, 0}}, nil, mp)
 		err := v.Copy(w, 2, 0, mp)
 		require.NoError(t, err)
@@ -1630,9 +1302,9 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float64
-		v := NewVec(types.New(types.T_array_float64, 10, 0))
+		v := NewVec(types.New(types.T_array_float64, 10, 0), mp)
 		AppendArrayList[float64](v, [][]float64{{0, 0}, {0, 0}, {1, 1}, {0, 0}}, nil, mp)
-		w := NewVec(types.New(types.T_array_float64, 10, 0))
+		w := NewVec(types.New(types.T_array_float64, 10, 0), mp)
 		AppendArrayList[float64](w, [][]float64{{0, 0}, {0, 0}, {0, 0}, {0, 0}}, nil, mp)
 		err := v.Copy(w, 2, 0, mp)
 		require.NoError(t, err)
@@ -1642,14 +1314,14 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // string
-		v := NewVec(types.New(types.T_char, 10, 0))
+		v := NewVec(types.New(types.T_char, 10, 0), mp)
 		AppendBytesList(v, [][]byte{
 			[]byte("hello"),
 			[]byte("hello"),
 			[]byte("nihao"),
 			[]byte("hello"),
 		}, nil, mp)
-		w := NewVec(types.New(types.T_char, 10, 0))
+		w := NewVec(types.New(types.T_char, 10, 0), mp)
 		AppendBytesList(w, [][]byte{
 			[]byte("hello"),
 			[]byte("hello"),
@@ -1664,10 +1336,10 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // string null with stale varlena metadata
-		v := NewVec(types.T_varchar.ToType())
+		v := NewVec(types.T_varchar.ToType(), mp)
 		err := AppendBytes(v, []byte("seed"), false, mp)
 		require.NoError(t, err)
-		w := NewVec(types.T_varchar.ToType())
+		w := NewVec(types.T_varchar.ToType(), mp)
 		err = AppendBytes(w, nil, true, mp)
 		require.NoError(t, err)
 		ws := MustFixedColNoTypeCheck[types.Varlena](w)
@@ -1680,10 +1352,10 @@ func TestCopy(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // array null with stale varlena metadata
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		err := AppendArray[float64](v, []float64{1, 2}, false, mp)
 		require.NoError(t, err)
-		w := NewVec(types.T_array_float64.ToType())
+		w := NewVec(types.T_array_float64.ToType(), mp)
 		err = AppendArray[float64](w, nil, true, mp)
 		require.NoError(t, err)
 		ws := MustFixedColNoTypeCheck[types.Varlena](w)
@@ -1702,11 +1374,11 @@ func TestCopyPreallocatedNullVectorKeepsScalarMetadata(t *testing.T) {
 	mp := mpool.MustNewZero()
 	defer mp.Free(nil)
 
-	source := NewVec(types.T_int64.ToType())
+	source := NewVec(types.T_int64.ToType(), mp)
 	require.NoError(t, AppendFixed(source, int64(42), false, mp))
 	defer source.Free(mp)
 
-	destination := NewVec(types.T_int64.ToType())
+	destination := NewVec(types.T_int64.ToType(), mp)
 	require.NoError(t, destination.PreExtend(rows, mp))
 	destination.SetLength(rows)
 	destination.SetAllNulls(rows)
@@ -1744,7 +1416,7 @@ func TestCloneWindow(t *testing.T) {
 	v5, err := NewConstBytes(types.T_varchar.ToType(), payload, 10, mp)
 	require.NoError(t, err)
 	defer v5.Free(mp)
-	v6 := NewOffHeapVecWithType(types.T_varchar.ToType())
+	v6 := NewVec(types.T_varchar.ToType(), mp)
 	defer v6.Free(mp)
 	require.NoError(t, v5.CloneWindowTo(v6, 3, 5, mp))
 	require.True(t, v6.IsConst())
@@ -1759,7 +1431,7 @@ func TestRollbackAppendIgnoresStaleNullExtent(t *testing.T) {
 	mp := mpool.MustNewZero()
 	defer mp.Free(nil)
 
-	vec := NewVec(types.T_text.ToType())
+	vec := NewVec(types.T_text.ToType(), mp)
 	for row := 0; row < 130; row++ {
 		require.NoError(t, AppendBytes(vec, []byte("v"), row == 129, mp))
 	}
@@ -1768,7 +1440,7 @@ func TestRollbackAppendIgnoresStaleNullExtent(t *testing.T) {
 	require.True(t, vec.GetNulls().Contains(129), "SetLength preserves stale bitmap extent")
 	checkpoint := vec.MakeAppendCheckpoint()
 
-	source := NewVec(types.T_text.ToType())
+	source := NewVec(types.T_text.ToType(), mp)
 	require.NoError(t, AppendBytes(source, []byte("appended"), false, mp))
 	defer source.Free(mp)
 	require.NoError(t, vec.UnionBatch(source, 0, 1, nil, mp))
@@ -1780,478 +1452,19 @@ func TestRollbackAppendIgnoresStaleNullExtent(t *testing.T) {
 	require.Equal(t, "v", vec.GetStringAt(1))
 }
 
-func TestCloneWindowWithMpNil(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec1 := NewVec(types.T_int32.ToType())
-	AppendFixed(vec1, int32(1), false, mp)
-	AppendFixed(vec1, int32(2), true, mp)
-	AppendFixed(vec1, int32(3), false, mp)
-	require.False(t, vec1.NeedDup())
-
-	vec2, err := vec1.CloneWindow(0, vec1.Length(), nil)
-	require.NoError(t, err)
-	vec1.Free(mp)
-
-	t.Log(vec2.String())
-	require.True(t, vec2.NeedDup())
-	require.Equal(t, int32(1), GetFixedAtWithTypeCheck[int32](vec2, 0))
-	require.True(t, vec2.GetNulls().Contains(uint64(1)))
-	require.Equal(t, int32(3), GetFixedAtWithTypeCheck[int32](vec2, 2))
-
-	vec3 := NewVec(types.T_char.ToType())
-	AppendBytes(vec3, []byte("h"), false, mp)
-	AppendBytes(vec3, []byte("xx"), true, mp)
-	AppendBytes(vec3, []byte("uuu"), false, mp)
-	require.False(t, vec3.NeedDup())
-
-	vec4, err := vec3.CloneWindow(0, vec3.Length(), nil)
-	require.NoError(t, err)
-	vec3.Free(mp)
-
-	require.True(t, vec4.NeedDup())
-	require.Equal(t, 1, len(vec4.GetBytesAt(0)))
-	require.Equal(t, 3, len(vec4.GetBytesAt(2)))
-	require.True(t, vec4.GetNulls().Contains(uint64(1)))
-
-	{ //Array Float32
-		mp := mpool.MustNewZero()
-		vec5 := NewVec(types.New(types.T_array_float32, 2, 0))
-		AppendArray[float32](vec5, []float32{1, 1}, false, mp)
-		AppendArray[float32](vec5, []float32{2, 2}, true, mp)
-		AppendArray[float32](vec5, []float32{3, 3}, false, mp)
-		require.False(t, vec5.NeedDup())
-
-		vec6, err := vec5.CloneWindow(0, vec5.Length(), nil)
-		require.NoError(t, err)
-		vec5.Free(mp)
-
-		t.Log(vec6.String())
-		require.True(t, vec6.NeedDup())
-		require.Equal(t, []float32{1, 1}, GetArrayAt[float32](vec6, 0))
-		require.True(t, vec6.GetNulls().Contains(uint64(1)))
-		require.Equal(t, []float32{3, 3}, GetArrayAt[float32](vec6, 2))
-	}
-	{ //Array Float64
-		mp := mpool.MustNewZero()
-		vec5 := NewVec(types.New(types.T_array_float64, 2, 0))
-		AppendArray(vec5, []float64{1, 1}, false, mp)
-		AppendArray(vec5, []float64{2, 2}, true, mp)
-		AppendArray(vec5, []float64{3, 3}, false, mp)
-		require.False(t, vec5.NeedDup())
-
-		vec6, err := vec5.CloneWindow(0, vec5.Length(), nil)
-		require.NoError(t, err)
-		vec5.Free(mp)
-
-		t.Log(vec6.String())
-		require.True(t, vec6.NeedDup())
-		require.Equal(t, []float64{1, 1}, GetArrayAt[float64](vec6, 0))
-		require.True(t, vec6.GetNulls().Contains(uint64(1)))
-		require.Equal(t, []float64{3, 3}, GetArrayAt[float64](vec6, 2))
-	}
-}
-
-func TestOwnedVarlenaMarshalKeepsBulkLayout(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_varchar.ToType())
-	defer func() {
-		vec.Free(mp)
-		require.Zero(t, mp.CurrNB())
-	}()
-	values := [][]byte{
-		[]byte("ordinary inline"),
-		[]byte("ordinary long value that exceeds inline storage"),
-		[]byte("second ordinary long value that exceeds inline storage"),
-	}
-	require.NoError(t, AppendBytesList(vec, values, nil, mp))
-
-	plan, err := vec.PrepareMarshalBinary()
-	require.NoError(t, err)
-	require.False(t, plan.canonicalVarlen,
-		"an ordinary owned append-built vector should retain bulk serialization")
-	require.Equal(t, uint32(vec.Length()*vec.GetType().TypeSize()+len(vec.GetArea())),
-		plan.dataLength+plan.areaLength)
-
-	encoded, err := vec.MarshalBinary()
-	require.NoError(t, err)
-	decoded := NewVecFromReuse()
-	defer decoded.Free(nil)
-	require.NoError(t, decoded.UnmarshalBinary(encoded))
-	require.Equal(t, values[0], decoded.GetBytesAt(0))
-	require.Equal(t, values[1], decoded.GetBytesAt(1))
-	require.Equal(t, values[2], decoded.GetBytesAt(2))
-
-	nullable := NewVec(types.T_varchar.ToType())
-	defer nullable.Free(mp)
-	require.NoError(t, AppendBytes(nullable, values[0], false, mp))
-	require.NoError(t, AppendBytes(nullable, values[1], true, mp))
-	nullablePlan, err := nullable.PrepareMarshalBinary()
-	require.NoError(t, err)
-	require.False(t, nullablePlan.canonicalVarlen,
-		"an ordinary owned vector with a safe NULL descriptor should retain bulk serialization")
-	require.Nil(t, nullablePlan.normalizedVarlenData)
-	nullableEncoded, err := nullable.MarshalBinary()
-	require.NoError(t, err)
-	nullableDecoded := NewVecFromReuse()
-	defer nullableDecoded.Free(nil)
-	require.NoError(t, nullableDecoded.UnmarshalBinary(nullableEncoded))
-	require.True(t, nullableDecoded.IsNull(1))
-
-	stale := NewVec(types.T_varchar.ToType())
-	defer stale.Free(mp)
-	require.NoError(t, AppendBytes(stale, values[1], false, mp))
-	stale.SetNull(0)
-	stalePlan, err := stale.PrepareMarshalBinary()
-	require.NoError(t, err)
-	require.False(t, stalePlan.canonicalVarlen,
-		"an owned stale NULL descriptor should use bulk serialization with normalization")
-	require.NotNil(t, stalePlan.normalizedVarlenData)
-
-	staleEncoded, err := stale.MarshalBinary()
-	require.NoError(t, err)
-	staleDecoded := NewVecFromReuse()
-	defer staleDecoded.Free(nil)
-	require.NoError(t, staleDecoded.UnmarshalBinary(staleEncoded))
-	require.True(t, staleDecoded.IsNull(0))
-
-	window, err := vec.Window(2, 3)
-	require.NoError(t, err)
-	defer window.Free(nil)
-	windowPlan, err := window.PrepareMarshalBinary()
-	require.NoError(t, err)
-	require.True(t, windowPlan.canonicalVarlen,
-		"a window retaining a larger source area must use canonical serialization")
-	windowEncoded, err := window.MarshalBinary()
-	require.NoError(t, err)
-	windowDecoded := NewVecFromReuse()
-	defer windowDecoded.Free(nil)
-	require.NoError(t, windowDecoded.UnmarshalBinary(windowEncoded))
-	require.Equal(t, values[2], windowDecoded.GetBytesAt(0))
-}
-
-func TestNullableFixedWidthMarshalDoesNotCastAsVarlena(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int64.ToType())
-	defer func() {
-		vec.Free(mp)
-		require.Zero(t, mp.CurrNB())
-	}()
-	require.NoError(t, AppendFixedList(vec, []int64{11, 22, 33}, []bool{false, true, false}, mp))
-
-	encoded, err := vec.MarshalBinary()
-	require.NoError(t, err)
-	size, err := vec.MarshalBinarySize()
-	require.NoError(t, err)
-	require.Equal(t, len(encoded), size)
-	decoded := NewVecFromReuse()
-	defer decoded.Free(nil)
-	require.NoError(t, decoded.UnmarshalBinary(encoded))
-	require.Equal(t, []int64{11, 0, 33}, MustFixedColNoTypeCheck[int64](decoded))
-	require.True(t, decoded.IsNull(1))
-}
-
-func TestMarshalAndUnMarshal(t *testing.T) {
-	mp := mpool.MustNewZero()
-	v := NewVec(types.T_int8.ToType())
-	err := AppendFixedList(v, []int8{0, 1, 2}, nil, mp)
-	require.NoError(t, err)
-	data, err := v.MarshalBinary()
-	require.NoError(t, err)
-	size, err := v.MarshalBinarySize()
-	require.NoError(t, err)
-	require.Equal(t, len(data), size)
-	var streamed bytes.Buffer
-	require.NoError(t, v.MarshalBinaryTo(&streamed))
-	require.Equal(t, data, streamed.Bytes())
-	require.ErrorIs(t, v.MarshalBinaryTo(shortVectorMarshalWriter{}), io.ErrShortWrite)
-	w := NewVecFromReuse()
-	err = w.UnmarshalBinary(data)
-	require.NoError(t, err)
-	require.Equal(t, MustFixedColWithTypeCheck[int8](v), MustFixedColWithTypeCheck[int8](w))
-	w = NewVecFromReuse()
-	err = w.UnmarshalBinaryWithCopy(data, mp)
-	require.NoError(t, err)
-	require.Equal(t, MustFixedColWithTypeCheck[int8](v), MustFixedColWithTypeCheck[int8](w))
-	require.NoError(t, err)
-	v.Free(mp)
-	w.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
-
-type shortVectorMarshalWriter struct{}
-
-func (shortVectorMarshalWriter) Write(value []byte) (int, error) {
-	return len(value) - 1, nil
-}
-
-func TestMarshalBinarySizeRejectsInvalidVector(t *testing.T) {
-	var nilVector *Vector
-	_, err := nilVector.MarshalBinarySize()
-	require.Error(t, err)
-
-	typ := types.T_int64.ToType()
-	typ.Size = -1
-	invalidType := NewVec(typ)
-	_, err = invalidType.MarshalBinarySize()
-	require.Error(t, err)
-
-	shortData := NewVec(types.T_int64.ToType())
-	shortData.SetLength(1)
-	_, err = shortData.MarshalBinarySize()
-	require.Error(t, err)
-}
-
-func TestUnmarshalBinaryAcceptsNullBitmapCoveragePastLength(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_int64.ToType())
-	require.NoError(t, AppendFixed(source, int64(0), false, mp))
-	source.GetNulls().AddRange(0, 1)
-
-	data, err := source.MarshalBinary()
-	require.NoError(t, err)
-
-	target := NewVecFromReuse()
-	require.NoError(t, target.UnmarshalBinary(data))
-	require.Equal(t, 1, target.Length())
-	require.True(t, target.IsNull(0))
-
-	source.Free(mp)
-	target.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
-
-func TestUnmarshalBinaryAcceptsStaleVarlenaInNullRow(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_varchar.ToType())
-	require.NoError(t, AppendBytes(source, []byte("value longer than inline storage"), false, mp))
-	source.SetNull(0)
-	source.ResetArea()
-
-	data, err := source.MarshalBinary()
-	require.NoError(t, err)
-
-	target := NewVecFromReuse()
-	require.NoError(t, target.UnmarshalBinary(data))
-	require.Equal(t, 1, target.Length())
-	require.True(t, target.IsNull(0))
-
-	source.Free(mp)
-	target.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
-
-func TestUnmarshalBinaryRejectsOverflowingNullBitmapLength(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_int64.ToType())
-	require.NoError(t, AppendFixed(source, int64(0), true, mp))
-	data, err := source.MarshalBinary()
-	require.NoError(t, err)
-	source.Free(mp)
-
-	nspLenOffset := 1 + types.TSize + 4 + 4 + types.T_int64.TypeLen() + 4
-	nspDataOffset := nspLenOffset + 4
-	corrupted := append([]byte(nil), data[:nspDataOffset+24]...)
-	corrupted = append(corrupted, data[len(data)-1])
-	nspLen := uint32(24)
-	count := int64(0)
-	bitmapLen := ^uint64(0)
-	bitmapDataLen := uint64(0)
-	copy(corrupted[nspLenOffset:nspDataOffset], types.EncodeUint32(&nspLen))
-	copy(corrupted[nspDataOffset:nspDataOffset+8], types.EncodeInt64(&count))
-	copy(corrupted[nspDataOffset+8:nspDataOffset+16], types.EncodeUint64(&bitmapLen))
-	copy(corrupted[nspDataOffset+16:nspDataOffset+24], types.EncodeUint64(&bitmapDataLen))
-
-	target := NewVecFromReuse()
-	require.Error(t, target.UnmarshalBinary(corrupted))
-}
-
-func TestUnmarshalBinaryRejectsMisalignedArrayPayload(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		values     []float32
-		corruptLen func([]byte, int)
-	}{
-		{
-			name:   "out_of_line",
-			values: make([]float32, 10),
-			corruptLen: func(data []byte, varlenOffset int) {
-				misalignedLength := uint32(3)
-				copy(data[varlenOffset+8:varlenOffset+12], types.EncodeUint32(&misalignedLength))
-			},
-		},
-		{
-			name:   "inline",
-			values: []float32{0},
-			corruptLen: func(data []byte, varlenOffset int) {
-				data[varlenOffset] = 3
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			mp := mpool.MustNewZero()
-			source := NewVec(types.New(types.T_array_float32, 10, 0))
-			require.NoError(t, AppendArray(source, test.values, false, mp))
-			data, err := source.MarshalBinary()
-			require.NoError(t, err)
-			source.Free(mp)
-
-			// The array payload remains in bounds, but cannot be decoded as a
-			// []float32. Cover both Varlena storage forms.
-			corrupted := append([]byte(nil), data...)
-			varlenOffset := 1 + types.TSize + 4 + 4
-			test.corruptLen(corrupted, varlenOffset)
-
-			target := NewVecFromReuse()
-			var unmarshalErr error
-			require.NotPanics(t, func() {
-				unmarshalErr = target.UnmarshalBinary(corrupted)
-				if unmarshalErr == nil {
-					_ = GetArrayAt[float32](target, 0)
-				}
-			})
-			require.Error(t, unmarshalErr)
-		})
-	}
-}
-
-func TestUnmarshalBinaryRejectsUnsupportedZeroSizeType(t *testing.T) {
-	for _, oid := range []types.T{types.T_interval, types.T_tuple} {
-		t.Run(oid.String(), func(t *testing.T) {
-			source := NewVec(types.Type{Oid: oid})
-			data, err := source.MarshalBinary()
-			require.NoError(t, err)
-
-			target := NewVecFromReuse()
-			var unmarshalErr error
-			require.NotPanics(t, func() {
-				unmarshalErr = target.UnmarshalBinary(data)
-			})
-			require.Error(t, unmarshalErr)
-		})
-	}
-}
-
-func TestUnmarshalBinaryTrustedKeepsStructuralChecks(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_varchar.ToType())
-	require.NoError(t, AppendBytes(source, []byte("value longer than inline storage"), false, mp))
-	data, err := source.MarshalBinary()
-	require.NoError(t, err)
-	source.Free(mp)
-
-	for end := len(data) - 1; end >= 0; end-- {
-		target := NewVecFromReuse()
-		var unmarshalErr error
-		require.NotPanics(t, func() {
-			unmarshalErr = target.UnmarshalBinaryTrusted(data[:end])
-		}, "truncation at %d bytes", end)
-		require.Error(t, unmarshalErr, "truncation at %d bytes", end)
-	}
-}
-
-func TestUnmarshalBinaryTrustedRequiresPriorSemanticValidation(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_varchar.ToType())
-	require.NoError(t, AppendBytes(source, []byte("value longer than inline storage"), false, mp))
-	data, err := source.MarshalBinary()
-	require.NoError(t, err)
-	source.Free(mp)
-
-	// Preserve the complete frame while forging an out-of-range Varlena
-	// offset. The checked boundary rejects it; the trusted bind intentionally
-	// relies on a previous checked decode and immutable bytes.
-	corrupted := append([]byte(nil), data...)
-	varlenOffset := 1 + types.TSize + 4 + 4
-	invalidOffset := uint32(len(data) + 1)
-	copy(corrupted[varlenOffset+4:varlenOffset+8], types.EncodeUint32(&invalidOffset))
-
-	checked := NewVecFromReuse()
-	require.Error(t, checked.UnmarshalBinary(corrupted))
-
-	trusted := NewVecFromReuse()
-	require.NoError(t, trusted.UnmarshalBinaryTrusted(corrupted))
-}
-
-func TestStrMarshalAndUnMarshal(t *testing.T) {
-	mp := mpool.MustNewZero()
-	v := NewVec(types.T_text.ToType())
-	err := AppendBytesList(v, [][]byte{[]byte("x"), []byte("y")}, nil, mp)
-	require.NoError(t, err)
-	data, err := v.MarshalBinary()
-	require.NoError(t, err)
-	w := NewVecFromReuse()
-	err = w.UnmarshalBinary(data)
-	require.NoError(t, err)
-	require.Equal(t, InefficientMustStrCol(v), InefficientMustStrCol(w))
-	w = NewVecFromReuse()
-	err = w.UnmarshalBinaryWithCopy(data, mp)
-	require.NoError(t, err)
-	require.Equal(t, InefficientMustStrCol(v), InefficientMustStrCol(w))
-	v.Free(mp)
-	w.Free(mp)
-	require.Equal(t, int64(0), mp.CurrNB())
-}
-
-func TestArrayMarshalAndUnMarshal(t *testing.T) {
-
-	{
-		// Array Float32
-		mp := mpool.MustNewZero()
-		v := NewVec(types.New(types.T_array_float32, 2, 0))
-		err := AppendArrayList(v, [][]float32{{0, 0}, {1, 1}, {2, 2}}, nil, mp)
-		require.NoError(t, err)
-		data, err := v.MarshalBinary()
-		require.NoError(t, err)
-		w := NewVecFromReuse()
-		err = w.UnmarshalBinary(data)
-		require.NoError(t, err)
-		require.Equal(t, MustArrayCol[float32](v), MustArrayCol[float32](w))
-		w = NewVecFromReuse()
-		err = w.UnmarshalBinaryWithCopy(data, mp)
-		require.NoError(t, err)
-		require.Equal(t, MustArrayCol[float32](v), MustArrayCol[float32](w))
-		require.NoError(t, err)
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-
-	{
-		// Array Float64
-		mp := mpool.MustNewZero()
-		v := NewVec(types.New(types.T_array_float64, 2, 0))
-		err := AppendArrayList(v, [][]float64{{0, 0}, {1, 1}, {2, 2}}, nil, mp)
-		require.NoError(t, err)
-		data, err := v.MarshalBinary()
-		require.NoError(t, err)
-		w := NewVecFromReuse()
-		err = w.UnmarshalBinary(data)
-		require.NoError(t, err)
-		require.Equal(t, MustArrayCol[float64](v), MustArrayCol[float64](w))
-		w = NewVecFromReuse()
-		err = w.UnmarshalBinaryWithCopy(data, mp)
-		require.NoError(t, err)
-		require.Equal(t, MustArrayCol[float64](v), MustArrayCol[float64](w))
-		require.NoError(t, err)
-		v.Free(mp)
-		w.Free(mp)
-		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
 func TestWindowWith(t *testing.T) {
 	mp := mpool.MustNewZero()
-	vec1 := NewVec(types.T_int32.ToType())
+	vec1 := NewVec(types.T_int32.ToType(), mp)
 	AppendFixed(vec1, int32(1), false, mp)
 	AppendFixed(vec1, int32(2), true, mp)
 	AppendFixed(vec1, int32(3), false, mp)
-	require.False(t, vec1.NeedDup())
+	require.False(t, vec1.IsReadOnly())
 
 	vec2, err := vec1.Window(0, vec1.Length())
 	require.NoError(t, err)
 
 	t.Log(vec2.String())
-	require.True(t, vec2.NeedDup())
+	require.True(t, vec2.IsReadOnly(), "a window is a read-only reference")
 	require.Equal(t, int32(1), GetFixedAtWithTypeCheck[int32](vec2, 0))
 	require.True(t, vec2.GetNulls().Contains(uint64(1)))
 	require.Equal(t, int32(3), GetFixedAtWithTypeCheck[int32](vec2, 2))
@@ -2261,27 +1474,27 @@ func TestWindowWith(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Log(vec6.String())
-	require.True(t, vec6.NeedDup())
+	require.True(t, vec6.IsReadOnly(), "a window is a read-only reference")
 	require.True(t, vec6.GetNulls().Contains(uint64(0)))
 	require.Equal(t, int32(3), GetFixedAtWithTypeCheck[int32](vec6, 1))
 	vec6.Free(mp)
 
-	require.False(t, vec1.NeedDup())
+	require.False(t, vec1.IsReadOnly())
 	require.Equal(t, int32(1), GetFixedAtWithTypeCheck[int32](vec1, 0))
 	require.True(t, vec1.GetNulls().Contains(uint64(1)))
 	require.Equal(t, int32(3), GetFixedAtWithTypeCheck[int32](vec1, 2))
 	vec1.Free(mp)
 
-	vec3 := NewVec(types.T_char.ToType())
+	vec3 := NewVec(types.T_char.ToType(), mp)
 	AppendBytes(vec3, []byte("h"), false, mp)
 	AppendBytes(vec3, []byte("xx"), true, mp)
 	AppendBytes(vec3, []byte("uuu"), false, mp)
-	require.False(t, vec3.NeedDup())
+	require.False(t, vec3.IsReadOnly())
 
 	vec4, err := vec3.Window(0, vec3.Length())
 	require.NoError(t, err)
 
-	require.True(t, vec4.NeedDup())
+	require.True(t, vec4.IsReadOnly(), "a window is a read-only reference")
 	require.Equal(t, "h", string(vec4.GetBytesAt(0)))
 	require.Equal(t, "uuu", string(vec4.GetBytesAt(2)))
 	require.True(t, vec4.GetNulls().Contains(uint64(1)))
@@ -2290,12 +1503,12 @@ func TestWindowWith(t *testing.T) {
 	vec5, err := vec3.Window(1, vec3.Length())
 	require.NoError(t, err)
 
-	require.True(t, vec5.NeedDup())
+	require.True(t, vec5.IsReadOnly(), "a window is a read-only reference")
 	require.Equal(t, "uuu", string(vec5.GetBytesAt(1)))
 	require.True(t, vec5.GetNulls().Contains(uint64(0)))
 	vec5.Free(mp)
 
-	require.False(t, vec3.NeedDup())
+	require.False(t, vec3.IsReadOnly())
 	require.Equal(t, "h", string(vec3.GetBytesAt(0)))
 	require.Equal(t, "uuu", string(vec3.GetBytesAt(2)))
 	require.True(t, vec3.GetNulls().Contains(uint64(1)))
@@ -2304,16 +1517,16 @@ func TestWindowWith(t *testing.T) {
 	{
 		//Array Float32
 
-		vec7 := NewVec(types.T_array_float32.ToType())
+		vec7 := NewVec(types.T_array_float32.ToType(), mp)
 		AppendArray(vec7, []float32{1, 1, 1}, false, mp)
 		AppendArray(vec7, []float32{2, 2, 2}, true, mp)
 		AppendArray(vec7, []float32{3, 3, 3}, false, mp)
-		require.False(t, vec7.NeedDup())
+		require.False(t, vec7.IsReadOnly())
 
 		vec8, err := vec7.Window(0, vec7.Length())
 		require.NoError(t, err)
 
-		require.True(t, vec8.NeedDup())
+		require.True(t, vec8.IsReadOnly(), "a window is a read-only reference")
 		require.Equal(t, []float32{1, 1, 1}, GetArrayAt[float32](vec8, 0))
 		require.Equal(t, []float32{3, 3, 3}, GetArrayAt[float32](vec8, 2))
 		require.True(t, vec8.GetNulls().Contains(uint64(1)))
@@ -2322,12 +1535,12 @@ func TestWindowWith(t *testing.T) {
 		vec9, err := vec7.Window(1, vec7.Length())
 		require.NoError(t, err)
 
-		require.True(t, vec9.NeedDup())
+		require.True(t, vec9.IsReadOnly(), "a window is a read-only reference")
 		require.Equal(t, []float32{3, 3, 3}, GetArrayAt[float32](vec9, 1))
 		require.True(t, vec9.GetNulls().Contains(uint64(0)))
 		vec9.Free(mp)
 
-		require.False(t, vec7.NeedDup())
+		require.False(t, vec7.IsReadOnly())
 		require.Equal(t, []float32{1, 1, 1}, GetArrayAt[float32](vec7, 0))
 		require.Equal(t, []float32{3, 3, 3}, GetArrayAt[float32](vec7, 2))
 		require.True(t, vec7.GetNulls().Contains(uint64(1)))
@@ -2337,16 +1550,16 @@ func TestWindowWith(t *testing.T) {
 	{
 		//Array Float64
 
-		vec7 := NewVec(types.T_array_float64.ToType())
+		vec7 := NewVec(types.T_array_float64.ToType(), mp)
 		AppendArray(vec7, []float64{1, 1, 1}, false, mp)
 		AppendArray(vec7, []float64{2, 2, 2}, true, mp)
 		AppendArray(vec7, []float64{3, 3, 3}, false, mp)
-		require.False(t, vec7.NeedDup())
+		require.False(t, vec7.IsReadOnly())
 
 		vec8, err := vec7.Window(0, vec7.Length())
 		require.NoError(t, err)
 
-		require.True(t, vec8.NeedDup())
+		require.True(t, vec8.IsReadOnly(), "a window is a read-only reference")
 		require.Equal(t, []float64{1, 1, 1}, GetArrayAt[float64](vec8, 0))
 		require.Equal(t, []float64{3, 3, 3}, GetArrayAt[float64](vec8, 2))
 		require.True(t, vec8.GetNulls().Contains(uint64(1)))
@@ -2355,12 +1568,12 @@ func TestWindowWith(t *testing.T) {
 		vec9, err := vec7.Window(1, vec7.Length())
 		require.NoError(t, err)
 
-		require.True(t, vec9.NeedDup())
+		require.True(t, vec9.IsReadOnly(), "a window is a read-only reference")
 		require.Equal(t, []float64{3, 3, 3}, GetArrayAt[float64](vec9, 1))
 		require.True(t, vec9.GetNulls().Contains(uint64(0)))
 		vec9.Free(mp)
 
-		require.False(t, vec7.NeedDup())
+		require.False(t, vec7.IsReadOnly())
 		require.Equal(t, []float64{1, 1, 1}, GetArrayAt[float64](vec7, 0))
 		require.Equal(t, []float64{3, 3, 3}, GetArrayAt[float64](vec7, 2))
 		require.True(t, vec7.GetNulls().Contains(uint64(1)))
@@ -2371,7 +1584,7 @@ func TestWindowWith(t *testing.T) {
 func TestSetFunction(t *testing.T) {
 	mp := mpool.MustNewZero()
 	{ // bool
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		w := NewConstNull(types.T_bool.ToType(), 0, mp)
 		err := AppendFixedList(v, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
@@ -2385,7 +1598,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		w := NewConstNull(types.T_uint64.ToType(), 0, mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2399,7 +1612,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int8
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		w := NewConstNull(types.T_int8.ToType(), 0, mp)
 		err := AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2413,7 +1626,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int16
-		v := NewVec(types.T_int16.ToType())
+		v := NewVec(types.T_int16.ToType(), mp)
 		w := NewConstNull(types.T_int16.ToType(), 0, mp)
 		err := AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2427,7 +1640,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int32
-		v := NewVec(types.T_int32.ToType())
+		v := NewVec(types.T_int32.ToType(), mp)
 		w := NewConstNull(types.T_int32.ToType(), 0, mp)
 		err := AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2441,7 +1654,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int64
-		v := NewVec(types.T_int64.ToType())
+		v := NewVec(types.T_int64.ToType(), mp)
 		w := NewConstNull(types.T_int64.ToType(), 0, mp)
 		err := AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2455,7 +1668,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint8
-		v := NewVec(types.T_uint8.ToType())
+		v := NewVec(types.T_uint8.ToType(), mp)
 		w := NewConstNull(types.T_uint8.ToType(), 0, mp)
 		err := AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2469,7 +1682,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint16
-		v := NewVec(types.T_uint16.ToType())
+		v := NewVec(types.T_uint16.ToType(), mp)
 		w := NewConstNull(types.T_uint16.ToType(), 0, mp)
 		err := AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2483,7 +1696,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint32
-		v := NewVec(types.T_uint32.ToType())
+		v := NewVec(types.T_uint32.ToType(), mp)
 		w := NewConstNull(types.T_uint32.ToType(), 0, mp)
 		err := AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2497,7 +1710,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint64
-		v := NewVec(types.T_uint64.ToType())
+		v := NewVec(types.T_uint64.ToType(), mp)
 		w := NewConstNull(types.T_uint64.ToType(), 0, mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2511,7 +1724,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float32
-		v := NewVec(types.T_float32.ToType())
+		v := NewVec(types.T_float32.ToType(), mp)
 		w := NewConstNull(types.T_float32.ToType(), 0, mp)
 		err := AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2525,7 +1738,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float64
-		v := NewVec(types.T_float64.ToType())
+		v := NewVec(types.T_float64.ToType(), mp)
 		w := NewConstNull(types.T_float64.ToType(), 0, mp)
 		err := AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
@@ -2539,7 +1752,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // text
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		w := NewConstNull(types.T_text.ToType(), 0, mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
@@ -2553,7 +1766,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float32
-		v := NewVec(types.T_array_float32.ToType())
+		v := NewVec(types.T_array_float32.ToType(), mp)
 		w := NewConstNull(types.T_array_float32.ToType(), 0, mp)
 		err := AppendArrayList(v, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}, {4, 4, 4}}, nil, mp)
 		require.NoError(t, err)
@@ -2567,7 +1780,7 @@ func TestSetFunction(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float64
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		w := NewConstNull(types.T_array_float64.ToType(), 0, mp)
 		err := AppendArrayList(v, [][]float64{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}, {4, 4, 4}}, nil, mp)
 		require.NoError(t, err)
@@ -2582,21 +1795,43 @@ func TestSetFunction(t *testing.T) {
 	}
 }
 
+func TestSetAnyConstNull(t *testing.T) {
+	mp := mpool.MustNewZero()
+	typ := types.T_any.ToType()
+	set := GetConstSetFunction(typ, mp)
+	constant := NewConstNull(typ, 2, mp)
+	flat := NewVec(typ, mp)
+	flat.SetLength(2)
+	flat.SetNull(1)
+	dst := NewVec(typ, mp)
+
+	for _, src := range []*Vector{constant, flat} {
+		require.NoError(t, set(dst, src, 1, 3))
+		require.True(t, dst.IsConstNull())
+		require.Equal(t, 3, dst.Length())
+	}
+	require.ErrorContains(t, set(dst, flat, 0, 1), "non-NULL value of type ANY")
+	constant.Free(mp)
+	flat.Free(mp)
+	dst.Free(mp)
+	require.Zero(t, mp.CurrNB())
+}
+
 func TestSortAndCompact(t *testing.T) {
 	mp := mpool.MustNewZero()
-	v := NewVec(types.New(types.T_array_float32, 4, 0))
+	v := NewVec(types.New(types.T_array_float32, 4, 0), mp)
 	err := AppendArrayList(v, [][]float32{{1, 2, 3, 0}, {1, 2, 3, 0}}, nil, mp)
 	require.NoError(t, err)
 	require.NoError(t, v.InplaceSortAndCompact(mp))
 	require.Equal(t, v.length, 1)
 
-	v = NewVec(types.New(types.T_array_float64, 4, 0))
+	v = NewVec(types.New(types.T_array_float64, 4, 0), mp)
 	err = AppendArrayList(v, [][]float64{{1.1, 2, 3, 0}, {1.1, 2, 3, 0}}, nil, mp)
 	require.NoError(t, err)
 	require.NoError(t, v.InplaceSortAndCompact(mp))
 	require.Equal(t, v.length, 1)
 
-	v = NewVec(types.T_geometry.ToType())
+	v = NewVec(types.T_geometry.ToType(), mp)
 	err = AppendBytesList(v, [][]byte{[]byte("POINT(2 2)"), []byte("POINT(1 1)"), []byte("POINT(1 1)")}, nil, mp)
 	require.NoError(t, err)
 	require.NoError(t, v.InplaceSortAndCompact(mp))
@@ -2608,7 +1843,7 @@ func TestSortAndCompact(t *testing.T) {
 func TestGeometryVarlenPlumbing(t *testing.T) {
 	mp := mpool.MustNewZero()
 
-	src := NewVec(types.T_geometry.ToType())
+	src := NewVec(types.T_geometry.ToType(), mp)
 	err := AppendBytesList(src, [][]byte{
 		[]byte("POINT(1 1)"),
 		[]byte("POINT(2 2)"),
@@ -2617,7 +1852,7 @@ func TestGeometryVarlenPlumbing(t *testing.T) {
 	}, nil, mp)
 	require.NoError(t, err)
 
-	dst := NewVec(types.T_geometry.ToType())
+	dst := NewVec(types.T_geometry.ToType(), mp)
 	err = dst.UnionOne(src, 1, mp)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("POINT(2 2)")}, InefficientMustBytesCol(dst))
@@ -2648,7 +1883,7 @@ func TestGeometryVarlenPlumbing(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("POINT(3 3)")}, InefficientMustBytesCol(constVec))
 
 	unionAll := GetUnionAllFunction(types.T_geometry.ToType(), mp)
-	unionDst := NewVec(types.T_geometry.ToType())
+	unionDst := NewVec(types.T_geometry.ToType(), mp)
 	err = unionAll(unionDst, src)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{
@@ -2658,7 +1893,7 @@ func TestGeometryVarlenPlumbing(t *testing.T) {
 		[]byte("POINT(4 4)"),
 	}, InefficientMustBytesCol(unionDst))
 
-	minmax := NewVec(types.T_geometry.ToType())
+	minmax := NewVec(types.T_geometry.ToType(), mp)
 	err = AppendAny(minmax, []byte("POINT(2 2)"), false, mp)
 	require.NoError(t, err)
 	err = AppendAny(minmax, []byte("POINT(1 1)"), false, mp)
@@ -2677,9 +1912,9 @@ func TestGeometryVarlenPlumbing(t *testing.T) {
 	}, InefficientMustBytesCol(minmax))
 
 	var bm bitmap.Bitmap
-	bm.InitWithSize(2)
+	require.NoError(t, bm.InitWithSize(2, mpool.MustNewZero()))
 	bm.AddMany([]uint64{0, 1})
-	maskVec := NewVec(types.T_geometry.ToType())
+	maskVec := NewVec(types.T_geometry.ToType(), mp)
 	err = AppendBytesList(maskVec, [][]byte{
 		[]byte("POINT(1 1)"),
 		[]byte("POINT(2 2)"),
@@ -2706,7 +1941,7 @@ func TestSetFunction2(t *testing.T) {
 		mp := mpool.MustNewZero()
 
 		w := NewConstNull(types.T_bool.ToType(), 0, mp)
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixedList(v, []bool{true, false, true, false}, []bool{false, false, true, true}, mp)
 		require.NoError(t, err)
 
@@ -2747,7 +1982,7 @@ func TestSetFunction2(t *testing.T) {
 		mp := mpool.MustNewZero()
 
 		w := NewConstNull(types.T_varchar.ToType(), 0, mp)
-		v := NewVec(types.T_varchar.ToType())
+		v := NewVec(types.T_varchar.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{
 			[]byte("a"), []byte("abcdefabcdefabcdefabcdef12345"), []byte("c"), []byte("d")},
 			[]bool{false, false, true, true}, mp)
@@ -2790,7 +2025,7 @@ func TestSetFunction2(t *testing.T) {
 		mp := mpool.MustNewZero()
 
 		w := NewConstNull(types.T_array_float32.ToType(), 0, mp)
-		v := NewVec(types.T_array_float32.ToType())
+		v := NewVec(types.T_array_float32.ToType(), mp)
 		err := AppendArrayList[float32](v, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}, {4, 4, 4}}, []bool{false, false, true, true}, mp)
 		require.NoError(t, err)
 
@@ -2827,237 +2062,10 @@ func TestSetFunction2(t *testing.T) {
 	}
 }
 
-func TestMisc(t *testing.T) {
-	vec := NewVec(types.T_int8.ToType())
-	var gsp nulls.Nulls
-	vec.SetGrouping(&gsp)
-	require.False(t, vec.HasGrouping())
-	gsp.Add(1, 3)
-	vec.SetGrouping(&gsp)
-	require.True(t, vec.HasGrouping())
-	require.True(t, vec.GetGrouping().Contains(1))
-	require.True(t, vec.GetGrouping().Contains(3))
-
-	mp := mpool.MustNewZero()
-	vec2 := NewRollupConst(types.T_int8.ToType(), 5, mp)
-	defer vec2.Free(mp)
-	vec3 := NewVec(types.T_int8.ToType())
-	defer vec3.Free(mp)
-	require.False(t, vec3.HasGrouping())
-	err := vec3.UnionOne(vec2, 0, mp)
-	require.NoError(t, err)
-	require.True(t, vec3.HasGrouping())
-	require.True(t, vec3.GetGrouping().Contains(0))
-
-	vec4 := NewVec(types.T_int8.ToType())
-	defer vec4.Free(mp)
-	err = vec4.UnionMulti(vec2, 1, 2, mp)
-	require.NoError(t, err)
-	require.True(t, vec4.HasGrouping())
-	require.True(t, vec4.GetGrouping().Contains(0))
-	require.True(t, vec4.GetGrouping().Contains(1))
-	require.False(t, vec4.GetGrouping().Contains(2))
-
-	vec5 := NewVec(types.T_int8.ToType())
-	defer vec5.Free(mp)
-	vec6 := NewConstNull(types.T_int8.ToType(), 5, mp)
-	defer vec6.Free(mp)
-
-	err = AppendFixed(vec5, int8(1), false, mp)
-	require.NoError(t, err)
-	err = vec5.UnionMulti(vec6, 1, 2, mp)
-	require.NoError(t, err)
-	require.False(t, vec5.GetNulls().Contains(0))
-	require.True(t, vec5.GetNulls().Contains(1))
-	require.True(t, vec5.GetNulls().Contains(2))
-	require.False(t, vec5.GetNulls().Contains(3))
-
-	vec7 := NewVec(types.T_char.ToType())
-	defer vec7.Free(mp)
-	err = AppendMultiBytes(vec7, nil, true, 2, mp)
-	require.NoError(t, err)
-	require.True(t, vec7.GetNulls().Contains(0))
-	require.True(t, vec7.GetNulls().Contains(1))
-	require.False(t, vec7.GetNulls().Contains(2))
-	require.Equal(t, 2, vec7.Length())
-
-	fixSizedTypes := []types.Type{
-		types.T_int8.ToType(),
-		types.T_int16.ToType(),
-		types.T_int32.ToType(),
-		types.T_int64.ToType(),
-		types.T_uint8.ToType(),
-		types.T_uint16.ToType(),
-		types.T_uint32.ToType(),
-		types.T_uint64.ToType(),
-		types.T_float32.ToType(),
-		types.T_float64.ToType(),
-		types.T_bool.ToType(),
-		types.T_bit.ToType(),
-		types.T_Rowid.ToType(),
-		types.T_TS.ToType(),
-		types.T_uuid.ToType(),
-		types.T_datetime.ToType(),
-		types.T_timestamp.ToType(),
-	}
-	gsp.Clear()
-	gsp.Add(0, 1, 2)
-	for _, fType := range fixSizedTypes {
-		v1 := NewVec(fType)
-		v2 := NewVec(fType)
-		defer v1.Free(mp)
-		defer v2.Free(mp)
-		switch fType.Oid {
-		case types.T_int8:
-			vals := make([]int8, 2)
-			err = AppendFixedList[int8](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]int8, 3)
-			err = AppendFixedList[int8](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_int16:
-			vals := make([]int16, 2)
-			err = AppendFixedList[int16](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]int16, 3)
-			err = AppendFixedList[int16](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_int32:
-			vals := make([]int32, 2)
-			err = AppendFixedList[int32](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]int32, 3)
-			err = AppendFixedList[int32](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_int64:
-			vals := make([]int64, 2)
-			err = AppendFixedList[int64](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]int64, 3)
-			err = AppendFixedList[int64](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_uint8:
-			vals := make([]uint8, 2)
-			err = AppendFixedList[uint8](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]uint8, 3)
-			err = AppendFixedList[uint8](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_uint16:
-			vals := make([]uint16, 2)
-			err = AppendFixedList[uint16](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]uint16, 3)
-			err = AppendFixedList[uint16](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_uint32:
-			vals := make([]uint32, 2)
-			err = AppendFixedList[uint32](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]uint32, 3)
-			err = AppendFixedList[uint32](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_uint64:
-			vals := make([]uint64, 2)
-			err = AppendFixedList[uint64](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]uint64, 3)
-			err = AppendFixedList[uint64](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_float32:
-			vals := make([]float32, 2)
-			err = AppendFixedList[float32](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]float32, 3)
-			err = AppendFixedList[float32](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_float64:
-			vals := make([]float64, 2)
-			err = AppendFixedList[float64](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]float64, 3)
-			err = AppendFixedList[float64](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_bool:
-			vals := make([]bool, 2)
-			err = AppendFixedList[bool](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]bool, 3)
-			err = AppendFixedList[bool](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_bit:
-			vals := make([]uint64, 2)
-			err = AppendFixedList[uint64](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]uint64, 3)
-			err = AppendFixedList[uint64](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_Rowid:
-			vals := make([]types.Rowid, 2)
-			err = AppendFixedList[types.Rowid](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]types.Rowid, 3)
-			err = AppendFixedList[types.Rowid](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_TS:
-			vals := make([]types.TS, 2)
-			err = AppendFixedList[types.TS](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]types.TS, 3)
-			err = AppendFixedList[types.TS](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_uuid:
-			vals := make([]types.Uuid, 2)
-			err = AppendFixedList[types.Uuid](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]types.Uuid, 3)
-			err = AppendFixedList[types.Uuid](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_datetime:
-			vals := make([]types.Datetime, 2)
-			err = AppendFixedList[types.Datetime](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]types.Datetime, 3)
-			err = AppendFixedList[types.Datetime](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		case types.T_timestamp:
-			vals := make([]types.Timestamp, 2)
-			err = AppendFixedList[types.Timestamp](v1, vals, []bool{true, true}, mp)
-			require.NoError(t, err)
-			vals = make([]types.Timestamp, 3)
-			err = AppendFixedList[types.Timestamp](v2, vals, []bool{true, true, true}, mp)
-			require.NoError(t, err)
-			v2.SetGrouping(&gsp)
-		}
-		union := GetUnionAllFunction(fType, mp)
-		err = union(v1, v2)
-		require.NoError(t, err)
-		require.Equal(t, 5, v1.Length())
-		require.Equal(t, 5, v1.GetNulls().Count())
-		require.Equal(t, 3, v1.GetGrouping().Count())
-	}
-}
-
 func TestGetAny(t *testing.T) {
 	{ // test const vector
 		mp := mpool.MustNewZero()
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixed(v, int8(0), false, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3066,7 +2074,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // test const vector
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_varchar.ToType())
+		w := NewVec(types.T_varchar.ToType(), mp)
 		err := AppendBytes(w, []byte("x"), false, mp)
 		require.NoError(t, err)
 		s := GetAny(w, 0, false)
@@ -3075,7 +2083,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // bool
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_bool.ToType())
+		w := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixedList(w, []bool{true, false, true, false}, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(w, 0, false)
@@ -3086,7 +2094,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int8
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_int8.ToType())
+		w := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixedList(w, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3098,7 +2106,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int16
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_int16.ToType())
+		w := NewVec(types.T_int16.ToType(), mp)
 		err := AppendFixedList(w, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3110,7 +2118,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int32
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_int32.ToType())
+		w := NewVec(types.T_int32.ToType(), mp)
 		err := AppendFixedList(w, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3122,7 +2130,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int64
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_int64.ToType())
+		w := NewVec(types.T_int64.ToType(), mp)
 		err := AppendFixedList(w, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3134,7 +2142,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // uint8
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_uint8.ToType())
+		w := NewVec(types.T_uint8.ToType(), mp)
 		err := AppendFixedList(w, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3146,7 +2154,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int16
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_uint16.ToType())
+		w := NewVec(types.T_uint16.ToType(), mp)
 		err := AppendFixedList(w, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3158,7 +2166,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int32
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_uint32.ToType())
+		w := NewVec(types.T_uint32.ToType(), mp)
 		err := AppendFixedList(w, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3170,7 +2178,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // int64
 		mp := mpool.MustNewZero()
-		w := NewVec(types.T_uint64.ToType())
+		w := NewVec(types.T_uint64.ToType(), mp)
 		err := AppendFixedList(w, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 
@@ -3182,7 +2190,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // text
 		mp := mpool.MustNewZero()
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 
@@ -3194,7 +2202,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // time
 		mp := mpool.MustNewZero()
-		v := NewVec(types.T_time.ToType())
+		v := NewVec(types.T_time.ToType(), mp)
 		err := AppendFixedList(v, []types.Time{12 * 3600 * 1000 * 1000, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3204,7 +2212,7 @@ func TestGetAny(t *testing.T) {
 	}
 	{ // timestamp
 		mp := mpool.MustNewZero()
-		v := NewVec(types.T_timestamp.ToType())
+		v := NewVec(types.T_timestamp.ToType(), mp)
 		err := AppendFixedList(v, []types.Timestamp{10000000, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3216,7 +2224,7 @@ func TestGetAny(t *testing.T) {
 		mp := mpool.MustNewZero()
 		typ := types.T_decimal64.ToType()
 		typ.Scale = 2
-		v := NewVec(typ)
+		v := NewVec(typ, mp)
 		err := AppendFixedList(v, []types.Decimal64{1234, 2000}, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3228,7 +2236,7 @@ func TestGetAny(t *testing.T) {
 		mp := mpool.MustNewZero()
 		typ := types.T_decimal128.ToType()
 		typ.Scale = 2
-		v := NewVec(typ)
+		v := NewVec(typ, mp)
 		err := AppendFixedList(v, []types.Decimal128{{B0_63: 1234, B64_127: 0}, {B0_63: 2345, B64_127: 0}}, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3239,7 +2247,7 @@ func TestGetAny(t *testing.T) {
 	{ // uuid
 		mp := mpool.MustNewZero()
 		vs := make([]types.Uuid, 4)
-		v := NewVec(types.T_uuid.ToType())
+		v := NewVec(types.T_uuid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3250,7 +2258,7 @@ func TestGetAny(t *testing.T) {
 	{ // ts
 		mp := mpool.MustNewZero()
 		vs := make([]types.TS, 4)
-		v := NewVec(types.T_TS.ToType())
+		v := NewVec(types.T_TS.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
@@ -3261,78 +2269,13 @@ func TestGetAny(t *testing.T) {
 	{ // rowid
 		mp := mpool.MustNewZero()
 		vs := make([]types.Rowid, 4)
-		v := NewVec(types.T_Rowid.ToType())
+		v := NewVec(types.T_Rowid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		s := GetAny(v, 0, false)
 		require.Equal(t, types.Rowid(types.Rowid{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}), s)
 		v.Free(mp)
 		require.Equal(t, int64(0), mp.CurrNB())
-	}
-}
-
-func BenchmarkUnmarshal(b *testing.B) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_int8.ToType())
-	AppendAny(source, int8(42), false, mp)
-	data, err := source.MarshalBinary()
-	if err != nil {
-		b.Fatal(err)
-	}
-	source.Free(mp)
-	var target Vector
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		err := target.UnmarshalBinary(data)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkToTypedSlice(b *testing.B) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	AppendAny(vec, int8(42), false, mp)
-	var slice []int8
-	b.Run("ToSlice", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ToSlice(vec, &slice)
-		}
-	})
-	if slice[0] != 42 {
-		b.Fatalf("got %v", slice)
-	}
-	b.Run("ToSliceNoTypeCheck", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ToSliceNoTypeCheck(vec, &slice)
-		}
-	})
-	if slice[0] != 42 {
-		b.Fatalf("got %v", slice)
-	}
-}
-
-func BenchmarkToFixedCol(b *testing.B) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	AppendAny(vec, int8(42), false, mp)
-	b.ResetTimer()
-	var slice []int8
-	for i := 0; i < b.N; i++ {
-		ToFixedCol[int8](vec, &slice)
-	}
-}
-
-func BenchmarkMustFixedCol(b *testing.B) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_int8.ToType())
-	AppendAny(vec, int8(42), false, mp)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		MustFixedColWithTypeCheck[int8](vec)
 	}
 }
 
@@ -3354,7 +2297,7 @@ func TestRowToString(t *testing.T) {
 	mp := mpool.MustNewZero()
 
 	{ // Array Float32
-		v := NewVec(types.T_array_float32.ToType())
+		v := NewVec(types.T_array_float32.ToType(), mp)
 		err := AppendArrayList(v, [][]float32{{1, 1}}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "[1, 1]", v.RowToString(0))
@@ -3365,7 +2308,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // Array Float64
-		v := NewVec(types.T_array_float64.ToType())
+		v := NewVec(types.T_array_float64.ToType(), mp)
 		err := AppendArrayList(v, [][]float64{{1, 1}}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "[1, 1]", v.RowToString(0))
@@ -3376,7 +2319,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bool
-		v := NewVec(types.T_bool.ToType())
+		v := NewVec(types.T_bool.ToType(), mp)
 		err := AppendFixed(v, true, false, mp)
 		require.NoError(t, err)
 		require.Equal(t, "true", v.RowToString(0))
@@ -3385,7 +2328,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, "null", v.RowToString(1))
 		v.Free(mp)
 
-		v0 := NewVec(types.T_bool.ToType())
+		v0 := NewVec(types.T_bool.ToType(), mp)
 		err = AppendFixed(v0, false, true, mp)
 		require.NoError(t, err)
 		require.Equal(t, "null", v0.RowToString(0))
@@ -3401,7 +2344,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int8
-		v := NewVec(types.T_int8.ToType())
+		v := NewVec(types.T_int8.ToType(), mp)
 		err := AppendFixedList(v, []int8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3409,7 +2352,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int16
-		v := NewVec(types.T_int16.ToType())
+		v := NewVec(types.T_int16.ToType(), mp)
 		err := AppendFixedList(v, []int16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3417,7 +2360,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int32
-		v := NewVec(types.T_int32.ToType())
+		v := NewVec(types.T_int32.ToType(), mp)
 		err := AppendFixedList(v, []int32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3425,7 +2368,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // int64
-		v := NewVec(types.T_int64.ToType())
+		v := NewVec(types.T_int64.ToType(), mp)
 		err := AppendFixedList(v, []int64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3433,7 +2376,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint8
-		v := NewVec(types.T_uint8.ToType())
+		v := NewVec(types.T_uint8.ToType(), mp)
 		err := AppendFixedList(v, []uint8{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3441,7 +2384,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint16
-		v := NewVec(types.T_uint16.ToType())
+		v := NewVec(types.T_uint16.ToType(), mp)
 		err := AppendFixedList(v, []uint16{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3449,7 +2392,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint32
-		v := NewVec(types.T_uint32.ToType())
+		v := NewVec(types.T_uint32.ToType(), mp)
 		err := AppendFixedList(v, []uint32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3457,7 +2400,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // uint64
-		v := NewVec(types.T_uint64.ToType())
+		v := NewVec(types.T_uint64.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3465,7 +2408,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float32
-		v := NewVec(types.T_float32.ToType())
+		v := NewVec(types.T_float32.ToType(), mp)
 		err := AppendFixedList(v, []float32{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3473,7 +2416,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // float64
-		v := NewVec(types.T_float64.ToType())
+		v := NewVec(types.T_float64.ToType(), mp)
 		err := AppendFixedList(v, []float64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3481,7 +2424,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // text
-		v := NewVec(types.T_text.ToType())
+		v := NewVec(types.T_text.ToType(), mp)
 		err := AppendBytesList(v, [][]byte{[]byte("1"), []byte("2"), []byte("3"), []byte("4")}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3489,7 +2432,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // date
-		v := NewVec(types.T_date.ToType())
+		v := NewVec(types.T_date.ToType(), mp)
 		err := AppendFixedList(v, []types.Date{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "0001-01-03", v.RowToString(1))
@@ -3498,7 +2441,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // datetime
 		// Test 1: Non-const vector with non-null value
-		v := NewVec(types.T_datetime.ToType())
+		v := NewVec(types.T_datetime.ToType(), mp)
 		scale := types.Datetime(types.MicroSecsPerSec * types.SecsPerDay)
 		err := AppendFixedList(v, []types.Datetime{1 * scale, 2 * scale, 3 * scale, 4 * scale}, nil, mp)
 		require.NoError(t, err)
@@ -3507,7 +2450,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		// Test 2: Non-const vector with null value
-		v2 := NewVec(types.T_datetime.ToType())
+		v2 := NewVec(types.T_datetime.ToType(), mp)
 		err = AppendFixedList(v2, []types.Datetime{1 * scale, 2 * scale, 3 * scale, 4 * scale}, []bool{false, false, true, false}, mp)
 		require.NoError(t, err)
 		require.Equal(t, "null", v2.RowToString(2))
@@ -3536,7 +2479,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		// Test 6: Non-const vector with different scale
-		v6 := NewVec(types.T_datetime.ToType())
+		v6 := NewVec(types.T_datetime.ToType(), mp)
 		v6.SetTypeScale(3)
 		err = AppendFixedList(v6, []types.Datetime{1 * scale, 2 * scale}, nil, mp)
 		require.NoError(t, err)
@@ -3556,7 +2499,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		// Test 8: Non-const vector with null at index 0
-		v8 := NewVec(types.T_datetime.ToType())
+		v8 := NewVec(types.T_datetime.ToType(), mp)
 		err = AppendFixedList(v8, []types.Datetime{1 * scale, 2 * scale}, []bool{true, false}, mp)
 		require.NoError(t, err)
 		require.Equal(t, "null", v8.RowToString(0))
@@ -3578,7 +2521,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 
 		// Test 10: Ensure all code paths are covered - non-const vector else branch at line 2753-2754
-		v10 := NewVec(types.T_datetime.ToType())
+		v10 := NewVec(types.T_datetime.ToType(), mp)
 		err = AppendFixedList(v10, []types.Datetime{5 * scale, 6 * scale}, []bool{false, false}, mp)
 		require.NoError(t, err)
 		// Ensure idx 0 is not null (line 2751 check should be false)
@@ -3589,7 +2532,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // time
-		v := NewVec(types.T_time.ToType())
+		v := NewVec(types.T_time.ToType(), mp)
 		scale := types.Time(types.MicroSecsPerSec)
 		err := AppendFixedList(v, []types.Time{1 * scale, 2 * scale, 3 * scale, 4 * scale}, nil, mp)
 		require.NoError(t, err)
@@ -3599,7 +2542,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // timestamp
 		func() {
-			v := NewVec(types.T_timestamp.ToType())
+			v := NewVec(types.T_timestamp.ToType(), mp)
 			defer v.Free(mp)
 			ts := types.FromClockZone(time.UTC, 1970, 1, 1, 0, 0, 0, 0)
 			err := AppendFixedList(v, []types.Timestamp{1, ts, 3, 4}, nil, mp)
@@ -3612,7 +2555,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // decimal64
 		vs := make([]types.Decimal64, 4)
-		v := NewVec(types.T_decimal64.ToType())
+		v := NewVec(types.T_decimal64.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "0", v.RowToString(1))
@@ -3621,7 +2564,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // decimal128
 		vs := make([]types.Decimal128, 4)
-		v := NewVec(types.T_decimal128.ToType())
+		v := NewVec(types.T_decimal128.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "0", v.RowToString(1))
@@ -3630,7 +2573,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // uuid
 		vs := make([]types.Uuid, 4)
-		v := NewVec(types.T_uuid.ToType())
+		v := NewVec(types.T_uuid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "00000000-0000-0000-0000-000000000000", v.RowToString(1))
@@ -3639,7 +2582,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // ts
 		vs := make([]types.TS, 4)
-		v := NewVec(types.T_TS.ToType())
+		v := NewVec(types.T_TS.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "0-0", v.RowToString(1))
@@ -3648,7 +2591,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // rowid
 		vs := make([]types.Rowid, 4)
-		v := NewVec(types.T_Rowid.ToType())
+		v := NewVec(types.T_Rowid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "00000000-0000-0000-0000-000000000000-0-0-0", v.RowToString(1))
@@ -3657,7 +2600,7 @@ func TestRowToString(t *testing.T) {
 	}
 	{ // blockid
 		vs := make([]types.Blockid, 4)
-		v := NewVec(types.T_Blockid.ToType())
+		v := NewVec(types.T_Blockid.ToType(), mp)
 		err := AppendFixedList(v, vs, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]", v.RowToString(1))
@@ -3665,7 +2608,7 @@ func TestRowToString(t *testing.T) {
 		require.Equal(t, int64(0), mp.CurrNB())
 	}
 	{ // bit
-		v := NewVec(types.T_bit.ToType())
+		v := NewVec(types.T_bit.ToType(), mp)
 		err := AppendFixedList(v, []uint64{1, 2, 3, 4}, nil, mp)
 		require.NoError(t, err)
 		require.Equal(t, "2", v.RowToString(1))
@@ -3702,7 +2645,7 @@ func TestIntersection2VectorOrdered(t *testing.T) {
 		slices.SortFunc(a, cmp)
 		slices.SortFunc(b, cmp)
 
-		ret := NewVec(types.T_int32.ToType())
+		ret := NewVec(types.T_int32.ToType(), mp)
 		Intersection2VectorOrdered(a, b, ret, mp, cmp)
 
 		mm := make(map[int32]struct{})
@@ -3739,8 +2682,8 @@ func TestIntersection2VectorVarlen(t *testing.T) {
 		var a = make([]string, lenA)
 		var b = make([]string, lenB)
 
-		va := NewVec(types.T_text.ToType())
-		vb := NewVec(types.T_text.ToType())
+		va := NewVec(types.T_text.ToType(), mp)
+		vb := NewVec(types.T_text.ToType(), mp)
 
 		for i := 0; i < lenA; i++ {
 			x := rand.Int31() % (ll / 2)
@@ -3767,7 +2710,7 @@ func TestIntersection2VectorVarlen(t *testing.T) {
 			AppendBytes(vb, []byte(b[i]), false, mp)
 		}
 
-		ret := NewVec(types.T_text.ToType())
+		ret := NewVec(types.T_text.ToType(), mp)
 		Intersection2VectorVarlen(va, vb, ret, mp)
 
 		mm := make(map[string]struct{})
@@ -3819,7 +2762,7 @@ func TestUnion2VectorOrdered(t *testing.T) {
 		slices.SortFunc(a, cmp)
 		slices.SortFunc(b, cmp)
 
-		ret := NewVec(types.T_int32.ToType())
+		ret := NewVec(types.T_int32.ToType(), mp)
 		Union2VectorOrdered(a, b, ret, mp, cmp)
 
 		mm := make(map[int32]struct{})
@@ -3856,8 +2799,8 @@ func TestUnion2VectorVarlen(t *testing.T) {
 		var a = make([]string, lenA)
 		var b = make([]string, lenB)
 
-		va := NewVec(types.T_text.ToType())
-		vb := NewVec(types.T_text.ToType())
+		va := NewVec(types.T_text.ToType(), mp)
+		vb := NewVec(types.T_text.ToType(), mp)
 
 		for i := 0; i < lenA; i++ {
 			x := rand.Int31() % (ll / 2)
@@ -3884,7 +2827,7 @@ func TestUnion2VectorVarlen(t *testing.T) {
 			AppendBytes(vb, []byte(b[i]), false, mp)
 		}
 
-		ret := NewVec(types.T_text.ToType())
+		ret := NewVec(types.T_text.ToType(), mp)
 		Union2VectorValen(va, vb, ret, mp)
 
 		mm := make(map[string]struct{})
@@ -3908,27 +2851,13 @@ func TestUnion2VectorVarlen(t *testing.T) {
 	}
 }
 
-func TestProtoVector(t *testing.T) {
-	mp := mpool.MustNewZero()
-	vec := NewVec(types.T_char.ToType())
-	defer vec.Free(mp)
-	ss := "xxxxxx"
-	err := AppendBytes(vec, []byte(ss), false, mp)
-	require.NoError(t, err)
-	vec.ResetWithSameType()
-	vec2, err := VectorToProtoVector(vec)
-	require.NoError(t, err)
-	_, err = ProtoVectorToVector(vec2)
-	require.NoError(t, err)
-}
-
 func TestVectorPoolTypeChangeBug_Issue23295(t *testing.T) {
 	mp, err := mpool.NewMPool("test", 0, mpool.NoFixed)
 	require.NoError(t, err)
 	defer mpool.DeleteMPool(mp)
 
 	// Step 1: Create vector with int8 type, allocate small buffer (8 bytes)
-	vec := NewVec(types.T_int8.ToType())
+	vec := NewVec(types.T_int8.ToType(), mp)
 	err = AppendMultiFixed(vec, int8(1), false, 8, mp)
 	require.NoError(t, err)
 	// Now: cap(data)=8, col.Cap=8 (for int8, 8 bytes = 8 elements)
@@ -3954,7 +2883,7 @@ func TestVectorPoolTypeChangeBug_Issue23295(t *testing.T) {
 
 func TestResetWithSameTypeResetsClass(t *testing.T) {
 	mp := mpool.MustNewZeroNoFixed()
-	vec := NewVec(types.T_varchar.ToType())
+	vec := NewVec(types.T_varchar.ToType(), mp)
 	defer vec.Free(mp)
 
 	err := appendOneBytes(vec, []byte("hello"), false, mp)
@@ -3998,7 +2927,7 @@ func TestFunctionResultAppendNullAfterToConst(t *testing.T) {
 func TestInplaceSortAndCompactMarksUniqueVectorsSorted(t *testing.T) {
 	mp := mpool.MustNew(t.Name())
 
-	fixed := NewVec(types.T_int64.ToType())
+	fixed := NewVec(types.T_int64.ToType(), mp)
 	for _, value := range []int64{3, 1, 2} {
 		require.NoError(t, AppendFixed(fixed, value, false, mp))
 	}
@@ -4007,7 +2936,7 @@ func TestInplaceSortAndCompactMarksUniqueVectorsSorted(t *testing.T) {
 	require.True(t, fixed.GetSorted())
 	fixed.Free(mp)
 
-	varlen := NewVec(types.T_varchar.ToType())
+	varlen := NewVec(types.T_varchar.ToType(), mp)
 	for _, value := range []string{"c", "a", "b"} {
 		require.NoError(t, AppendBytes(varlen, []byte(value), false, mp))
 	}
@@ -4016,7 +2945,7 @@ func TestInplaceSortAndCompactMarksUniqueVectorsSorted(t *testing.T) {
 	require.True(t, varlen.GetSorted())
 	varlen.Free(mp)
 
-	unsupported := NewVec(types.T_any.ToType())
+	unsupported := NewVec(types.T_any.ToType(), mp)
 	require.NoError(t, unsupported.InplaceSortAndCompact(mp))
 	require.False(t, unsupported.GetSorted())
 }
@@ -4024,7 +2953,7 @@ func TestInplaceSortAndCompactMarksUniqueVectorsSorted(t *testing.T) {
 func TestInplaceSortMarksSupportedVectorsSortedWithoutCompacting(t *testing.T) {
 	mp := mpool.MustNew(t.Name())
 
-	fixed := NewVec(types.T_int64.ToType())
+	fixed := NewVec(types.T_int64.ToType(), mp)
 	for _, value := range []int64{3, 1, 1, 2} {
 		require.NoError(t, AppendFixed(fixed, value, false, mp))
 	}
@@ -4033,7 +2962,7 @@ func TestInplaceSortMarksSupportedVectorsSortedWithoutCompacting(t *testing.T) {
 	require.True(t, fixed.GetSorted())
 	fixed.Free(mp)
 
-	varlen := NewVec(types.T_varchar.ToType())
+	varlen := NewVec(types.T_varchar.ToType(), mp)
 	for _, value := range []string{"c", "a", "a", "b"} {
 		require.NoError(t, AppendBytes(varlen, []byte(value), false, mp))
 	}
@@ -4044,121 +2973,9 @@ func TestInplaceSortMarksSupportedVectorsSortedWithoutCompacting(t *testing.T) {
 	require.True(t, varlen.GetSorted())
 	varlen.Free(mp)
 
-	unsupported := NewVec(types.T_any.ToType())
+	unsupported := NewVec(types.T_any.ToType(), mp)
 	require.NoError(t, unsupported.InplaceSort(mp))
 	require.False(t, unsupported.GetSorted())
-}
-
-// lowPrecValueOrderingCase exercises the container ordering/aggregation paths for one
-// low-precision float type, asserting they order/aggregate by FLOAT VALUE, not raw bits.
-func lowPrecValueOrderingCase[T types.LowPrecFloat](
-	t *testing.T, oid types.T, from func(float32) T,
-) {
-	mp := mpool.MustNew(t.Name())
-
-	// Values exactly representable in ALL four formats (float4 magnitudes are
-	// {0,.5,1,1.5,2,3,4,6}). Negatives are the discriminator: a negative float's raw
-	// uint bits exceed a positive's, so a bit-wise sort would reverse them.
-	vals := []float32{2.0, -1.0, -3.0, 0.5}
-	wantSorted := []float32{-3.0, -1.0, 0.5, 2.0}
-
-	build := func(fs []float32) *Vector {
-		v := NewVec(oid.ToType())
-		for _, f := range fs {
-			require.NoError(t, AppendFixed(v, from(f), false, mp))
-		}
-		return v
-	}
-	toF := func(v *Vector) []float32 {
-		col := MustFixedColNoTypeCheck[T](v)
-		out := make([]float32, len(col))
-		for i := range col {
-			out[i] = col[i].ToFloat32()
-		}
-		return out
-	}
-
-	// InplaceSort: value order (negatives first), no compaction.
-	v := build(vals)
-	require.True(t, supportsInplaceSort(oid))
-	require.NoError(t, v.InplaceSort(mp))
-	require.Equal(t, wantSorted, toF(v), "InplaceSort")
-	require.True(t, v.GetSorted())
-	v.Free(mp)
-
-	// compareVectorRows: -3.0 (row 2) < 2.0 (row 0); a raw-bit compare would say the
-	// negative is larger.
-	v = build(vals)
-	require.Less(t, compareVectorRows(v, 2, 0), 0, "compareVectorRows neg<pos")
-	require.Greater(t, compareVectorRows(v, 0, 1), 0, "compareVectorRows 2.0>-1.0")
-	v.Free(mp)
-
-	// InplaceSortAndCompact: dedup by value (+0/-0 collapse; here plain dups).
-	v = build([]float32{1.0, -1.0, 1.0, -1.0})
-	require.NoError(t, v.InplaceSortAndCompact(mp))
-	require.Equal(t, []float32{-1.0, 1.0}, toF(v), "InplaceSortAndCompact")
-	require.True(t, v.GetSorted())
-	v.Free(mp)
-
-	// GetSumValue: widened float64 sum = 2-1-3+0.5 = -1.5.
-	v = build(vals)
-	ok, sumBytes := v.GetSumValue()
-	require.True(t, ok)
-	require.InDelta(t, -1.5, types.DecodeFloat64(sumBytes), 1e-6, "GetSumValue")
-	v.Free(mp)
-
-	// GetMinMaxValue: by value, min=-3.0 max=2.0.
-	v = build(vals)
-	ok, minBytes, maxBytes := v.GetMinMaxValue()
-	require.True(t, ok)
-	require.Equal(t, float32(-3.0), types.DecodeFixed[T](minBytes).ToFloat32(), "GetMinMaxValue min")
-	require.Equal(t, float32(2.0), types.DecodeFixed[T](maxBytes).ToFloat32(), "GetMinMaxValue max")
-	v.Free(mp)
-}
-
-// TestLowPrecFloatContainerValueOrdering covers the Layer-4 container paths for the
-// scalar low-precision float types (#20567): they must order/aggregate by float value
-// (via ToFloat32), never by the raw uint bits, whose sign bit inverts float order.
-func TestLowPrecFloatContainerValueOrdering(t *testing.T) {
-	t.Run("bf16", func(t *testing.T) {
-		lowPrecValueOrderingCase(t, types.T_bf16, types.BF16FromFloat32)
-	})
-	t.Run("float16", func(t *testing.T) {
-		lowPrecValueOrderingCase(t, types.T_float16, types.Float16FromFloat32)
-	})
-	t.Run("float8", func(t *testing.T) {
-		lowPrecValueOrderingCase(t, types.T_float8, types.Float8FromFloat32)
-	})
-	t.Run("float4", func(t *testing.T) {
-		lowPrecValueOrderingCase(t, types.T_float4, types.Float4FromFloat32)
-	})
-}
-
-// TestLowPrecFloatGetMinMaxSkipsNaN verifies NaN never poisons the zonemap bounds
-// (bf16/float16/float8 have a NaN encoding; float4 has none).
-func TestLowPrecFloatGetMinMaxSkipsNaN(t *testing.T) {
-	mp := mpool.MustNew(t.Name())
-	nan := float32(math.NaN())
-
-	// bf16 with a NaN mixed in: min/max come from the finite values only.
-	v := NewVec(types.T_bf16.ToType())
-	for _, f := range []float32{nan, -2.0, 4.0, nan} {
-		require.NoError(t, AppendFixed(v, types.BF16FromFloat32(f), false, mp))
-	}
-	ok, minB, maxB := v.GetMinMaxValue()
-	require.True(t, ok)
-	require.Equal(t, float32(-2.0), types.DecodeFixed[types.BF16](minB).ToFloat32())
-	require.Equal(t, float32(4.0), types.DecodeFixed[types.BF16](maxB).ToFloat32())
-	v.Free(mp)
-
-	// All-NaN bf16: no comparable value → ok=false, zonemap left uninitialized.
-	v = NewVec(types.T_bf16.ToType())
-	for i := 0; i < 3; i++ {
-		require.NoError(t, AppendFixed(v, types.BF16FromFloat32(nan), false, mp))
-	}
-	ok, _, _ = v.GetMinMaxValue()
-	require.False(t, ok)
-	v.Free(mp)
 }
 
 func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
@@ -4167,7 +2984,7 @@ func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
 	typ := types.T_varchar.ToType()
 	payload := []byte(strings.Repeat("x", 128))
 
-	flat := NewVec(typ)
+	flat := NewVec(typ, mp)
 	require.True(t, flat.VarlenaAreaIsDisjoint())
 	for range 2 {
 		require.NoError(t, AppendBytes(flat, payload, false, mp))
@@ -4180,7 +2997,7 @@ func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
 		"read access must not mutate vector metadata")
 	require.NoError(t, SetFixedAtNoTypeCheck(flat, 1, values[0]))
 	require.False(t, flat.VarlenaAreaIsDisjoint(),
-		"installing an arbitrary descriptor must invalidate the proof")
+		"an installed descriptor that shares bytes is not disjoint")
 
 	flat.ResetWithSameType()
 	require.True(t, flat.VarlenaAreaIsDisjoint())
@@ -4192,13 +3009,13 @@ func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
 		"a null append must clear a stale descriptor from reused capacity")
 	flat.GetNulls().Del(0)
 	require.True(t, flat.VarlenaAreaIsDisjoint(),
-		"null-bitmap changes cannot invalidate a descriptor-level proof")
+		"the null bitmap does not change descriptor disjointness")
 
 	flat.ResetWithSameType()
 	for range 2 {
 		require.NoError(t, AppendBytes(flat, payload, false, mp))
 	}
-	copied := NewVec(typ)
+	copied := NewVec(typ, mp)
 	require.NoError(t, copied.UnionBatch(flat, 0, flat.Length(), nil, mp))
 	require.True(t, copied.VarlenaAreaIsDisjoint(),
 		"full in-order copy preserves independent payload ranges")
@@ -4211,7 +3028,7 @@ func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
 
 	constant, err := NewConstBytes(typ, payload, 2, mp)
 	require.NoError(t, err)
-	shared := NewVec(typ)
+	shared := NewVec(typ, mp)
 	require.NoError(t, shared.UnionBatch(constant, 0, 2, nil, mp))
 	require.False(t, shared.VarlenaAreaIsDisjoint(),
 		"const broadcast shares one non-inline descriptor")
@@ -4226,13 +3043,12 @@ func TestVarlenaAreaDisjointLifecycle(t *testing.T) {
 	require.Zero(t, mp.CurrNB())
 }
 
-func TestVarlenaAreaDisjointAppendFailureFailsClosed(t *testing.T) {
+func TestVarlenaAppendFailureReleasesMemory(t *testing.T) {
 	mp, err := mpool.NewMPool("varlena-disjoint-failure", 1<<20, mpool.NoFixed)
 	require.NoError(t, err)
 	defer mpool.DeleteMPool(mp)
 
-	vec := NewVec(types.T_varchar.ToType())
-	vec.SetOffHeap(true)
+	vec := NewVec(types.T_varchar.ToType(), mp)
 	err = AppendBytesList(
 		vec,
 		[][]byte{make([]byte, 128), make([]byte, 2<<20)},
@@ -4240,8 +3056,6 @@ func TestVarlenaAreaDisjointAppendFailureFailsClosed(t *testing.T) {
 		mp,
 	)
 	require.Error(t, err)
-	require.False(t, vec.VarlenaAreaIsDisjoint(),
-		"a partially initialized logical range must never retain the fast proof")
 
 	vec.Free(mp)
 	require.Zero(t, mp.CurrNB())
@@ -4250,384 +3064,41 @@ func TestVarlenaAreaDisjointAppendFailureFailsClosed(t *testing.T) {
 func TestConstSetFunctionCopiesSelectedMetadata(t *testing.T) {
 	mp := mpool.MustNewZero()
 	t.Cleanup(func() { defer mpool.DeleteMPool(mp); require.Zero(t, mp.CurrNB()) })
-	source := NewVec(types.T_text.ToType())
+	source := NewVec(types.T_text.ToType(), mp)
 	t.Cleanup(func() { source.Free(mp) })
 	require.NoError(t, AppendBytes(source, []byte("5"), false, mp))
 	require.NoError(t, AppendBytes(source, []byte("5"), false, mp))
-	destination := NewVec(types.T_text.ToType())
+	destination := NewVec(types.T_text.ToType(), mp)
 	t.Cleanup(func() { destination.Free(mp) })
 	set := GetConstSetFunction(types.T_text.ToType(), mp)
 	require.NoError(t, set(destination, source, 1, 3))
 	require.Equal(t, 3, destination.Length())
 	require.Equal(t, "5", destination.GetStringAt(2))
 
-	nullSource := NewVec(types.T_text.ToType())
+	nullSource := NewVec(types.T_text.ToType(), mp)
 	t.Cleanup(func() { nullSource.Free(mp) })
 	require.NoError(t, AppendBytes(nullSource, nil, true, mp))
 	require.NoError(t, set(destination, nullSource, 0, 2))
 	require.True(t, destination.IsConstNull())
 
-	source.GetGrouping().Add(1)
 	require.NoError(t, set(destination, source, 1, 3))
-	require.True(t, destination.HasGrouping())
+	require.False(t, destination.IsConstNull())
+	require.Equal(t, "5", destination.GetStringAt(0))
 	require.NoError(t, set(destination, source, 1, 0))
 	require.Zero(t, destination.Length())
-	require.False(t, destination.HasGrouping())
-}
-
-func TestSelectedBatchPreflightProtocol(t *testing.T) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_varchar.ToType())
-	destination := NewVec(types.T_varchar.ToType())
-	defer func() {
-		destination.Free(mp)
-		source.Free(mp)
-		require.Zero(t, mp.CurrNB())
-	}()
-
-	for _, value := range []string{
-		strings.Repeat("a", 64),
-		strings.Repeat("b", 80),
-		strings.Repeat("c", 96),
-	} {
-		require.NoError(t, AppendBytes(source, []byte(value), false, mp))
-	}
-	flags := []uint8{1, 0, 1}
-	var preflight SelectedBatchPreflight
-	require.ErrorIs(t,
-		destination.UnionBatchPreflighted(source, 0, len(flags), flags, &preflight, mp),
-		mpool.ErrAllocationAccountInvariant)
-	require.ErrorIs(t,
-		destination.UnionBatchPreflighted(source, 0, len(flags), flags, nil, mp),
-		mpool.ErrAllocationAccountInvariant)
-
-	preflight, err := destination.PreExtendSelectedBatch(
-		source, 0, len(flags), flags, 2, mp)
-	require.NoError(t, err)
-	require.True(t, preflight.Ready())
-	admitted := mp.CurrNB()
-	require.NoError(t,
-		destination.UnionBatchPreflighted(source, 0, len(flags), flags, &preflight, mp))
-	require.Equal(t, admitted, mp.CurrNB(),
-		"publication must use only capacity admitted by preflight")
-	require.Equal(t, 2, destination.Length())
-	require.Equal(t, source.GetBytesAt(0), destination.GetBytesAt(0))
-	require.Equal(t, source.GetBytesAt(2), destination.GetBytesAt(1))
-	require.False(t, preflight.Ready())
-	require.ErrorIs(t,
-		destination.UnionBatchPreflighted(source, 0, len(flags), flags, &preflight, mp),
-		mpool.ErrAllocationAccountInvariant,
-		"the preflight is consumed exactly once")
-
-	preflight, err = destination.PreExtendSelectedBatch(
-		source, 0, len(flags), []uint8{1, 2, 0}, 2, mp)
-	require.ErrorIs(t, err, mpool.ErrAllocationAccountInvalid)
-	require.False(t, preflight.Ready(),
-		"a failed preflight must not return a publishable result")
-
-	destination.ResetWithSameType()
-	preflight, err = destination.PreExtendSelectedBatchValidated(
-		source, 0, len(flags), flags, 2, mp)
-	require.NoError(t, err)
-	require.NoError(t,
-		destination.UnionBatchPreflighted(source, 0, len(flags), flags, &preflight, mp))
-	require.Equal(t, 2, destination.Length())
-
-	constant, err := NewConstBytes(
-		types.T_varchar.ToType(), []byte(strings.Repeat("constant", 8)),
-		len(flags)+4, mp)
-	require.NoError(t, err)
-	defer constant.Free(mp)
-	destination.ResetWithSameType()
-	preflight, err = destination.PreExtendSelectedBatchValidated(
-		constant, 2, len(flags), flags, 2, mp)
-	require.NoError(t, err)
-	require.NoError(t,
-		destination.UnionBatchPreflighted(constant, 2, len(flags), flags, &preflight, mp))
-	require.Equal(t, 2, destination.Length())
-	require.Equal(t, constant.GetBytesAt(0), destination.GetBytesAt(0))
-	require.Equal(t, constant.GetBytesAt(0), destination.GetBytesAt(1))
-
-	preflight, err = destination.PreExtendSelectedBatch(
-		destination, 0, 2, []uint8{1, 0}, 3, mp)
-	require.ErrorIs(t, err, mpool.ErrAllocationAccountInvalid,
-		"a preflight cannot retain an aliased source for publication")
-	require.False(t, preflight.Ready(),
-		"a rejected aliased preflight must not return a publishable result")
-}
-
-func TestUnionAppendMetadataTransitions(t *testing.T) {
-	for _, copies := range []int{1, 3} {
-		for _, metadata := range []string{"ordinary"} {
-			t.Run(fmt.Sprintf("%s/copies=%d", metadata, copies), func(t *testing.T) {
-				mp := mpool.MustNewZero()
-				source := NewVec(types.T_varchar.ToType())
-				destination := NewVec(types.T_varchar.ToType())
-				var changed, constant *Vector
-				t.Cleanup(func() {
-					source.Free(mp)
-					changed.Free(mp)
-					constant.Free(mp)
-					destination.Free(mp)
-					require.Zero(t, mp.CurrNB())
-				})
-				require.NoError(t, AppendBytesList(source, [][]byte{
-					[]byte("value"), nil, []byte(strings.Repeat("long", 16)),
-				}, []bool{false, true, false}, mp))
-				source.GetGrouping().Add(1)
-				changed, err := source.Dup(mp)
-				require.NoError(t, err)
-				constant, err = NewConstBytes(types.T_varchar.ToType(), []byte("constant"), 4, mp)
-				require.NoError(t, err)
-				rows := []struct {
-					vec *Vector
-					row int
-				}{{source, 1}, {constant, 3}, {source, 2}, {changed, 1},
-					{changed, 0}, {changed, 2}, {source, 0}, {source, 1}}
-				for range 2 { // Reuse must not retain a previous mixed representation.
-					destination.ResetWithSameType()
-					for end, input := range rows {
-						if copies == 1 {
-							require.NoError(t, destination.UnionOne(input.vec, int64(input.row), mp))
-						} else {
-							require.NoError(t, destination.UnionMulti(input.vec, int64(input.row), copies, mp))
-						}
-						require.Equal(t, (end+1)*copies, destination.Length())
-						for row := range destination.Length() {
-							expected := rows[row/copies]
-							isNull := expected.vec.IsNull(uint64(expected.row))
-							require.Equal(t, isNull, destination.IsNull(uint64(row)))
-							if !isNull {
-								require.Equal(t, expected.vec.GetBytesAt(expected.row), destination.GetBytesAt(row))
-							}
-							require.Equal(t, expected.vec.GetGrouping().Contains(uint64(expected.row)),
-								destination.GetGrouping().Contains(uint64(row)))
-						}
-					}
-				}
-			})
-		}
-	}
-}
-
-func BenchmarkUnionMultiUniformMetadata(b *testing.B) {
-	for _, oid := range []types.T{types.T_int64, types.T_varchar} {
-		for _, copies := range []int{1, 8, 64} {
-			b.Run(fmt.Sprintf("%s/copies=%d", oid, copies), func(b *testing.B) {
-				mp := mpool.MustNewZero()
-				source := NewVec(oid.ToType())
-				defer source.Free(mp)
-				destination := NewVec(oid.ToType())
-				defer destination.Free(mp)
-				if oid == types.T_int64 {
-					require.NoError(b, AppendFixed(source, int64(42), false, mp))
-				} else {
-					require.NoError(b, AppendBytes(source, []byte("ordinary column value"), false, mp))
-				}
-				require.NoError(b, destination.PreExtend(copies, mp))
-				b.ReportAllocs()
-				b.ResetTimer()
-				for b.Loop() {
-					destination.ResetWithSameType()
-					if err := destination.UnionMulti(source, 0, copies, mp); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestUnionOneEmptyMarkerSets(t *testing.T) {
-	for _, oid := range []types.T{types.T_int8, types.T_int16, types.T_int32, types.T_int64, types.T_decimal128, types.T_decimal256} {
-		t.Run(oid.String(), func(t *testing.T) {
-			mp := mpool.MustNewZero()
-			t.Cleanup(func() { require.Zero(t, mp.CurrNB()) })
-			source := NewVec(oid.ToType())
-			t.Cleanup(func() { source.Free(mp) })
-			destination := NewVec(oid.ToType())
-			t.Cleanup(func() { destination.Free(mp) })
-			require.NoError(t, source.PreExtend(3, mp))
-			source.SetLength(3)
-			tlen := source.GetType().TypeSize()
-			// Distinct fixed-width byte patterns make every selected row and
-			// byte observable, including widths handled by the generic copy.
-			for row := range 3 {
-				for column := range tlen {
-					source.data[row*tlen+column] = byte(row*32 + column + 1)
-				}
-			}
-			require.NoError(t, destination.PreExtend(3, mp))
-			capacity := cap(destination.data)
-			for range 2 {
-				destination.ResetWithSameType()
-				for row, sel := range []int64{2, 0, 1} {
-					require.NoError(t, destination.UnionOne(source, sel, mp))
-					require.Equal(t, source.data[int(sel)*tlen:(int(sel)+1)*tlen], destination.data[row*tlen:(row+1)*tlen])
-					require.False(t, destination.IsNull(uint64(row)))
-					require.False(t, destination.GetGrouping().Contains(uint64(row)))
-				}
-				require.Equal(t, 3, destination.Length())
-				require.Equal(t, capacity, len(destination.data), "append retains extendWithBitmaps' slice-to-cap contract")
-			}
-			require.NoError(t, destination.UnionOne(source, 1, mp))
-			require.Equal(t, source.data[tlen:2*tlen], destination.data[3*tlen:4*tlen])
-		})
-	}
-}
-
-func TestUnionOneSourceMarkerLookup(t *testing.T) {
-	for _, scenario := range []string{"source_null", "source_all_null", "source_grouping", "null_prefix", "grouping_prefix", "source_const", "source_const_null", "source_const_null_with_data", "destination_const", "nil_mpool"} {
-		t.Run(scenario, func(t *testing.T) {
-			mp := mpool.MustNewZero()
-			t.Cleanup(func() { require.Zero(t, mp.CurrNB()) })
-			source := NewVec(types.T_int64.ToType())
-			t.Cleanup(func() { source.Free(mp) })
-			destination := NewVec(types.T_int64.ToType())
-			t.Cleanup(func() { destination.Free(mp) })
-			require.NoError(t, AppendFixedList(source, []int64{11, 22, 33}, nil, mp))
-			require.NoError(t, destination.PreExtend(4, mp))
-			offset := 0
-			appendMP := mp
-			switch scenario {
-			case "source_null":
-				source.GetNulls().Set(1)
-			case "source_all_null":
-				for row := range source.Length() {
-					source.GetNulls().Set(uint64(row))
-				}
-			case "source_grouping":
-				source.GetGrouping().Set(1)
-			case "null_prefix":
-				require.NoError(t, AppendFixed(destination, int64(0), true, mp))
-				offset = 1
-			case "grouping_prefix":
-				require.NoError(t, AppendFixed(destination, int64(44), false, mp))
-				destination.GetGrouping().Set(0)
-				offset = 1
-			case "source_const_null":
-				source.Free(mp)
-				source = NewConstNull(types.T_int64.ToType(), 3, mp)
-			case "source_const", "source_const_null_with_data":
-				source.Free(mp)
-				var err error
-				source, err = NewConstFixed(types.T_int64.ToType(), int64(77), 3, mp)
-				require.NoError(t, err)
-				if scenario == "source_const_null_with_data" {
-					source.GetNulls().Set(0)
-				}
-			case "destination_const":
-				destination.SetClass(CONSTANT)
-			case "nil_mpool":
-				appendMP = nil
-			}
-			for row, sel := range []int64{0, 1, 2} {
-				require.NoError(t, destination.UnionOne(source, sel, appendMP))
-				require.Equal(t, source.IsNull(uint64(sel)), destination.IsNull(uint64(row+offset)))
-				require.Equal(t, source.GetGrouping().Contains(uint64(sel)), destination.GetGrouping().Contains(uint64(row+offset)))
-				if !source.IsNull(uint64(sel)) {
-					// Assert physical row bytes as well as constant-class retention.
-					physicalSourceRow := int(sel)
-					if source.IsConst() {
-						physicalSourceRow = 0
-					}
-					require.Equal(t, source.data[physicalSourceRow*8:(physicalSourceRow+1)*8], destination.data[(row+offset)*8:(row+offset+1)*8])
-				}
-			}
-			require.Equal(t, 3+offset, destination.Length())
-			if scenario == "null_prefix" {
-				require.True(t, destination.IsNull(0))
-			}
-			if scenario == "grouping_prefix" {
-				require.True(t, destination.GetGrouping().Contains(0))
-				require.Equal(t, int64(44), GetFixedAtWithTypeCheck[int64](destination, 0))
-			}
-			if scenario == "destination_const" {
-				require.True(t, destination.IsConst())
-				require.Equal(t, int64(11), GetFixedAtWithTypeCheck[int64](destination, 2))
-			}
-		})
-	}
-}
-
-func TestUnionOneFixedGrowthFailureKeepsPrefix(t *testing.T) {
-	const poolCap = int64(1 << 20)
-	mp, err := mpool.NewMPool(t.Name(), poolCap, mpool.NoFixed)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.Zero(t, mp.CurrNB())
-		mpool.DeleteMPool(mp)
-	})
-	destination := NewOffHeapVecWithType(types.T_int64.ToType())
-	t.Cleanup(func() { destination.Free(mp) })
-	require.NoError(t, destination.PreExtend(1, mp))
-	rows := cap(destination.data) / 8
-	for range rows {
-		require.NoError(t, AppendFixed(destination, int64(7), false, mp))
-	}
-	sourceMP := mpool.MustNewZero()
-	t.Cleanup(func() { require.Zero(t, sourceMP.CurrNB()) })
-	source := NewVec(types.T_int64.ToType())
-	t.Cleanup(func() { source.Free(sourceMP) })
-	require.NoError(t, AppendFixed(source, int64(9), false, sourceMP))
-	fill, err := mp.Alloc(int(poolCap-mp.CurrNB()), true)
-	require.NoError(t, err)
-	t.Cleanup(func() { mp.Free(fill) })
-	require.Error(t, destination.UnionOne(source, 0, mp))
-	require.Equal(t, rows, destination.Length())
-	for _, value := range MustFixedColNoTypeCheck[int64](destination) {
-		require.Equal(t, int64(7), value)
-	}
-	mp.Free(fill)
-	fill = nil
-	require.NoError(t, destination.UnionOne(source, 0, mp))
-	require.Equal(t, rows+1, destination.Length())
-	require.Equal(t, int64(9), GetFixedAtWithTypeCheck[int64](destination, rows))
-}
-
-func BenchmarkUnionOneUniformMetadata(b *testing.B) {
-	for _, oid := range []types.T{types.T_int64, types.T_varchar} {
-		{
-			b.Run(oid.String(), func(b *testing.B) {
-				const rows = 1024
-				mp := mpool.MustNewZero()
-				source := NewVec(oid.ToType())
-				destination := NewVec(oid.ToType())
-				defer source.Free(mp)
-				defer destination.Free(mp)
-				if oid == types.T_int64 {
-					require.NoError(b, AppendFixedList(source, make([]int64, rows), nil, mp))
-				} else {
-					for range rows {
-						require.NoError(b, AppendBytes(source, []byte("ordinary column value"), false, mp))
-					}
-				}
-				b.ReportAllocs()
-				b.ResetTimer()
-				for b.Loop() {
-					destination.ResetWithSameType()
-					for row := range rows {
-						if err := destination.UnionOne(source, int64(row), mp); err != nil {
-							b.Fatal(err)
-						}
-					}
-				}
-			})
-		}
-	}
 }
 
 func BenchmarkCopyPreallocatedNullVectorReverseFill(b *testing.B) {
 	const rows = 16 << 10
 	mp := mpool.MustNewZero()
-	source := NewVec(types.T_int64.ToType())
+	source := NewVec(types.T_int64.ToType(), mp)
 	require.NoError(b, AppendFixed(source, int64(42), false, mp))
 	defer source.Free(mp)
 
 	b.ReportMetric(float64(rows), "rows/op")
 	for b.Loop() {
 		b.StopTimer()
-		destination := NewVec(types.T_int64.ToType())
+		destination := NewVec(types.T_int64.ToType(), mp)
 		if err := destination.PreExtend(rows, mp); err != nil {
 			b.Fatal(err)
 		}
@@ -4645,201 +3116,6 @@ func BenchmarkCopyPreallocatedNullVectorReverseFill(b *testing.B) {
 	}
 }
 
-func TestUnionBatchCapacityFailurePreservesDestinationArea(t *testing.T) {
-	oldCapLimit := mpool.CapLimit
-	mpool.CapLimit = 64 << 10
-	t.Cleanup(func() {
-		mpool.CapLimit = oldCapLimit
-	})
-
-	mp := mpool.MustNewZeroNoFixed()
-	destination := NewVec(types.New(types.T_array_float32, 1024, 0))
-	source := NewVec(types.New(types.T_array_float32, 1024, 0))
-	defer func() {
-		destination.Free(mp)
-		source.Free(mp)
-		require.Zero(t, mp.CurrNB())
-		mpool.DeleteMPool(mp)
-	}()
-
-	value := make([]float32, 1024)
-	for range 15 {
-		require.NoError(t, AppendArray(destination, value, false, mp))
-	}
-	require.NoError(t, AppendArray(source, value, false, mp))
-	beforeLength := destination.Length()
-	beforeArea := bytes.Clone(destination.GetArea())
-
-	err := destination.UnionBatch(source, 0, 1, nil, mp)
-	require.ErrorIs(t, err, mpool.ErrAllocationAllocatorLimit)
-	require.Equal(t, beforeLength, destination.Length())
-	require.Equal(t, beforeArea, destination.GetArea())
-}
-
-func BenchmarkUnionBatchFixedRange(b *testing.B) {
-	for _, test := range []struct {
-		name      string
-		nullEvery int
-	}{
-		{name: "no-null"},
-		{name: "sparse", nullEvery: 100},
-		{name: "dense", nullEvery: 2},
-		{name: "all-null", nullEvery: 1},
-	} {
-		b.Run(test.name, func(b *testing.B) {
-			mp := mpool.MustNewZero()
-			source := NewVec(types.T_int64.ToType())
-			defer source.Free(mp)
-			for i := 0; i < 1024; i++ {
-				isNull := test.nullEvery != 0 && i%test.nullEvery == 0
-				require.NoError(b, AppendFixed(source, int64(i), isNull, mp))
-			}
-			destination := NewVec(types.T_int64.ToType())
-			defer destination.Free(mp)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				destination.ResetWithSameType()
-				if err := destination.UnionBatch(source, 0, source.Length(), nil, mp); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkUnionBatchStaticBinaryNoMetadata(b *testing.B) {
-	mp := mpool.MustNewZero()
-	source := NewVec(types.T_varbinary.ToType())
-	defer source.Free(mp)
-	for i := 0; i < 1024; i++ {
-		require.NoError(b, AppendBytes(source, []byte("value"), false, mp))
-	}
-	destination := NewVec(types.T_varbinary.ToType())
-	defer destination.Free(mp)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		destination.ResetWithSameType()
-		if err := destination.UnionBatch(source, 0, source.Length(), nil, mp); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// TestLowPrecFloatAccessMovement exercises the access/movement/string switches for the
-// scalar low-precision float types (bf16/float16/float8/float4) so each per-type arm is
-// covered: GetAny/AppendAny round-trip, Shrink, ShrinkByMask, Shuffle, ShuffleWithBuf,
-// String, RowToString, and NewFunctionResultWrapper (#20567).
-func TestLowPrecFloatAccessMovement(t *testing.T) {
-	mp := mpool.MustNew(t.Name())
-
-	cases := []struct {
-		oid types.T
-		mk  func(float32) any
-	}{
-		{types.T_bf16, func(f float32) any { return types.BF16FromFloat32(f) }},
-		{types.T_float16, func(f float32) any { return types.Float16FromFloat32(f) }},
-		{types.T_float8, func(f float32) any { return types.Float8FromFloat32(f) }},
-		{types.T_float4, func(f float32) any { return types.Float4FromFloat32(f) }},
-	}
-
-	for _, c := range cases {
-		t.Run(c.oid.String(), func(t *testing.T) {
-			// AppendAny builds the column; GetAny reads it back.
-			v := NewVec(c.oid.ToType())
-			for _, f := range []float32{1.0, -2.0, 0.5, 4.0} {
-				require.NoError(t, AppendAny(v, c.mk(f), false, mp))
-			}
-			require.Equal(t, c.mk(1.0), GetAny(v, 0, true))
-			require.Equal(t, c.mk(-2.0), GetAny(v, 1, true))
-
-			// String and RowToString must not panic and render the row.
-			_ = v.String()
-			require.NotEmpty(t, v.RowToString(0))
-
-			// NewFunctionResultWrapper builds a result vector for the type.
-			rw := NewFunctionResultWrapper(c.oid.ToType(), mp)
-			require.NotNil(t, rw)
-			rw.Free()
-
-			// Shuffle reorders in place.
-			require.NoError(t, v.Shuffle([]int64{3, 2, 1, 0}, mp))
-			require.Equal(t, c.mk(4.0), GetAny(v, 0, true))
-			v.Free(mp)
-
-			// ShuffleWithBuf.
-			v2 := NewVec(c.oid.ToType())
-			for _, f := range []float32{1.0, 2.0, 3.0} {
-				require.NoError(t, AppendAny(v2, c.mk(f), false, mp))
-			}
-			var buf []byte
-			require.NoError(t, v2.ShuffleWithBuf([]int64{2, 1, 0}, mp, &buf))
-			require.Equal(t, c.mk(3.0), GetAny(v2, 0, true))
-			v2.Free(mp)
-
-			// Shrink keeps selected rows.
-			v3 := NewVec(c.oid.ToType())
-			for _, f := range []float32{1.0, 2.0, 3.0, 4.0} {
-				require.NoError(t, AppendAny(v3, c.mk(f), false, mp))
-			}
-			require.NoError(t, v3.Shrink([]int64{0, 2}, false, mp))
-			require.Equal(t, 2, v3.Length())
-			require.Equal(t, c.mk(1.0), GetAny(v3, 0, true))
-			require.Equal(t, c.mk(3.0), GetAny(v3, 1, true))
-			v3.Free(mp)
-
-			// ShrinkByMask.
-			v4 := NewVec(c.oid.ToType())
-			for _, f := range []float32{1.0, 2.0, 3.0, 4.0} {
-				require.NoError(t, AppendAny(v4, c.mk(f), false, mp))
-			}
-			var bm bitmap.Bitmap
-			bm.InitWithSize(4)
-			bm.Add(1)
-			bm.Add(3)
-			require.NoError(t, v4.ShrinkByMask(&bm, false, 0, mp))
-			require.Equal(t, 2, v4.Length())
-			require.Equal(t, c.mk(2.0), GetAny(v4, 0, true))
-			v4.Free(mp)
-		})
-	}
-}
-
-func TestBoolMinMax(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		values       []bool
-		nulls        []int
-		ok, min, max bool
-	}{
-		{name: "empty"},
-		{name: "false", values: []bool{false, false}, ok: true},
-		{name: "true", values: []bool{true, true}, ok: true, min: true, max: true},
-		{name: "mixed", values: []bool{false, true}, ok: true, max: true},
-		{name: "mixed reversed", values: []bool{true, false}, ok: true, max: true},
-		{name: "nullable mixed", values: []bool{true, false, true}, nulls: []int{0}, ok: true, max: true},
-		{name: "null false", values: []bool{false, true}, nulls: []int{0}, ok: true, min: true, max: true},
-		{name: "null true", values: []bool{false, true}, nulls: []int{1}, ok: true},
-		{name: "all null", values: []bool{false, true}, nulls: []int{0, 1}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mp := mpool.MustNewZero()
-			v := NewVec(types.T_bool.ToType())
-			defer func() { v.Free(mp); require.Zero(t, mp.CurrNB()) }()
-			for i, value := range tc.values {
-				require.NoError(t, AppendFixed(v, value, slices.Contains(tc.nulls, i), mp))
-			}
-			ok, min, max := v.GetMinMaxValue()
-			require.Equal(t, tc.ok, ok)
-			if ok {
-				require.Equal(t, tc.min, types.DecodeBool(min))
-				require.Equal(t, tc.max, types.DecodeBool(max))
-			}
-		})
-	}
-}
-
 func TestCloneWindowToConstNullReuse(t *testing.T) {
 	for _, typ := range []types.Type{types.T_int64.ToType(), types.T_varchar.ToType()} {
 		for _, nilMP := range []bool{false, true} {
@@ -4847,7 +3123,7 @@ func TestCloneWindowToConstNullReuse(t *testing.T) {
 				mp := mpool.MustNewZero()
 				src := NewConstNull(typ, 2, mp)
 				t.Cleanup(func() { src.Free(mp) })
-				dst := NewOffHeapVecWithType(typ)
+				dst := NewVec(typ, mp)
 				t.Cleanup(func() { dst.Free(mp) })
 				require.NoError(t, dst.PreExtend(2, mp))
 				backing := dst.GetData()
@@ -4857,6 +3133,11 @@ func TestCloneWindowToConstNullReuse(t *testing.T) {
 				if nilMP {
 					cloneMP = nil
 				}
+				if nilMP {
+					// The destination's own pool must be passed.
+					require.Error(t, src.CloneWindowTo(dst, 0, 2, cloneMP))
+					return
+				}
 				require.NoError(t, src.CloneWindowTo(dst, 0, 2, cloneMP))
 				require.True(t, dst.IsConstNull())
 				require.Equal(t, 2, dst.Length())
@@ -4865,7 +3146,7 @@ func TestCloneWindowToConstNullReuse(t *testing.T) {
 				require.Equal(t, before, mp.CurrNB())
 				encoded, err := dst.MarshalBinary()
 				require.NoError(t, err)
-				decoded := NewVec(typ)
+				decoded := NewVec(typ, mp)
 				t.Cleanup(func() { decoded.Free(mp) })
 				require.NoError(t, decoded.UnmarshalBinary(encoded))
 				require.True(t, decoded.IsConstNull())
@@ -4887,33 +3168,6 @@ func TestCloneWindowToConstNullReuse(t *testing.T) {
 	}
 }
 
-func TestCloneWindowToConstNullBorrowedData(t *testing.T) {
-	mp := mpool.MustNewZero()
-	typ := types.T_int64.ToType()
-	owner := NewOffHeapVecWithType(typ)
-	t.Cleanup(func() { owner.Free(mp) })
-	require.NoError(t, AppendFixed(owner, int64(9), false, mp))
-	dst, err := owner.Window(0, 1)
-	require.NoError(t, err)
-	t.Cleanup(func() { dst.Free(mp) })
-	src := NewConstNull(typ, 1, mp)
-	t.Cleanup(func() { src.Free(mp) })
-	before := mp.CurrNB()
-	require.NoError(t, src.CloneWindowTo(dst, 0, 1, mp))
-	require.True(t, dst.IsConstNull())
-	require.Nil(t, dst.GetData())
-	require.False(t, dst.cantFreeData)
-	require.True(t, dst.cantFreeArea, "data cleanup must preserve independent area ownership")
-	require.Equal(t, before, mp.CurrNB())
-	require.Equal(t, int64(9), GetFixedAtNoTypeCheck[int64](owner, 0))
-	dst.ResetWithNewType(&typ)
-	require.NoError(t, AppendFixed(dst, int64(4), false, mp))
-	require.Equal(t, int64(9), GetFixedAtNoTypeCheck[int64](owner, 0))
-	dst.Free(mp)
-	owner.Free(mp)
-	require.Zero(t, mp.CurrNB())
-}
-
 func BenchmarkConstSetSelection(b *testing.B) {
 	for _, shape := range []string{"flat", "flat_null", "constant", "constant_null", "text", "zero"} {
 		b.Run(shape, func(b *testing.B) {
@@ -4923,7 +3177,7 @@ func BenchmarkConstSetSelection(b *testing.B) {
 			if shape == "text" {
 				typ = types.T_text.ToType()
 			}
-			source := NewVec(typ)
+			source := NewVec(typ, mp)
 			var err error
 			switch shape {
 			case "constant":
@@ -4959,4 +3213,345 @@ func BenchmarkConstSetSelection(b *testing.B) {
 			}
 		})
 	}
+}
+
+// Exercise every ordered deletion set, including empty, prefix, suffix, and all rows.
+func TestShrinkNegateOrderedSubsets(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	for n := 0; n <= 7; n++ {
+		for mask := 0; mask < 1<<n; mask++ {
+			func() {
+				v := NewVec(types.T_int64.ToType(), mp)
+				defer v.Free(mp)
+				values := make([]int64, n)
+				sels := make([]int64, 0, n)
+				want := make([]int64, 0, n)
+				for i := range values {
+					values[i] = int64(i + 10)
+					if mask&(1<<i) != 0 {
+						sels = append(sels, int64(i))
+					} else {
+						want = append(want, values[i])
+					}
+				}
+				require.NoError(t, AppendFixedList(v, values, nil, mp), "n=%d mask=%d", n, mask)
+				require.NoError(t, v.Shrink(sels, true, mp), "n=%d mask=%d", n, mask)
+				got := MustFixedColNoTypeCheck[int64](v)
+				require.Equal(t, len(want), len(got), "n=%d mask=%d", n, mask)
+				for i := range want {
+					require.Equal(t, want[i], got[i], "n=%d mask=%d index=%d", n, mask, i)
+				}
+			}()
+		}
+	}
+	require.Zero(t, mp.CurrNB())
+}
+
+func TestVarlenaAreaIsDisjointEdgeCases(t *testing.T) {
+	mp := mpool.MustNewZero()
+	long := func(c string) []byte { return []byte(strings.Repeat(c, 40)) }
+
+	build := func(t *testing.T) *Vector {
+		v := NewVec(types.T_varchar.ToType(), mp)
+		for _, c := range []string{"a", "b", "c"} {
+			require.NoError(t, AppendBytes(v, long(c), false, mp))
+		}
+		require.NoError(t, AppendBytes(v, []byte("inline"), false, mp))
+		return v
+	}
+
+	t.Run("append built", func(t *testing.T) {
+		v := build(t)
+		defer v.Free(mp)
+		require.True(t, v.VarlenaAreaIsDisjoint())
+	})
+
+	t.Run("shuffled stays disjoint", func(t *testing.T) {
+		v := build(t)
+		defer v.Free(mp)
+		require.NoError(t, v.Shuffle([]int64{2, 0, 3, 1}, mp))
+		require.True(t, v.VarlenaAreaIsDisjoint())
+		require.Equal(t, long("c"), v.GetBytesAt(0))
+	})
+
+	t.Run("aliased descriptors", func(t *testing.T) {
+		v := build(t)
+		defer v.Free(mp)
+		values := MustFixedColNoTypeCheck[types.Varlena](v)
+		values[2] = values[0]
+		require.False(t, v.VarlenaAreaIsDisjoint())
+		// A NULL row's stale descriptor is not live.
+		v.SetNull(2)
+		require.True(t, v.VarlenaAreaIsDisjoint())
+	})
+
+	t.Run("out of area", func(t *testing.T) {
+		v := build(t)
+		defer v.Free(mp)
+		v.area = v.area[:len(v.area)-1]
+		require.False(t, v.VarlenaAreaIsDisjoint())
+	})
+
+	t.Run("const and fixed never report", func(t *testing.T) {
+		c, err := NewConstBytes(types.T_varchar.ToType(), long("z"), 3, mp)
+		require.NoError(t, err)
+		defer c.Free(mp)
+		require.False(t, c.VarlenaAreaIsDisjoint())
+		f := NewVec(types.T_int64.ToType(), mp)
+		require.False(t, f.VarlenaAreaIsDisjoint())
+	})
+}
+
+func TestTypedReadLogicalBoundsAndConstantRows(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	flat := NewVec(types.T_int64.ToType(), mp)
+	defer flat.Free(mp)
+	require.NoError(t, flat.PreExtend(32, mp))
+	require.NoError(t, AppendFixedList(flat, []int64{11, 22}, nil, mp))
+	require.Equal(t, int64(11), GetFixedAtNoTypeCheck[int64](flat, 0))
+	require.Equal(t, int64(22), GetFixedAtNoTypeCheck[int64](flat, 1))
+	for _, row := range []int{-1, 2, 31} {
+		require.Panics(t, func() { _ = GetFixedAtNoTypeCheck[int64](flat, row) })
+	}
+	constant, err := NewConstFixed(types.T_int64.ToType(), int64(42), 2, mp)
+	require.NoError(t, err)
+	defer constant.Free(mp)
+	for _, row := range []int{-1, 0, 1, 100} {
+		require.Equal(t, int64(42), GetFixedAtNoTypeCheck[int64](constant, row))
+	}
+	flat.ResetWithSameType()
+	require.Panics(t, func() { _ = GetFixedAtNoTypeCheck[int64](flat, 0) })
+	constantNull := NewConstNull(types.T_int64.ToType(), 2, mp)
+	defer constantNull.Free(mp)
+	require.Panics(t, func() { _ = GetFixedAtNoTypeCheck[int64](constantNull, 0) })
+}
+
+func TestTypedReadBytesRetainsAliasesAndBounds(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	vec := NewVec(types.T_varbinary.ToType(), mp)
+	defer vec.Free(mp)
+	require.NoError(t, vec.PreExtend(32, mp))
+	values := [][]byte{[]byte("inline"), bytes.Repeat([]byte("x"), 64), {}}
+	require.NoError(t, AppendBytesList(vec, values, nil, mp))
+	for row, want := range values {
+		require.Equal(t, want, vec.GetBytesAt(row))
+	}
+	for _, row := range []int{0, 1} {
+		value := vec.GetBytesAt(row)
+		value[0] = 'z'
+		require.Equal(t, byte('z'), vec.GetBytesAt(row)[0])
+	}
+	for _, row := range []int{-1, 3, 31} {
+		require.Panics(t, func() { _ = vec.GetBytesAt(row) })
+	}
+	constant, err := NewConstBytes(types.T_varbinary.ToType(), []byte("constant"), 2, mp)
+	require.NoError(t, err)
+	defer constant.Free(mp)
+	for _, row := range []int{-1, 0, 1, 100} {
+		require.Equal(t, []byte("constant"), constant.GetBytesAt(row))
+	}
+	vec.ResetWithSameType()
+	require.Panics(t, func() { _ = vec.GetBytesAt(0) })
+}
+
+var typedReadBenchSink int64
+
+func BenchmarkVectorTypedRead(b *testing.B) {
+	const rows = 2048
+	for _, constant := range []bool{false, true} {
+		name := "int64_flat_2048"
+		if constant {
+			name = "int64_const_2048"
+		}
+		b.Run(name, func(b *testing.B) {
+			mp := mpool.MustNewZero()
+			defer mpool.DeleteMPool(mp)
+			vec := NewVec(types.T_int64.ToType(), mp)
+			defer func() { vec.Free(mp) }()
+			if constant {
+				vec.Free(mp)
+				var err error
+				vec, err = NewConstFixed(types.T_int64.ToType(), int64(42), rows, mp)
+				require.NoError(b, err)
+			} else {
+				values := make([]int64, rows)
+				for i := range values {
+					values[i] = 42
+				}
+				require.NoError(b, AppendFixedList(vec, values, nil, mp))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				var sum int64
+				for row := 0; row < rows; row++ {
+					sum += GetFixedAtNoTypeCheck[int64](vec, row)
+				}
+				typedReadBenchSink = sum
+			}
+			b.StopTimer()
+			require.Equal(b, int64(rows*42), typedReadBenchSink)
+		})
+	}
+	b.Run("bool_flat_2048", func(b *testing.B) {
+		mp := mpool.MustNewZero()
+		defer mpool.DeleteMPool(mp)
+		vec := NewVec(types.T_bool.ToType(), mp)
+		defer vec.Free(mp)
+		values := make([]bool, rows)
+		for row := range values {
+			values[row] = row%2 == 0
+		}
+		require.NoError(b, AppendFixedList(vec, values, nil, mp))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			var sum int64
+			for row := 0; row < rows; row++ {
+				if GetFixedAtNoTypeCheck[bool](vec, row) {
+					sum++
+				}
+			}
+			typedReadBenchSink = sum
+		}
+		b.StopTimer()
+		require.Equal(b, int64(rows/2), typedReadBenchSink)
+	})
+	for _, size := range []int{6, 64} {
+		name := "bytes_inline_2048"
+		if size == 64 {
+			name = "bytes_area_2048"
+		}
+		b.Run(name, func(b *testing.B) {
+			mp := mpool.MustNewZero()
+			defer mpool.DeleteMPool(mp)
+			vec := NewVec(types.T_varbinary.ToType(), mp)
+			defer vec.Free(mp)
+			values := make([][]byte, rows)
+			for row := range values {
+				values[row] = bytes.Repeat([]byte("x"), size)
+			}
+			require.NoError(b, AppendBytesList(vec, values, nil, mp))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				var sum int64
+				for row := 0; row < rows; row++ {
+					value := vec.GetBytesAt(row)
+					sum += int64(len(value)) + int64(value[0])
+				}
+				typedReadBenchSink = sum
+			}
+			b.StopTimer()
+			require.Equal(b, int64(rows*(size+int('x'))), typedReadBenchSink)
+		})
+	}
+}
+
+// exerciseNarrowArray drives the generic narrow-vector (bf16/f16/int8/uint8) array
+// functions added for quantized vector columns: Append*, GetArrayAt, NewConstArray,
+// SetConstArray, and the String()/RowToString() narrow branches.
+func exerciseNarrowArray[T types.ArrayElement](t *testing.T, oid types.T, a, b []T) {
+	mp := mpool.MustNewZero()
+	dim := int32(len(a))
+
+	// AppendArray (value + null) then AppendArrayList
+	vec := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, AppendArray[T](vec, a, false, mp))
+	require.NoError(t, AppendArray[T](vec, nil, true, mp)) // null row
+	require.NoError(t, AppendArrayList[T](vec, [][]T{a, b}, nil, mp))
+	require.Equal(t, a, GetArrayAt[T](vec, 0))
+	require.Equal(t, b, GetArrayAt[T](vec, 3))
+	_ = vec.String()       // String() narrow branch (multi-row + null bitmap)
+	_ = vec.RowToString(0) // RowToString -> implArrayRowToString narrow branch
+	_ = vec.RowToString(2)
+	vec.Free(mp)
+
+	// NewConstArray + GetArrayAt + single-row String()
+	cv, err := NewConstArray[T](types.New(oid, dim, 0), a, 2, mp)
+	require.NoError(t, err)
+	require.Equal(t, a, GetArrayAt[T](cv, 0))
+	_ = cv.String()
+	_ = cv.RowToString(0)
+	cv.Free(mp)
+
+	// SetConstArray
+	sv := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, SetConstArray[T](sv, b, 3, mp))
+	require.Equal(t, b, GetArrayAt[T](sv, 0))
+	sv.Free(mp)
+
+	// single-row String()/RowToString — the len(col)==1 narrow branch
+	one := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, AppendArray[T](one, a, false, mp))
+	_ = one.String()
+	_ = one.RowToString(0)
+	one.Free(mp)
+
+	// InplaceSort narrow branch (unsorted input with a duplicate)
+	srt := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, AppendArrayList[T](srt, [][]T{b, a, a}, nil, mp))
+	require.NoError(t, srt.InplaceSort(mp))
+	srt.Free(mp)
+
+	// InplaceSortAndCompact narrow branch (sort + dedup)
+	cmp := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, AppendArrayList[T](cmp, [][]T{b, a, a}, nil, mp))
+	require.NoError(t, cmp.InplaceSortAndCompact(mp))
+	cmp.Free(mp)
+
+	// GetMinMaxValue narrow branch
+	mm := NewVec(types.New(oid, dim, 0), mp)
+	require.NoError(t, AppendArrayList[T](mm, [][]T{a, b}, nil, mp))
+	_, _, _ = mm.GetMinMaxValue()
+	mm.Free(mp)
+}
+
+func TestNarrowArrayVectorOps(t *testing.T) {
+	t.Run("bf16", func(t *testing.T) {
+		exerciseNarrowArray(t, types.T_array_bf16,
+			types.Float32ToBF16Slice([]float32{1, 2, 3}), types.Float32ToBF16Slice([]float32{4, 5, 6}))
+	})
+	t.Run("f16", func(t *testing.T) {
+		exerciseNarrowArray(t, types.T_array_float16,
+			types.Float32ToFloat16Slice([]float32{1, 2, 3}), types.Float32ToFloat16Slice([]float32{4, 5, 6}))
+	})
+	t.Run("int8", func(t *testing.T) {
+		exerciseNarrowArray(t, types.T_array_int8, []int8{1, 2, 3}, []int8{4, 5, 6})
+	})
+	t.Run("uint8", func(t *testing.T) {
+		exerciseNarrowArray(t, types.T_array_uint8, []uint8{1, 2, 3}, []uint8{4, 5, 6})
+	})
+}
+
+// A read-only vector can own its nulls bitmap (DetachNulls). WindowInto
+// would drop that bitmap without freeing it, so it rejects such a target.
+func TestWindowIntoRejectsTargetOwningNulls(t *testing.T) {
+	mp := mpool.MustNewZero()
+	nspMP := mpool.MustNewZero()
+	src := NewVec(types.T_int64.ToType(), mp)
+	for i := 0; i < 8; i++ {
+		require.NoError(t, AppendFixed(src, int64(i), i%2 == 0, mp))
+	}
+	w, err := src.Window(0, 8)
+	require.NoError(t, err)
+	require.True(t, w.IsReadOnly())
+	require.NoError(t, w.DetachNulls(nspMP))
+	require.False(t, w.GetNulls().IsReadOnly())
+	require.Greater(t, nspMP.CurrNB(), int64(0))
+
+	require.Error(t, src.WindowInto(w, 0, 4))
+	require.True(t, w.GetNulls().Contains(0), "the rejected target is unchanged")
+
+	w.Free(nil)
+	require.Zero(t, nspMP.CurrNB())
+	var fresh Vector
+	require.NoError(t, src.WindowInto(&fresh, 0, 4))
+	require.Equal(t, 4, fresh.Length())
+	require.True(t, fresh.GetNulls().Contains(2))
+	src.Free(mp)
+	require.Zero(t, mp.CurrNB())
 }

@@ -166,7 +166,8 @@ func (rightDedupJoin *RightDedupJoin) Call(proc *process.Process) (vm.CallResult
 							ctr.buildGroupCount = ctr.groupCount
 							if !rightDedupJoin.InputKeysUnique &&
 								!proc.GetTxnOperator().Txn().IsPessimistic() && ctr.buildGroupCount > 0 {
-								ctr.matched, initErr = colexec.NewRowBitmap(int64(ctr.buildGroupCount))
+								ctr.matched.Free()
+								ctr.matched, initErr = colexec.NewRowBitmap(int64(ctr.buildGroupCount), proc.Mp())
 							}
 						case spillutil.BucketEmptyBuild:
 							ctr.mp, initErr = rightDedupJoin.newEmptyJoinMap(proc)
@@ -209,6 +210,7 @@ func (rightDedupJoin *RightDedupJoin) build(analyzer process.Analyzer, proc *pro
 		ctr.mp, err = rightDedupJoin.newEmptyJoinMap(proc)
 		ctr.groupCount = 0
 		ctr.buildGroupCount = 0
+		ctr.matched.Free()
 		ctr.matched = nil
 		return err
 	} else {
@@ -270,7 +272,8 @@ func (rightDedupJoin *RightDedupJoin) build(analyzer process.Analyzer, proc *pro
 		if !rightDedupJoin.InputKeysUnique &&
 			!proc.GetTxnOperator().Txn().IsPessimistic() &&
 			ctr.buildGroupCount > 0 {
-			ctr.matched, err = colexec.NewRowBitmap(int64(ctr.buildGroupCount))
+			ctr.matched.Free()
+			ctr.matched, err = colexec.NewRowBitmap(int64(ctr.buildGroupCount), proc.Mp())
 			if err != nil {
 				return err
 			}
@@ -394,17 +397,21 @@ func (ctr *container) probe(bat *batch.Batch, ap *RightDedupJoin, proc *process.
 		analyzer.GetOpStats().AddExtraStat("RightDedupInputUniqueRows", int64(count))
 	}
 
-	if err := ap.resetResultBatch(); err != nil {
+	if err := ap.resetResultBatch(proc); err != nil {
+		return err
+	}
+	resMP, err := ap.resultMP(proc)
+	if err != nil {
 		return err
 	}
 
 	for i, rp := range ap.Result {
 		if rp.Rel == 0 {
-			if err := ctr.resultBatch.Vecs[i].UnionBatch(bat.Vecs[rp.Pos], 0, count, nil, proc.Mp()); err != nil {
+			if err := ctr.resultBatch.Vecs[i].UnionBatch(bat.Vecs[rp.Pos], 0, count, nil, resMP); err != nil {
 				return err
 			}
 		} else {
-			if err := vector.SetConstNull(ctr.resultBatch.Vecs[i], count, proc.Mp()); err != nil {
+			if err := vector.SetConstNull(ctr.resultBatch.Vecs[i], count, resMP); err != nil {
 				return err
 			}
 		}

@@ -43,12 +43,9 @@ type LocalETLFS struct {
 var _ FileService = new(LocalETLFS)
 
 func NewLocalETLFS(name string, rootPath string) (*LocalETLFS, error) {
-	rootPath, rootFile, err := prepareLocalRoot(rootPath)
+	rootPath, err := prepareLocalRoot(rootPath)
 	if err != nil {
 		return nil, err
-	}
-	if rootFile != nil {
-		defer rootFile.Close()
 	}
 
 	// resolve symlinks in the path to get the canonical path
@@ -173,12 +170,7 @@ func (l *LocalETLFS) write(ctx context.Context, vector IOVector) error {
 
 	// move
 	if exclusiveWrite(ctx) {
-		// Link installs the complete temporary file atomically and refuses an
-		// existing name, using the filesystem's own alias equivalence.
-		if err := os.Link(tempPath, nativePath); err != nil {
-			if os.IsExist(err) {
-				return moerr.NewFileAlreadyExistsNoCtx(path.File)
-			}
+		if err := linkLocalFile(tempPath, nativePath, path.File); err != nil {
 			return err
 		}
 	} else {
@@ -212,11 +204,30 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 	}
 	nativePath := l.toNativeFilePath(path.File)
 
+	wait := ReadWaitTrackerFromContext(ctx)
+	start := wait.Start()
 	_, err = os.Stat(nativePath)
+	wait.Stop(start)
 	if os.IsNotExist(err) {
 		return moerr.NewFileNotFoundNoCtx(path.File)
 	}
 	if err != nil {
+		return err
+	}
+
+	open := func() (*os.File, error) {
+		start := wait.Start()
+		f, err := os.Open(nativePath)
+		wait.Stop(start)
+		if os.IsNotExist(err) {
+			return nil, moerr.NewFileNotFoundNoCtx(path.File)
+		}
+		return f, err
+	}
+	seek := func(f *os.File, offset int64) error {
+		start := wait.Start()
+		_, err := f.Seek(offset, io.SeekStart)
+		wait.Stop(start)
 		return err
 	}
 
@@ -230,20 +241,17 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 		}
 
 		if entry.WriterForRead != nil {
-			f, err := os.Open(nativePath)
-			if os.IsNotExist(err) {
-				return moerr.NewFileNotFoundNoCtx(path.File)
-			}
+			f, err := open()
 			if err != nil {
 				return err
 			}
 			defer f.Close()
 			if entry.Offset > 0 {
-				if _, err := f.Seek(int64(entry.Offset), io.SeekStart); err != nil {
+				if err := seek(f, entry.Offset); err != nil {
 					return err
 				}
 			}
-			r := (io.Reader)(f)
+			r := wait.wrapReader(f)
 			if entry.Size > 0 {
 				r = io.LimitReader(r, int64(entry.Size))
 			}
@@ -281,19 +289,16 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 			}
 
 		} else if entry.ReadCloserForRead != nil {
-			f, err := os.Open(nativePath)
-			if os.IsNotExist(err) {
-				return moerr.NewFileNotFoundNoCtx(path.File)
-			}
+			f, err := open()
 			if err != nil {
 				return err
 			}
 			if entry.Offset > 0 {
-				if _, err := f.Seek(int64(entry.Offset), io.SeekStart); err != nil {
+				if err := seek(f, entry.Offset); err != nil {
 					return err
 				}
 			}
-			r := (io.Reader)(f)
+			r := wait.wrapReader(f)
 			if entry.Size > 0 {
 				r = io.LimitReader(r, int64(entry.Size))
 			}
@@ -322,22 +327,19 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 			}
 
 		} else {
-			f, err := os.Open(nativePath)
-			if os.IsNotExist(err) {
-				return moerr.NewFileNotFoundNoCtx(path.File)
-			}
+			f, err := open()
 			if err != nil {
 				return err
 			}
 			defer f.Close()
 
 			if entry.Offset > 0 {
-				_, err = f.Seek(int64(entry.Offset), io.SeekStart)
+				err = seek(f, entry.Offset)
 				if err != nil {
 					return err
 				}
 			}
-			r := (io.Reader)(f)
+			r := wait.wrapReader(f)
 			if entry.Size > 0 {
 				r = io.LimitReader(r, int64(entry.Size))
 			}

@@ -237,8 +237,6 @@ func jsonLengthCheckFn(overloads []overload, inputs []types.Type) checkResult {
 
 type computeFn func([]byte, []*bytejson.Path) (bytejson.ByteJson, error)
 
-type computeExtractFn func([]byte, []*bytejson.Path) (bytejson.ByteJson, bool, error)
-
 type computeJsonFn func([]byte, []*bytejson.Path, []bytejson.ByteJson) (bytejson.ByteJson, error)
 
 func computeString(json []byte, paths []*bytejson.Path) (bytejson.ByteJson, error) {
@@ -260,36 +258,6 @@ func computeStringSimple(json []byte, paths []*bytejson.Path) (bytejson.ByteJson
 		return bytejson.Null, err
 	}
 	return bj.QuerySimple(paths), nil
-}
-
-func computeJsonWithExists(json []byte, paths []*bytejson.Path) (bytejson.ByteJson, bool, error) {
-	bj := types.DecodeJson(json)
-	result, exists := bj.QueryWithExists(paths)
-	return result, exists, nil
-}
-
-func computeStringWithExists(json []byte, paths []*bytejson.Path) (bytejson.ByteJson, bool, error) {
-	bj, err := types.ParseSliceToByteJson(json)
-	if err != nil {
-		return bytejson.Null, false, err
-	}
-	result, exists := bj.QueryWithExists(paths)
-	return result, exists, nil
-}
-
-func computeJsonSimpleWithExists(json []byte, paths []*bytejson.Path) (bytejson.ByteJson, bool, error) {
-	bj := types.DecodeJson(json)
-	result, exists := bj.QuerySimpleWithExists(paths)
-	return result, exists, nil
-}
-
-func computeStringSimpleWithExists(json []byte, paths []*bytejson.Path) (bytejson.ByteJson, bool, error) {
-	bj, err := types.ParseSliceToByteJson(json)
-	if err != nil {
-		return bytejson.Null, false, err
-	}
-	result, exists := bj.QuerySimpleWithExists(paths)
-	return result, exists, nil
 }
 
 func (op *opBuiltInJsonContains) jsonContains(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
@@ -995,7 +963,7 @@ func computeStringJsonRemove(json []byte, paths []*bytejson.Path) (bytejson.Byte
 	return bj.Remove(paths)
 }
 
-func (op *opBuiltInJsonExtract) buildPath(params []*vector.Vector, length int, selectList *FunctionSelectList) error {
+func (op *opBuiltInJsonExtract) buildPath(ctx context.Context, params []*vector.Vector, length int, selectList *FunctionSelectList) error {
 	op.npath = len(params) - 1
 	if op.npath == 0 {
 		return nil
@@ -1067,6 +1035,9 @@ func (op *opBuiltInJsonExtract) buildPath(params []*vector.Vector, length int, s
 	} else {
 		op.simple = true
 		for i := 0; i < length; i++ {
+			if err := CheckJSONExtractRow(ctx, i); err != nil {
+				return err
+			}
 			strs := op.pathStrs[i*op.npath : (i+1)*op.npath]
 			paths := op.paths[i*op.npath : (i+1)*op.npath]
 			if selectList.Contains(uint64(i)) {
@@ -1124,77 +1095,64 @@ func (op *opBuiltInJsonExtract) buildOnePath(paramWrappers []vector.FunctionPara
 	return nil
 }
 
-func (op *opBuiltInJsonExtract) jsonExtract(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
-	var err error
-	var fn computeExtractFn
+// CheckJSONExtractRow checks before the next bounded group of rows, including
+// groups consisting entirely of masked or NULL inputs.
+func CheckJSONExtractRow(ctx context.Context, row int) error {
+	if row%64 == 0 && ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
 
+func (op *opBuiltInJsonExtract) jsonExtract(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	ctx := proc.Ctx
 	jsonVec := parameters[0]
 	jsonWrapper := vector.GenerateFunctionStrParameter(jsonVec)
 	rs := vector.MustFunctionResult[types.Varlena](result)
+	native := jsonVec.GetType().Oid == types.T_json
 
-	if selectList.IgnoreAllRow() {
-		for i := 0; i < length; i++ {
-			if err = rs.AppendBytes(nil, true); err != nil {
-				return err
-			}
-		}
-		return nil
+	if err := CheckJSONExtractRow(ctx, 0); err != nil {
+		return err
 	}
-
-	// build all paths
-	if err = op.buildPath(parameters, length, selectList); err != nil {
+	if err := op.buildPath(ctx, parameters, length, selectList); err != nil {
 		return err
 	}
 
-	if op.simple {
-		if jsonVec.GetType().Oid == types.T_json {
-			fn = computeJsonSimpleWithExists
-		} else {
-			fn = computeStringSimpleWithExists
+	for row := 0; row < length; row++ {
+		if err := CheckJSONExtractRow(ctx, row); err != nil {
+			return err
 		}
-	} else {
-		if jsonVec.GetType().Oid == types.T_json {
-			fn = computeJsonWithExists
-		} else {
-			fn = computeStringWithExists
-		}
-	}
-
-	for i := uint64(0); i < uint64(length); i++ {
-		if selectList.Contains(i) {
-			if err = rs.AppendBytes(nil, true); err != nil {
+		if selectList.IgnoreAllRow() || selectList.Contains(uint64(row)) {
+			if err := rs.AppendBytes(nil, true); err != nil {
 				return err
 			}
 			continue
 		}
-		jsonBytes, jIsNull := jsonWrapper.GetStrValue(i)
-		if jIsNull {
-			if err = rs.AppendBytes(nil, true); err != nil {
+		raw, null := jsonWrapper.GetStrValue(uint64(row))
+		paths := op.getPaths(uint64(row))
+		if null || len(paths) == 0 || paths[0] == nil {
+			if err := rs.AppendBytes(nil, true); err != nil {
 				return err
 			}
 			continue
 		}
 
-		paths := op.getPaths(i)
-		if len(paths) == 0 || paths[0] == nil {
-			if err = rs.AppendBytes(nil, true); err != nil {
-				return err
-			}
-			continue
+		var doc bytejson.ByteJson
+		if native {
+			doc = types.DecodeJson(raw)
 		} else {
-			out, exists, err := fn(jsonBytes, paths)
+			var err error
+			doc, err = bytejson.ParseFromByteSliceWithCancellation(ctx, raw)
 			if err != nil {
 				return err
 			}
-			if !exists {
-				if err = rs.AppendBytes(nil, true); err != nil {
-					return err
-				}
-			} else {
-				if err = rs.AppendByteJson(out, false); err != nil {
-					return err
-				}
-			}
+		}
+		out, exists, err := doc.QueryWithExistsContext(ctx, paths)
+		if err != nil {
+			return err
+		}
+		if err := rs.AppendByteJson(out, !exists); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1219,7 +1177,7 @@ func (op *opBuiltInJsonExtract) jsonExtractString(parameters []*vector.Vector, r
 	}
 
 	// build all paths
-	if err = op.buildPath(parameters, length, selectList); err != nil {
+	if err = op.buildPath(proc.Ctx, parameters, length, selectList); err != nil {
 		return err
 	}
 
@@ -1303,7 +1261,7 @@ func (op *opBuiltInJsonExtract) jsonExtractFloat64(parameters []*vector.Vector, 
 	}
 
 	// build all paths
-	if err = op.buildPath(parameters, length, selectList); err != nil {
+	if err = op.buildPath(proc.Ctx, parameters, length, selectList); err != nil {
 		return err
 	}
 	if !op.simple || op.npath > 1 {
@@ -1875,7 +1833,7 @@ rowLoop:
 				}
 				continue rowLoop
 			}
-			val, err := op.buildJsonModifyValue(proc, parameters[j], int(i), protocolVersion)
+			val, err := op.buildJsonModifyValue(proc, parameters[j], result.ArgumentIsBin(j), int(i), protocolVersion)
 			if err != nil {
 				return err
 			}
@@ -1922,8 +1880,8 @@ func jsonModifyFunctionName(jsonFuncType bytejson.JsonModifyType) string {
 	}
 }
 
-func (op *opBuiltInJsonSet) buildJsonModifyValue(proc *process.Process, v *vector.Vector, row int, protocolVersion int64) (bytejson.ByteJson, error) {
-	elem, err := (&opBuiltInJsonArray{}).convertToAny(proc, v, row, protocolVersion)
+func (op *opBuiltInJsonSet) buildJsonModifyValue(proc *process.Process, v *vector.Vector, isBin bool, row int, protocolVersion int64) (bytejson.ByteJson, error) {
+	elem, err := (&opBuiltInJsonArray{}).convertToAny(proc, v, isBin, row, protocolVersion)
 	if err != nil {
 		return bytejson.Null, err
 	}
@@ -1959,7 +1917,7 @@ func (op *opBuiltInJsonArray) jsonArray(params []*vector.Vector, result vector.F
 		}
 		elems := make([]any, 0, len(params))
 		for i := 0; i < len(params); i++ {
-			elem, err := op.convertToAny(proc, params[i], j, protocolVersion)
+			elem, err := op.convertToAny(proc, params[i], result.ArgumentIsBin(i), j, protocolVersion)
 			if err != nil {
 				return err
 			}
@@ -1981,7 +1939,9 @@ func (op *opBuiltInJsonArray) jsonArray(params []*vector.Vector, result vector.F
 	return nil
 }
 
-func (op *opBuiltInJsonArray) convertToAny(proc *process.Process, v *vector.Vector, row int, protocolVersion int64) (any, error) {
+// convertToAny converts row of v to a JSON value. isBin is v's
+// binary-literal flag (vector.FunctionResultWrapper.ArgumentIsBin).
+func (op *opBuiltInJsonArray) convertToAny(proc *process.Process, v *vector.Vector, isBin bool, row int, protocolVersion int64) (any, error) {
 	ctx := context.Background()
 	if proc != nil {
 		ctx = proc.Ctx
@@ -1989,7 +1949,7 @@ func (op *opBuiltInJsonArray) convertToAny(proc *process.Process, v *vector.Vect
 	if !v.IsNull(uint64(row)) {
 		switch v.GetType().Oid {
 		case types.T_char, types.T_varchar, types.T_text:
-			if isBinaryStringVector(v) {
+			if isBinaryStringVector(v, isBin) {
 				return newTypedByteJson(bytejson.TpCodeOpaque, string(v.GetBytesAt(row))), nil
 			}
 		}
@@ -2130,7 +2090,7 @@ func (op *opBuiltInJsonObject) jsonObject(params []*vector.Vector, result vector
 				key = fmt.Sprint(v)
 			}
 
-			elem, err := arrayOp.convertToAny(proc, params[i+1], j, protocolVersion)
+			elem, err := arrayOp.convertToAny(proc, params[i+1], result.ArgumentIsBin(i+1), j, protocolVersion)
 			if err != nil {
 				return err
 			}
@@ -2193,7 +2153,8 @@ func (op *opBuiltInJsonObject) convertKeyToAny(
 	case types.T_geometry:
 		return string(v.GetBytesAt(row)), nil
 	default:
-		return arrayOp.convertToAny(proc, v, row, protocolVersion)
+		// The string types the binary-literal flag applies to return above.
+		return arrayOp.convertToAny(proc, v, false, row, protocolVersion)
 	}
 }
 

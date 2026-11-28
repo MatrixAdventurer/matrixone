@@ -504,7 +504,7 @@ func Test_extractRowFromEveryVector(t *testing.T) {
 	mp := mpool.MustNewZeroNoFixed()
 	defer mpool.DeleteMPool(mp)
 
-	bat := batch.New([]string{"const_null", "const", "normal"})
+	bat := batch.NewWithSize(3)
 	bat.Vecs[0] = vector.NewConstNull(types.T_int32.ToType(), 3, mp)
 	bat.Vecs[1] = testutil.MakeScalarInt64(1, 3, mp)
 	bat.Vecs[2] = testutil.MakeInt32Vector([]int32{1, 2, 3}, nil, mp)
@@ -801,7 +801,7 @@ func Test_extractRowFromVector(t *testing.T) {
 		{
 			args: args{
 				ctx:      context.Background(),
-				vec:      vector.NewVec(types.T_decimal256.ToType()),
+				vec:      vector.NewVec(types.T_decimal256.ToType(), mp),
 				i:        0,
 				row:      make([]any, 1),
 				rowIndex: 0,
@@ -1245,7 +1245,7 @@ func Test_narrowVectorCdcRoundTrip(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			vec := vector.NewVec(c.typ)
+			vec := vector.NewVec(c.typ, mp)
 			require.NoError(t, vector.AppendBytes(vec, c.payload, false, mp))
 			defer vec.Free(mp)
 

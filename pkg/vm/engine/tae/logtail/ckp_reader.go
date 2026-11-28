@@ -90,7 +90,8 @@ func (r *ckpObjectReader) Read(
 		return true, nil
 	}
 	for {
-		if end, err = r.reader.Read(ctx, bat.Attrs, nil, mp, bat); err != nil {
+		// bat is a ckputil.MakeDataScanTableIDBatch batch.
+		if end, err = r.reader.Read(ctx, ckputil.DataScan_TableIDAtrrs, nil, mp, bat); err != nil {
 			return
 		}
 		if !end {
@@ -179,7 +180,7 @@ func (r *ckpObjectReaderForV12) Read(
 	}
 	var bats []*containers.Batch
 	if bats, err = LoadBlkColumnsByMeta(
-		CheckpointVersion12, ctx, typs, destBatch.Attrs, batchIndex, reader, mp,
+		CheckpointVersion12, ctx, typs, ckputil.DataScan_TableIDAtrrs, batchIndex, reader, mp,
 	); err != nil {
 		return
 	}
@@ -267,7 +268,7 @@ func (reader *CKPReader) GetTableRanges(
 		ranges = append(ranges, reader.tombstoneRanges...)
 		return
 	}
-	rangeBat := ckputil.MakeTableRangeBatch()
+	rangeBat := ckputil.MakeTableRangeBatch(reader.mp)
 	defer rangeBat.Clean(reader.mp)
 	if err = ckputil.CollectTableRanges(
 		ctx,
@@ -357,7 +358,7 @@ func readMetaForV12(
 	dataLocationsVec := metaBatch.Vecs[MetaSchema_DataObject_Idx+2]
 	tombstoneLocationsVec := metaBatch.Vecs[MetaSchema_TombstoneObject_Idx+2]
 	for i := 0; i < dataLocationsVec.Length(); i++ {
-		dataLocations := BlockLocations(dataLocationsVec.GetDownstreamVector().GetBytesAt(i))
+		dataLocations := BlockLocations(dataLocationsVec.GetBytesAt(i))
 		it := dataLocations.MakeIterator()
 		for it.HasNext() {
 			loc := it.Next().GetLocation()
@@ -366,7 +367,7 @@ func readMetaForV12(
 				data[str] = loc.Clone()
 			}
 		}
-		tombstoneLocations := BlockLocations(tombstoneLocationsVec.GetDownstreamVector().GetBytesAt(i))
+		tombstoneLocations := BlockLocations(tombstoneLocationsVec.GetBytesAt(i))
 		it = tombstoneLocations.MakeIterator()
 		for it.HasNext() {
 			loc := it.Next().GetLocation()
@@ -403,7 +404,7 @@ func readMetaForV12WithTableID(
 
 	data = make(map[string]objectio.Location)
 	tombstone = make(map[string]objectio.Location)
-	tids := vector.MustFixedColNoTypeCheck[uint64](metaBatch.Vecs[MetaSchema_Tid_Idx+2].GetDownstreamVector())
+	tids := vector.MustFixedColNoTypeCheck[uint64](metaBatch.Vecs[MetaSchema_Tid_Idx+2])
 	dataLocationsVec := metaBatch.Vecs[MetaSchema_DataObject_Idx+2]
 	tombstoneLocationsVec := metaBatch.Vecs[MetaSchema_TombstoneObject_Idx+2]
 	start := vector.OrderedFindFirstIndexInSortedSlice(tableID, tids)
@@ -414,7 +415,7 @@ func readMetaForV12WithTableID(
 		if tids[i] != tableID {
 			break
 		}
-		dataLocations := BlockLocations(dataLocationsVec.GetDownstreamVector().GetBytesAt(i))
+		dataLocations := BlockLocations(dataLocationsVec.GetBytesAt(i))
 		it := dataLocations.MakeIterator()
 		for it.HasNext() {
 			loc := it.Next().GetLocation()
@@ -423,7 +424,7 @@ func readMetaForV12WithTableID(
 				data[str] = loc.Clone()
 			}
 		}
-		tombstoneLocations := BlockLocations(tombstoneLocationsVec.GetDownstreamVector().GetBytesAt(i))
+		tombstoneLocations := BlockLocations(tombstoneLocationsVec.GetBytesAt(i))
 		it = tombstoneLocations.MakeIterator()
 		for it.HasNext() {
 			loc := it.Next().GetLocation()
@@ -455,7 +456,7 @@ func readMetaBatch(
 	); err != nil {
 		return
 	}
-	metaBatch = batch.New(ckputil.MetaAttrs)
+	metaBatch = batch.NewWithSize(len(ckputil.MetaAttrs))
 	for i, vec := range metaVecs {
 		metaBatch.Vecs[i] = &vec
 	}
@@ -485,9 +486,31 @@ func readMetaWithTableID(
 	mp *mpool.MPool,
 	fs fileservice.FileService,
 ) (dataRanges, tombstoneRanges []ckputil.TableRange, err error) {
+	meta, err := objectio.FastLoadObjectMeta(ctx, &location, false, fs)
+	if err != nil {
+		return nil, nil, err
+	}
+	// A block's table-ID zone map can prove absence without loading any
+	// columns. IDs inside its bounds still require the exact lookup below.
+	dataMeta := meta.MustGetMeta(objectio.SchemaData)
+	block := dataMeta.GetBlockMeta(uint32(location.ID()))
+	if block.GetMetaColumnCount() > ckputil.MetaSeqnums[0] {
+		column := block.ColumnMeta(ckputil.MetaSeqnums[0])
+		zm := column.ZoneMap()
+		if column.DataType() == uint8(types.T_uint64) && zm.Valid() && zm.GetType() == types.T_uint64 {
+			minBytes, maxBytes := zm.GetMinBuf(), zm.GetMaxBuf()
+			if len(minBytes) == 8 && len(maxBytes) == 8 {
+				minID, maxID := types.DecodeUint64(minBytes), types.DecodeUint64(maxBytes)
+				if minID <= maxID && (tableID < minID || tableID > maxID) {
+					return nil, nil, ctx.Err()
+				}
+			}
+		}
+	}
+
 	tableIDs := containers.NewVectors(1)
-	_, release, _, err := ioutil.LoadColumnsData(
-		ctx, ckputil.MetaSeqnums[:1], ckputil.MetaTypes[:1],
+	release, _, err := ioutil.LoadColumnsDataFromMeta(
+		ctx, dataMeta, ckputil.MetaSeqnums[:1], ckputil.MetaTypes[:1],
 		fs, location, tableIDs, mp, 0,
 	)
 	if err != nil {
@@ -511,7 +534,7 @@ func readMetaWithTableID(
 		sels[i] = int64(start + i)
 	}
 
-	metaBatch := ckputil.NewMetaBatch()
+	metaBatch := ckputil.NewMetaBatch(mp)
 	defer metaBatch.Clean(mp)
 	if _, _, err = ioutil.LoadColumnsDataInto(
 		ctx, ckputil.MetaSeqnums, ckputil.MetaTypes, fs, location,
@@ -597,8 +620,8 @@ func (reader *CKPReader) GetCheckpointData(ctx context.Context) (ckpData *batch.
 	if reader.withTableID {
 		panic("not support")
 	}
-	ckpData = ckputil.MakeDataScanTableIDBatch()
-	tmpBatch := ckputil.MakeDataScanTableIDBatch()
+	ckpData = ckputil.MakeDataScanTableIDBatch(reader.mp)
+	tmpBatch := ckputil.MakeDataScanTableIDBatch(reader.mp)
 	defer tmpBatch.Clean(reader.mp)
 	for {
 		tmpBatch.CleanOnlyData()
@@ -653,10 +676,10 @@ func compatibilityForV12(
 		); err != nil {
 			return err
 		}
-		if err = ckpData.Vecs[ckputil.TableObjectsAttr_DB_Idx].Union(src.Vecs[ObjectInfo_DBID_Idx+2].GetDownstreamVector(), sels, mp); err != nil {
+		if err = ckpData.Vecs[ckputil.TableObjectsAttr_DB_Idx].Union(src.Vecs[ObjectInfo_DBID_Idx+2], sels, mp); err != nil {
 			return err
 		}
-		if err = ckpData.Vecs[ckputil.TableObjectsAttr_Table_Idx].Union(src.Vecs[ObjectInfo_TID_Idx+2].GetDownstreamVector(), sels, mp); err != nil {
+		if err = ckpData.Vecs[ckputil.TableObjectsAttr_Table_Idx].Union(src.Vecs[ObjectInfo_TID_Idx+2], sels, mp); err != nil {
 			return err
 		}
 		if err = vector.AppendMultiFixed(
@@ -668,13 +691,13 @@ func compatibilityForV12(
 		); err != nil {
 			return err
 		}
-		if err = ckpData.Vecs[ckputil.TableObjectsAttr_ID_Idx].Union(src.Vecs[ObjectInfo_ObjectStats_Idx+2].GetDownstreamVector(), sels, mp); err != nil {
+		if err = ckpData.Vecs[ckputil.TableObjectsAttr_ID_Idx].Union(src.Vecs[ObjectInfo_ObjectStats_Idx+2], sels, mp); err != nil {
 			return err
 		}
-		if err = ckpData.Vecs[ckputil.TableObjectsAttr_CreateTS_Idx].Union(src.Vecs[ObjectInfo_CreateAt_Idx+2].GetDownstreamVector(), sels, mp); err != nil {
+		if err = ckpData.Vecs[ckputil.TableObjectsAttr_CreateTS_Idx].Union(src.Vecs[ObjectInfo_CreateAt_Idx+2], sels, mp); err != nil {
 			return err
 		}
-		if err = ckpData.Vecs[ckputil.TableObjectsAttr_DeleteTS_Idx].Union(src.Vecs[ObjectInfo_DeleteAt_Idx+2].GetDownstreamVector(), sels, mp); err != nil {
+		if err = ckpData.Vecs[ckputil.TableObjectsAttr_DeleteTS_Idx].Union(src.Vecs[ObjectInfo_DeleteAt_Idx+2], sels, mp); err != nil {
 			return err
 		}
 		for i := 0; i < src.Length(); i++ {
@@ -683,10 +706,10 @@ func compatibilityForV12(
 				return err
 			}
 		}
-		tids := vector.MustFixedColNoTypeCheck[uint64](src.Vecs[ObjectInfo_TID_Idx+2].GetDownstreamVector())
-		deletes := vector.MustFixedColNoTypeCheck[types.TS](src.Vecs[ObjectInfo_DeleteAt_Idx+2].GetDownstreamVector())
+		tids := vector.MustFixedColNoTypeCheck[uint64](src.Vecs[ObjectInfo_TID_Idx+2])
+		deletes := vector.MustFixedColNoTypeCheck[types.TS](src.Vecs[ObjectInfo_DeleteAt_Idx+2])
 		for i := 0; i < src.Length(); i++ {
-			objectStats := objectio.ObjectStats(src.Vecs[ObjectInfo_ObjectStats_Idx+2].GetDownstreamVector().GetBytesAt(i))
+			objectStats := objectio.ObjectStats(src.Vecs[ObjectInfo_ObjectStats_Idx+2].GetBytesAt(i))
 			ckputil.EncodeCluser(encoder, tids[i], dataType, objectStats.ObjectName().ObjectId(), deletes[i].IsEmpty())
 			if err = vector.AppendBytes(ckpData.Vecs[ckputil.TableObjectsAttr_Cluster_Idx], encoder.Bytes(), false, mp); err != nil {
 				return err
@@ -724,7 +747,7 @@ func (reader *CKPReader) ForEachRow(
 	if reader.withTableID {
 		panic("not support")
 	}
-	tmpBatch := ckputil.MakeDataScanTableIDBatch()
+	tmpBatch := ckputil.MakeDataScanTableIDBatch(reader.mp)
 	defer tmpBatch.Clean(reader.mp)
 	defer reader.ckpDataReader.Reset(ctx)
 	for {
@@ -769,7 +792,7 @@ func (reader *CKPReader) ConsumeCheckpointWithTableID(
 		panic("not support")
 	}
 	if reader.version <= CheckpointVersion12 {
-		tmpBatch := ckputil.MakeDataScanTableIDBatch()
+		tmpBatch := ckputil.MakeDataScanTableIDBatch(reader.mp)
 		defer tmpBatch.Clean(reader.mp)
 		defer reader.ckpDataReader.Reset(ctx)
 		for {
@@ -1204,7 +1227,7 @@ func (reader *SyncTableIDReader) Read(ctx context.Context) (release func(), bat 
 	); err != nil {
 		return
 	}
-	bat = batch.New(TableIDAttrs)
+	bat = batch.NewWithSize(len(TableIDAttrs))
 	for i, vec := range preTableIDVecs {
 		bat.Vecs[i] = &vec
 	}

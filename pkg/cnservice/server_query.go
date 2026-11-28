@@ -47,6 +47,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/ctl"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/udf"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
@@ -156,6 +157,7 @@ func (s *service) initQueryCommandHandler() {
 	s.addQueryCommandHandler(query.CmdMethod_RunTask, s.handleRunTask)
 	s.addQueryCommandHandler(query.CmdMethod_RemoveRemoteLockTable, s.handleRemoveRemoteLockTable)
 	s.addQueryCommandHandler(query.CmdMethod_UnsubscribeTable, s.handleUnsubscribeTable)
+	s.addQueryCommandHandler(query.CmdMethod_CountCachedObjectFiles, s.handleCountCachedObjectFiles)
 	s.addQueryCommandHandler(query.CmdMethod_GetCacheData, s.handleGetCacheData)
 	s.addQueryCommandHandler(query.CmdMethod_GetStatsInfo, s.handleGetStatsInfo)
 	s.addQueryCommandHandler(query.CmdMethod_GetPipelineInfo, s.handleGetPipelineInfo)
@@ -180,6 +182,7 @@ func (s *service) initQueryCommandHandler() {
 	s.addQueryCommandHandler(query.CmdMethod_ISCPDrainConsumer, s.handleISCPDrainConsumer)
 	s.addQueryCommandHandler(query.CmdMethod_IcebergCacheInvalidate, s.handleIcebergCacheInvalidate)
 	s.addQueryCommandHandler(query.CmdMethod_MongoDBClientRetire, s.handleMongoDBClientRetire)
+	s.addQueryCommandHandler(query.CmdMethod_GetPythonUdfStatus, s.handleGetPythonUdfStatus)
 }
 
 func (s *service) addQueryCommandHandler(
@@ -647,6 +650,23 @@ func (s *service) handleUnsubscribeTable(ctx context.Context, req *query.Request
 	return nil
 }
 
+func (s *service) handleCountCachedObjectFiles(ctx context.Context, req *query.Request, resp *query.Response, _ *morpc.Buffer) error {
+	probe := req.CountCachedObjectFilesRequest
+	if probe == nil {
+		return moerr.NewInvalidInput(ctx, "missing object cache probe")
+	}
+	fs, err := fileservice.Get[fileservice.FileService](s.fileService, defines.SharedFileServiceName)
+	if err != nil {
+		return err
+	}
+	hits, err := objectio.CountCachedObjectFiles(ctx, fs, probe.ObjectIds)
+	if err != nil {
+		return err
+	}
+	resp.CountCachedObjectFilesResponse = &query.CountCachedObjectFilesResponse{Hits: uint32(hits)}
+	return nil
+}
+
 // handleGetCacheData reads the cache data from the local data cache in fileservice.
 func (s *service) handleGetCacheData(ctx context.Context, req *query.Request, resp *query.Response, _ *morpc.Buffer) error {
 	sharedFS, err := fileservice.Get[fileservice.FileService](s.fileService, defines.SharedFileServiceName)
@@ -696,6 +716,50 @@ func (s *service) handleGetPipelineInfo(ctx context.Context, req *query.Request,
 	return nil
 }
 
+// handleGetPythonUdfStatus exposes the CN-local runtime state to the Operator.
+// The runtime provider owns the capability handshake and returns only a
+// bounded summary; this handler never accepts source or creates invocation
+// state. Returning a status payload for a disabled or mismatched runtime lets
+// the Operator fail closed for Python while ordinary CN query traffic remains
+// available.
+func (s *service) handleGetPythonUdfStatus(ctx context.Context, _ *query.Request, resp *query.Response, _ *morpc.Buffer) error {
+	status := udf.RuntimeStatusSnapshot{
+		Language:   udf.LanguagePython,
+		ErrorClass: udf.RuntimeStatusUnavailable,
+		Reason:     udf.RuntimeStatusReasonStatusUnavailable,
+	}
+	if provider, ok := s.udfService.(udf.RuntimeStatusProvider); ok {
+		status = provider.StatusSnapshot(ctx, udf.LanguagePython)
+	}
+	resp.GetPythonUdfStatus = query.GetPythonUdfStatusResponse{
+		CNUUID:                     s.metadata.UUID,
+		Language:                   status.Language,
+		Enabled:                    status.Enabled,
+		AllowUnisolated:            status.AllowUnisolated,
+		Ready:                      status.Ready,
+		ErrorClass:                 status.ErrorClass,
+		Reason:                     status.Reason,
+		ProtocolVersion:            status.ProtocolVersion,
+		ABIContract:                status.ABIContract,
+		AdapterVersion:             status.AdapterVersion,
+		SDKVersion:                 status.SDKVersion,
+		DefinitionSchemaVersion:    status.DefinitionSchemaVersion,
+		PlanContractVersion:        status.PlanContractVersion,
+		TypeDescriptorContract:     status.TypeDescriptorContract,
+		TimezoneDatabaseVersion:    status.TimezoneDatabaseVersion,
+		WindowBatches:              status.WindowBatches,
+		CumulativeAck:              status.CumulativeAck,
+		MaxExecutionFrameBytes:     status.MaxExecutionFrameBytes,
+		MaxHandlerProcesses:        status.MaxHandlerProcesses,
+		MaxAccountHandlerProcesses: status.MaxAccountHandlerProcesses,
+		MaxOwnerHandlerProcesses:   status.MaxOwnerHandlerProcesses,
+		LeaseEpoch:                 status.LeaseEpoch,
+		Modes:                      append([]string(nil), status.Modes...),
+		NullPolicies:               append([]string(nil), status.NullPolicies...),
+	}
+	return nil
+}
+
 func (s *service) handleMigrateConnFrom(
 	ctx context.Context, req *query.Request, resp *query.Response, _ *morpc.Buffer,
 ) error {
@@ -725,13 +789,14 @@ func (s *service) handleMigrateConnTo(
 		logutil.Errorf("failed to migrate conn to: %v", err)
 		return err
 	}
+	resp.MigrateConnToResponse = &query.MigrateConnToResponse{Success: true, PrincipalVerified: true}
+	if req.MigrateConnToRequest.VerifyPrincipalOnly {
+		return nil
+	}
 	logutil.Infof("migrate ok, conn ID: %d, DB: %s, prepared stmt count: %d",
 		req.MigrateConnToRequest.ConnID, req.MigrateConnToRequest.DB, len(req.MigrateConnToRequest.PrepareStmts))
 	for _, stmt := range req.MigrateConnToRequest.PrepareStmts {
 		logutil.Infof("migrated prepare stmt on conn %d, %s, %s", req.MigrateConnToRequest.ConnID, stmt.Name, stmt.SQL)
-	}
-	resp.MigrateConnToResponse = &query.MigrateConnToResponse{
-		Success: true,
 	}
 	return nil
 }

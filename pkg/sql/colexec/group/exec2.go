@@ -15,7 +15,6 @@
 package group
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"math"
@@ -75,12 +74,12 @@ func hasInactiveGroupingColumn(flags []bool) bool {
 	return false
 }
 
-// UsesGroupingAwareHash reports whether partial group keys use the extended
-// hash grammar that distinguishes a rolled-up grouping sentinel from SQL NULL.
-// MergeGroup must know this from the plan: an individual partial can contain
-// only the fully active grouping set and therefore carry no sentinel bits even
-// though later partials in the same stream do.
-func (group *Group) UsesGroupingAwareHash() bool {
+// ProducesGroupingSets reports whether this group emits grouping-set rows, in
+// which a rolled-up key is a NULL constant regardless of its declared type.
+// Its hash table must therefore keep NULL keys. MergeGroup must know this from
+// the plan: an individual partial can contain only the fully active grouping
+// set and therefore carry no rolled-up NULLs even though later partials do.
+func (group *Group) ProducesGroupingSets() bool {
 	return group != nil &&
 		(group.DynamicGrouping || hasInactiveGroupingColumn(group.GroupingFlag))
 }
@@ -109,24 +108,13 @@ func (group *Group) Prepare(proc *process.Process) (err error) {
 		if err != nil {
 			return err
 		}
+		if err = group.ctr.bindAllocationViews(proc); err != nil {
+			return err
+		}
 		if err = group.ctr.installRecoveryCapacity(); err != nil {
 			return err
 		}
 	}
-	group.ctr.legacyTextMinMax = useLegacyTextMinMaxForRemote(proc)
-	group.ctr.legacyVarianceState = useLegacyVarianceStateForRemote(proc)
-	group.ctr.legacyDecimalSumState = useLegacyDecimalSumState(proc)
-	group.ctr.legacyDecimalSumResult = useLegacyDecimalSumResultForRemote(proc, group.NeedEval)
-	group.ctr.legacyApproxPercentileState = useLegacyApproxPercentileStateForRemote(proc)
-	group.ctr.legacyHLLState = useLegacyHLLStateForRemote(proc)
-	group.ctr.floatZeroHLLState = useFloatZeroHLLStateForRemote(proc)
-	group.ctr.legacyVectorHLLState = useLegacyVectorHLLStateForRemote(proc)
-	group.ctr.legacyTextHLLAddState = useLegacyTextHLLAddStateForRemote(proc)
-	group.ctr.legacyFloatHLLAddState = useLegacyFloatHLLAddStateForRemote(proc)
-	// Freeze the FLOAT DISTINCT key policy before makeAggList creates any
-	// states. A pre-v79 remote producer keeps every legacy float key (including
-	// distinct NaN payloads); local and v79+ execution uses canonical keys.
-	group.ctr.legacyDistinctFloatKeys = !canonicalDistinctKeyWireEnabled(proc)
 	group.ctr.timeZone = proc.Base.SessionInfo.TimeZone
 
 	// debug,
@@ -171,18 +159,17 @@ func (group *Group) Prepare(proc *process.Process) (err error) {
 }
 
 func (group *Group) prepareGroupAndAggArg(proc *process.Process) (err error) {
-	group.ctr.legacyH8CharSemantics = false
 	if len(group.ctr.groupByEvaluate.Executor) == len(group.GroupBy) {
 		group.ctr.groupByEvaluate.ResetForNextQuery()
 	} else {
 		// calculate the key width and key nullable, and hash table type.
-		group.ctr.keyWidth, group.ctr.keyNullable = 0, false
+		// A rolled-up key is a NULL constant even when its expression is NOT NULL.
+		group.ctr.keyWidth, group.ctr.keyNullable = 0, group.ProducesGroupingSets()
 		hashKeyCount := len(group.GroupBy)
 		if len(group.GroupByHashKey) > 0 {
 			hashKeyCount = len(group.GroupByHashKey)
 		}
 		compactHashKey := true
-		variableLengthKey := false
 		for i := 0; i < hashKeyCount; i++ {
 			exprIdx := i
 			if len(group.GroupByHashKey) > 0 {
@@ -206,12 +193,11 @@ func (group *Group) prepareGroupAndAggArg(proc *process.Process) (err error) {
 				// variable-length keys on the length-delimited HStr codec, even
 				// when their declared width happens to fit in eight bytes.
 				compactHashKey = false
-				variableLengthKey = true
 			}
 			width := GetKeyWidth(types.T(expr.Typ.Id), expr.Typ.Width, group.ctr.keyNullable)
 			// Width only selects the hash-key codec. A LONGTEXT key plus its
 			// NULL marker already exceeds int32; wrapping a composite width can
-			// misclassify real keys as H0 or legacy H8. Saturate wide estimates
+			// misclassify real keys as H0 or H8. Saturate wide estimates
 			// while preserving exact widths for the eight-byte fast path.
 			if width < 0 || width > math.MaxInt32-int(group.ctr.keyWidth) {
 				group.ctr.keyWidth = math.MaxInt32
@@ -220,12 +206,9 @@ func (group *Group) prepareGroupAndAggArg(proc *process.Process) (err error) {
 			}
 		}
 
-		legacyShortVariableKey := variableLengthKey && group.ctr.keyWidth <= 8 &&
-			!groupHashStringWireEnabled(proc)
-		group.ctr.legacyH8CharSemantics = legacyShortVariableKey
 		if hashKeyCount == 0 {
 			group.ctr.mtyp = H0
-		} else if (compactHashKey || legacyShortVariableKey) && group.ctr.keyWidth <= 8 {
+		} else if compactHashKey && group.ctr.keyWidth <= 8 {
 			group.ctr.mtyp = H8
 		} else {
 			group.ctr.mtyp = HStr
@@ -235,19 +218,6 @@ func (group *Group) prepareGroupAndAggArg(proc *process.Process) (err error) {
 		// expects the historical H8 producer behavior. Keep that legacy wire until
 		// the shared rollout gate reaches v78; the planner prevents new plans from
 		// creating a new short-varlen remote boundary before then.
-
-		group.ctr.groupingAware = false
-		if group.DynamicGrouping {
-			group.ctr.mtyp = HStr
-			group.ctr.groupingAware = true
-		}
-		for _, flag := range group.GroupingFlag {
-			if !flag {
-				group.ctr.mtyp = HStr
-				group.ctr.groupingAware = true
-				break
-			}
-		}
 
 		// create group by evaluate
 		group.ctr.groupByEvaluate.Free()
@@ -558,13 +528,13 @@ func (group *Group) ensureRuntimeEmptyGroupingSet() error {
 	if len(group.ctr.aggList) != len(group.Aggs) {
 		group.ctr.aggList, err = group.ctr.makeAggList(group.Aggs)
 		if err != nil {
-			output.Clean(group.ctr.mp)
+			group.ctr.cleanGroupBatch(output)
 			return err
 		}
 	}
 	for _, agg := range group.ctr.aggList {
 		if err = agg.GroupGrow(1); err != nil {
-			output.Clean(group.ctr.mp)
+			group.ctr.cleanGroupBatch(output)
 			return err
 		}
 	}
@@ -656,7 +626,7 @@ func (group *Group) buildOneBatch(proc *process.Process, bat *batch.Batch) (bool
 		count := bat.RowCount()
 		var hashBytesBefore int64
 		var compactHitRows int64
-		compactEligible := !group.DynamicGrouping && !group.ctr.groupingAware && !group.ctr.legacyH8CharSemantics &&
+		compactEligible := !group.ProducesGroupingSets() &&
 			compactGroupExpressions(group.GroupBy)
 		if !group.ctr.hr.IsEmpty() {
 			hashBytesBefore = group.ctr.hr.Hash.Size()
@@ -982,22 +952,11 @@ func (ctr *container) buildHashTable(ctx context.Context, preAllocated uint64) e
 		false,
 		ctr.mtyp == HStr,
 		ctr.keyNullable,
-		ctr.groupingAware,
 		preAllocated,
 		ctr.hashAllocation,
 		ctr.hashIterator,
 	); err != nil {
 		return err
-	}
-	if ctr.mtyp == H8 && ctr.legacyH8CharSemantics {
-		legacy, ok := ctr.hr.Hash.(*hashmap.IntHashMap)
-		if !ok {
-			return moerr.NewInternalErrorNoCtx(
-				"legacy H8 CHAR semantics require IntHashMap")
-		}
-		if err := legacy.SetLegacyCharPadding(true); err != nil {
-			return err
-		}
 	}
 
 	// pre-allocate groups for each agg.
@@ -1064,7 +1023,7 @@ func (ctr *container) preflightBuildChunk(
 				return mpool.ErrAllocationAccountInvariant
 			}
 			preflight, err := destination.PreExtendSelectedBatchValidated(
-				vs[i], offset, rows, flags, targetRows, ctr.mp,
+				vs[i], offset, rows, flags, targetRows, ctr.groupByMP(),
 			)
 			if err != nil {
 				return err
@@ -1203,14 +1162,14 @@ func (ctr *container) createNewGroupByBatch(
 	return ctr.createNewGroupByBatchWithAllocation(
 		vs,
 		size,
-		ctr.groupByAllocation,
+		ctr.groupByMP(),
 	)
 }
 
 func (ctr *container) createNewGroupByBatchWithAllocation(
 	vs []*vector.Vector,
 	size int,
-	allocation *vector.AllocationAccountSelection,
+	mp *mpool.MPool,
 ) (*batch.Batch, error) {
 	// initialize the groupByTypes.   this is again very bad design.
 	// types should be resolved at plan time.
@@ -1220,16 +1179,12 @@ func (ctr *container) createNewGroupByBatchWithAllocation(
 		}
 	}
 
-	b := batch.NewOffHeapWithSize(len(ctr.groupByTypes))
+	b := batch.NewWithSize(len(ctr.groupByTypes))
 	for i, typ := range ctr.groupByTypes {
-		b.Vecs[i] = vector.NewOffHeapVecWithType(typ)
+		b.Vecs[i] = vector.NewVec(typ, mp)
 	}
-	if err := b.SetAllocationAccount(allocation); err != nil {
-		b.Clean(ctr.mp)
-		return nil, err
-	}
-	if err := b.PreExtend(ctr.mp, size); err != nil {
-		b.Clean(ctr.mp)
+	if err := b.PreExtend(mp, size); err != nil {
+		ctr.cleanGroupBatch(b)
 		return nil, err
 	}
 	b.SetRowCount(0)
@@ -1284,7 +1239,7 @@ func (ctr *container) appendGroupByBatch(
 			preflight = &preflights[i]
 		}
 		if err := vec.UnionBatchPreflighted(
-			vs[i], int64(offset), len(thisTime), thisTime, preflight, ctr.mp); err != nil {
+			vs[i], int64(offset), len(thisTime), thisTime, preflight, ctr.groupByMP()); err != nil {
 			return err
 		}
 	}
@@ -1359,6 +1314,40 @@ func (group *Group) outputOneBatch(proc *process.Process) (vm.CallResult, error)
 	}
 }
 
+// pooledWriter is an io.Writer over memory allocated from mp, for partial
+// results written without an allocation account. detach hands the bytes to a
+// new owner; free releases whatever was not detached.
+type pooledWriter struct {
+	mp   *mpool.MPool
+	data []byte
+}
+
+func (w *pooledWriter) Write(p []byte) (int, error) {
+	n := len(w.data)
+	if n+len(p) > cap(w.data) {
+		grown, err := w.mp.Grow(w.data, n+len(p), true)
+		if err != nil {
+			return 0, err
+		}
+		w.data = grown
+	}
+	w.data = append(w.data[:n], p...)
+	return len(p), nil
+}
+
+func (w *pooledWriter) detach() []byte {
+	data := w.data
+	w.data = nil
+	return data
+}
+
+func (w *pooledWriter) free() {
+	if cap(w.data) != 0 {
+		w.mp.Free(w.data)
+	}
+	w.data = nil
+}
+
 func (group *Group) getNextIntermediateResult(proc *process.Process) (vm.CallResult, bool, error) {
 	// the groupby batches are now in groupbybatches, partial agg result is in agglist.
 	// now, we need to stream the partial results in the group by batch as aggs.
@@ -1377,10 +1366,11 @@ func (group *Group) getNextIntermediateResult(proc *process.Process) (vm.CallRes
 	// dump group state to a vector and put the vector into the batch.
 	// But well,
 	var (
-		legacyBuffer bytes.Buffer
-		accounted    *mpool.AccountedBuffer
-		writer       io.Writer = &legacyBuffer
+		pooled    = pooledWriter{mp: proc.Mp()}
+		accounted *mpool.AccountedBuffer
+		writer    io.Writer = &pooled
 	)
+	defer pooled.free()
 	if group.ctr.allocationAccount != nil {
 		var err error
 		accounted, err = mpool.NewAccountedBuffer(
@@ -1407,27 +1397,8 @@ func (group *Group) getNextIntermediateResult(proc *process.Process) (vm.CallRes
 	}
 	for _, ag := range group.ctr.aggList {
 		aggexec.SetGroupConcatSourceRowWire(ag, groupConcatSourceRowWireEnabled(proc))
-		aggexec.SetGroupConcatSourceRowProvenanceWire(
-			ag, groupConcatSourceRowProvenanceWireEnabled(proc))
-		// The FLOAT DISTINCT membership policy is frozen when the aggregate
-		// state is admitted. If the capability gate advances while a prepared
-		// Group is draining, keep legacy-policy state on the legacy framing;
-		// the v79 marker would make a receiver treat legacy float bytes as
-		// already canonical and preserve distinct NaN payloads incorrectly.
-		canonicalDistinctWire := canonicalDistinctKeyWireEnabled(proc) &&
-			!group.ctr.legacyDistinctFloatKeys
-		if aggexec.RequiresModernDistinctFloatKeyWire(ag) &&
-			!canonicalDistinctWire {
-			return vm.CancelResult, false, moerr.NewInvalidStateNoCtx(
-				"modern FLOAT DISTINCT key state requires MORPCVersion79")
-		}
-		aggexec.SetCanonicalDistinctKeyWire(
-			ag, canonicalDistinctWire)
-		if aggexec.RequiresCanonicalDistinctKeyWire(ag) &&
-			!canonicalDistinctKeyWireEnabled(proc) {
-			return vm.CancelResult, false, moerr.NewInvalidStateNoCtx(
-				"canonical DISTINCT argument keys require MORPCVersion79")
-		}
+		aggexec.SetGroupConcatSourceRowProvenanceWire(ag, proc != nil)
+		aggexec.SetCanonicalDistinctKeyWire(ag, true)
 		if err := ag.SaveIntermediateResultOfChunk(curr, writer); err != nil {
 			return vm.CancelResult, false, err
 		}
@@ -1437,8 +1408,7 @@ func (group *Group) getNextIntermediateResult(proc *process.Process) (vm.CallRes
 			return vm.CancelResult, false, err
 		}
 	} else {
-		batch.DropExtraBuffer()
-		batch.ExtraBuf = legacyBuffer.Bytes()
+		batch.AdoptExtraBuf(pooled.mp, pooled.detach())
 	}
 
 	res := vm.NewCallResult()

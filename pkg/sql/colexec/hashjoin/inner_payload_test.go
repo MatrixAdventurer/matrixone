@@ -32,15 +32,13 @@ import (
 
 func TestNonuniqueInnerLongProbePayloadCapacity(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		matches    int
-		probeRows  int
-		dictionary bool
+		name      string
+		matches   int
+		probeRows int
 	}{
 		{name: "duplicate group", matches: 128, probeRows: 1},
 		{name: "across gather chunks", matches: 2*hashmap.UnitLimit + 1, probeRows: 1},
 		{name: "different probe values", matches: 128, probeRows: 2},
-		{name: "dictionary bulk control", matches: 128, probeRows: 1, dictionary: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keyType, textType := types.T_int64.ToType(), types.T_varchar.ToType()
@@ -50,13 +48,7 @@ func TestNonuniqueInnerLongProbePayloadCapacity(t *testing.T) {
 			join.arg.LeftTypes, join.arg.RightTypes = []types.Type{keyType, textType}, []types.Type{keyType}
 			registry, err := mpool.NewAllocationAccountRegistry(1, 128)
 			require.NoError(t, err)
-			limit := uint64(64 << 10)
-			if tc.dictionary {
-				// The existing dictionary repeat copier stores each payload.
-				// This control preserves its bulk-copy route and footprint.
-				limit = 4 << 20
-			}
-			account, err := registry.Open(limit)
+			account, err := registry.Open(64 << 10)
 			require.NoError(t, err)
 			t.Cleanup(func() {
 				require.Zero(t, account.Snapshot().Used)
@@ -64,16 +56,18 @@ func TestNonuniqueInnerLongProbePayloadCapacity(t *testing.T) {
 				require.NoError(t, err)
 			})
 			// Bound result copies independently of the retained build hash table.
-			join.arg.resultAllocation, err = vector.NewAllocationAccountSelection(account, mpool.AllocationOwnerHashBuild,
-				hashJoinAllocationSiteResultData, hashJoinAllocationSiteResultArea)
+			join.arg.resultAllocation, err = mpool.NewAccountBinding(account, mpool.AllocationOwnerHashBuild,
+				hashJoinAllocationSiteResultData)
 			require.NoError(t, err)
-			probe := batch.NewWithSchema(false, nil, join.arg.LeftTypes)
-			build := batch.NewWithSchema(false, nil, join.arg.RightTypes)
+			probe := batch.NewWithTypes(join.arg.LeftTypes, join.proc.Mp())
+			build := batch.NewWithTypes(join.arg.RightTypes, join.proc.Mp())
 			t.Cleanup(func() {
 				join.arg.Reset(join.proc, false, nil)
 				join.barg.Reset(join.proc, false, nil)
 				join.arg.Free(join.proc, false, nil)
+				freeTestChildren(join.arg)
 				join.barg.Free(join.proc, false, nil)
+				freeTestChildren(join.barg)
 				probe.Clean(join.proc.Mp())
 				build.Clean(join.proc.Mp())
 				join.proc.GetMessageBoard().Reset()
@@ -86,16 +80,6 @@ func TestNonuniqueInnerLongProbePayloadCapacity(t *testing.T) {
 				require.NoError(t, vector.AppendBytes(probe.Vecs[1], []byte(strings.Repeat(string(rune('a'+row)), 4096)), false, join.proc.Mp()))
 			}
 			probe.SetRowCount(tc.probeRows)
-			if tc.dictionary {
-				selected := make([]*vector.Vector, len(probe.Vecs))
-				admitted, err := vector.TrySelectDictionaryVectors(probe.Vecs, selected, []int64{0}, 1, join.proc.Mp(), nil)
-				require.NoError(t, err)
-				require.True(t, admitted)
-				for _, v := range probe.Vecs {
-					v.Free(join.proc.Mp())
-				}
-				probe.Vecs = selected
-			}
 			for range tc.matches {
 				require.NoError(t, vector.AppendFixed(build.Vecs[0], int64(1), false, join.proc.Mp()))
 			}
@@ -110,15 +94,88 @@ func TestNonuniqueInnerLongProbePayloadCapacity(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.probeRows*tc.matches, result.Batch.RowCount())
 			area := tc.probeRows * 4096
-			if tc.dictionary {
-				area *= tc.matches
-			}
 			require.Equal(t, area, len(result.Batch.Vecs[0].GetArea()))
 			for row := range result.Batch.RowCount() {
 				require.Equal(t, strings.Repeat(string(rune('a'+row/tc.matches)), 4096), string(result.Batch.Vecs[0].GetBytesAt(row)))
 			}
 		})
 	}
+}
+
+// A group larger than one gather has both a shared probe string and mixed
+// build widths. The second probe must resume partway through its duplicates.
+func TestInnerGatherResumesWideGroup(t *testing.T) {
+	previous := mpool.CapLimit
+	mpool.CapLimit = 1 << 20
+	t.Cleanup(func() { mpool.CapLimit = previous })
+	key, str := types.T_int64.ToType(), types.T_varchar.ToType()
+	arg := newTestCase(t, []types.Type{key, key}, nil, [][]*plan.Expr{{newExpr(0, key)}, {newExpr(0, key)}})
+	arg.arg.JoinType, arg.arg.NonEqCond = plan.Node_INNER, nil
+	arg.arg.LeftTypes, arg.arg.RightTypes = []types.Type{key, str}, []types.Type{key, key, str}
+	arg.arg.ResultCols = []colexec.ResultPos{{Rel: 0, Pos: 1}, {Rel: 1, Pos: 1}, {Rel: 1, Pos: 2}}
+	mp := arg.proc.Mp()
+	probe, build := batch.NewWithTypes(arg.arg.LeftTypes, mp), batch.NewWithTypes(arg.arg.RightTypes, mp)
+	t.Cleanup(func() {
+		arg.arg.Reset(arg.proc, false, nil)
+		arg.barg.Reset(arg.proc, false, nil)
+		arg.arg.Free(arg.proc, false, nil)
+		arg.barg.Free(arg.proc, false, nil)
+		freeTestChildren(arg.arg)
+		freeTestChildren(arg.barg)
+		probe.Clean(mp)
+		build.Clean(mp)
+		arg.proc.GetMessageBoard().Reset()
+		arg.cancel()
+		arg.proc.Free()
+		require.Zero(t, mp.CurrNB())
+	})
+	probeValues := []string{strings.Repeat("a", 100), strings.Repeat("b", 100)}
+	for _, value := range probeValues {
+		require.NoError(t, vector.AppendFixed(probe.Vecs[0], int64(1), false, mp))
+		require.NoError(t, vector.AppendBytes(probe.Vecs[1], []byte(value), false, mp))
+	}
+	probe.SetRowCount(len(probeValues))
+	const matches = 300
+	wide := strings.Repeat("z", int(outputAreaTarget()/hashmap.UnitLimit))
+	for id := range matches {
+		value := "short"
+		if id < 200 {
+			value = wide
+		}
+		require.NoError(t, vector.AppendFixed(build.Vecs[0], int64(1), false, mp))
+		require.NoError(t, vector.AppendFixed(build.Vecs[1], int64(id), false, mp))
+		require.NoError(t, vector.AppendBytes(build.Vecs[2], []byte(value), false, mp))
+	}
+	build.SetRowCount(matches)
+	resetHashBuildChildrenWithBatch(arg.barg, build)
+	resetChildrenWithBatch(arg.arg, probe)
+	require.NoError(t, arg.barg.Prepare(arg.proc))
+	require.NoError(t, arg.arg.Prepare(arg.proc))
+	_, err := vm.Exec(arg.barg, arg.proc)
+	require.NoError(t, err)
+	next := 0
+	for _, rows := range []int{356, 244} {
+		out, err := vm.Exec(arg.arg, arg.proc)
+		require.NoError(t, err)
+		require.Equal(t, rows, out.Batch.RowCount())
+		first := next / matches
+		for i := range rows {
+			id := next % matches
+			require.Equal(t, int64(id), vector.GetFixedAtNoTypeCheck[int64](out.Batch.Vecs[1], i))
+			require.Equal(t, probeValues[next/matches], string(out.Batch.Vecs[0].GetBytesAt(i)))
+			want := "short"
+			if id < 200 {
+				want = wide
+			}
+			require.Equal(t, want, string(out.Batch.Vecs[2].GetBytesAt(i)))
+			next++
+		}
+		require.Len(t, out.Batch.Vecs[0].GetArea(), ((next-1)/matches-first+1)*len(probeValues[0]))
+		require.LessOrEqual(t, int64(len(out.Batch.Vecs[2].GetArea())), outputAreaTarget())
+	}
+	end, err := vm.Exec(arg.arg, arg.proc)
+	require.NoError(t, err)
+	require.Equal(t, vm.ExecStop, end.Status)
 }
 
 func BenchmarkHashJoinSmallDuplicatePayload(b *testing.B) {
@@ -141,7 +198,9 @@ func BenchmarkHashJoinSmallDuplicatePayload(b *testing.B) {
 				tc.arg.Reset(tc.proc, false, nil)
 				tc.barg.Reset(tc.proc, false, nil)
 				tc.arg.Free(tc.proc, false, nil)
+				freeTestChildren(tc.arg)
 				tc.barg.Free(tc.proc, false, nil)
+				freeTestChildren(tc.barg)
 				probe.Clean(tc.proc.Mp())
 				build.Clean(tc.proc.Mp())
 				tc.proc.GetMessageBoard().Reset()
@@ -150,10 +209,10 @@ func BenchmarkHashJoinSmallDuplicatePayload(b *testing.B) {
 				require.Zero(b, tc.proc.Mp().CurrNB())
 			})
 			for col := range probe.Vecs {
-				probe.Vecs[col] = vector.NewVec(typ)
+				probe.Vecs[col] = vector.NewVec(typ, tc.proc.Mp())
 			}
 			for col := range build.Vecs {
-				build.Vecs[col] = vector.NewVec(typ)
+				build.Vecs[col] = vector.NewVec(typ, tc.proc.Mp())
 			}
 			const groups = 512
 			for row := range groups * duplicates {
@@ -180,7 +239,7 @@ func BenchmarkHashJoinSmallDuplicatePayload(b *testing.B) {
 			require.NoError(b, tc.arg.build(tc.arg.OpAnalyzer, tc.proc))
 			require.False(b, tc.arg.ctr.probeHashOnPK)
 			run := func() {
-				require.NoError(b, tc.arg.resetResultBat())
+				require.NoError(b, tc.arg.resetResultBat(tc.proc))
 				ctr := &tc.arg.ctr
 				ctr.leftBat = probe
 				ctr.lastIdx = 0

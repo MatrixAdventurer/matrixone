@@ -58,7 +58,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/plan"
 	planfunction "github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
-	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	hnswruntime "github.com/matrixorigin/matrixone/pkg/vectorindex/hnsw/plugin/runtime"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
@@ -167,28 +166,6 @@ func installDDLLineageLifecycleTestExecutor(t *testing.T, proc *process.Process)
 			rt.CompareAndDeleteGlobalVariables(moruntime.InternalSQLExecutor, exec)
 		}
 	})
-}
-
-func TestRequireCheckRenameProtocol(t *testing.T) {
-	proc := testutil.NewProcess(t)
-	c := &Compile{proc: proc}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	original, hadOriginal := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	defer func() {
-		if hadOriginal {
-			rt.SetGlobalVariables(moruntime.MOProtocolVersion, original)
-		} else {
-			rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCLatestVersion)
-		}
-	}()
-
-	checks := []*plan2.CheckDef{{OriginSql: "`renamed_col` > 0"}}
-	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion14)
-	require.ErrorContains(t, c.requireCheckRenameProtocol(checks), "protocol version 15")
-	require.NoError(t, c.requireCheckRenameProtocol(nil))
-
-	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion15)
-	require.NoError(t, c.requireCheckRenameProtocol(checks))
 }
 
 func TestValidateAlterForeignKeyNameActionsUsesSequentialState(t *testing.T) {
@@ -1053,45 +1030,6 @@ func TestCreateIndexLockProtocol(t *testing.T) {
 		err := newScope().CreateIndex(newCompile(t, eng))
 		require.ErrorIs(t, err, stop)
 	})
-}
-
-func TestAdvanceCreateIndexSnapshotUsesRollingUpgradeFence(t *testing.T) {
-	const service = "create-index-legacy-logtail-fence"
-	frontier := timestamp.Timestamp{PhysicalTime: 125, LogicalTime: 3}
-
-	rt := moruntime.NewRuntime(
-		metadata.ServiceType_CN,
-		service,
-		nil,
-		moruntime.WithClock(clock.NewHLCClock(func() int64 { return 100 }, 20*time.Nanosecond)),
-	)
-	moruntime.SetupServiceBasedRuntime(service, rt)
-	rt.SetGlobalVariables(moruntime.MOProtocolVersion, defines.MORPCVersion38)
-
-	ctrl := gomock.NewController(t)
-	lockService := mock_lock.NewMockLockService(ctrl)
-	lockService.EXPECT().GetConfig().Return(lockservice.Config{ServiceID: service}).AnyTimes()
-	txnClient := mock_frontend.NewMockTxnClient(ctrl)
-	txnClient.EXPECT().WaitLogTailAppliedAt(
-		gomock.Any(),
-		timestamp.Timestamp{PhysicalTime: 121},
-	).Return(frontier, nil)
-	workspace := mock_frontend.NewMockWorkspace(ctrl)
-	workspace.EXPECT().AdvanceSnapshot(gomock.Any(), frontier).Return(nil)
-	txnOp := mock_frontend.NewMockTxnOperator(ctrl)
-	txnOp.EXPECT().Txn().Return(txn.TxnMeta{
-		Mode:      txn.TxnMode_Pessimistic,
-		Isolation: txn.TxnIsolation_RC,
-	}).AnyTimes()
-	txnOp.EXPECT().GetWorkspace().Return(workspace)
-	txnOp.EXPECT().SnapshotTS().Return(frontier.Next())
-
-	proc := testutil.NewProcess(t)
-	proc.Base.LockService = lockService
-	proc.Base.TxnClient = txnClient
-	proc.Base.TxnOperator = txnOp
-
-	require.NoError(t, (&Compile{proc: proc}).advanceIndexDDLSnapshot())
 }
 
 type testCreateIndexLogtailBarrier struct {
@@ -2882,8 +2820,8 @@ func TestCheckSysMoCatalogPitrResult(t *testing.T) {
 	})
 
 	t.Run("insert needed", func(t *testing.T) {
-		v1 := vector.NewVec(types.T_uint64.ToType())
-		v2 := vector.NewVec(types.T_varchar.ToType())
+		v1 := vector.NewVec(types.T_uint64.ToType(), mp)
+		v2 := vector.NewVec(types.T_varchar.ToType(), mp)
 		// no data in vectors
 		needInsert, needUpdate, length, unit, err := CheckSysMoCatalogPitrResult(ctx, []*vector.Vector{v1, v2}, 10, "d")
 		assert.NoError(t, err)
@@ -2894,9 +2832,9 @@ func TestCheckSysMoCatalogPitrResult(t *testing.T) {
 	})
 
 	t.Run("update needed", func(t *testing.T) {
-		v1 := vector.NewVec(types.T_uint64.ToType())
+		v1 := vector.NewVec(types.T_uint64.ToType(), mp)
 		_ = vector.AppendFixed(v1, uint64(5), false, mp)
-		v2 := vector.NewVec(types.T_varchar.ToType())
+		v2 := vector.NewVec(types.T_varchar.ToType(), mp)
 		_ = vector.AppendBytes(v2, []byte("d"), false, mp)
 		needInsert, needUpdate, length, unit, err := CheckSysMoCatalogPitrResult(ctx, []*vector.Vector{v1, v2}, 10, "d")
 		assert.NoError(t, err)
@@ -2907,9 +2845,9 @@ func TestCheckSysMoCatalogPitrResult(t *testing.T) {
 	})
 
 	t.Run("update needed with catalog tinyint length", func(t *testing.T) {
-		v1 := vector.NewVec(types.T_uint8.ToType())
+		v1 := vector.NewVec(types.T_uint8.ToType(), mp)
 		_ = vector.AppendFixed(v1, uint8(5), false, mp)
-		v2 := vector.NewVec(types.T_varchar.ToType())
+		v2 := vector.NewVec(types.T_varchar.ToType(), mp)
 		_ = vector.AppendBytes(v2, []byte("d"), false, mp)
 		needInsert, needUpdate, length, unit, err := CheckSysMoCatalogPitrResult(ctx, []*vector.Vector{v1, v2}, 10, "d")
 		assert.NoError(t, err)
@@ -2920,9 +2858,9 @@ func TestCheckSysMoCatalogPitrResult(t *testing.T) {
 	})
 
 	t.Run("no update needed", func(t *testing.T) {
-		v1 := vector.NewVec(types.T_uint64.ToType())
+		v1 := vector.NewVec(types.T_uint64.ToType(), mp)
 		_ = vector.AppendFixed(v1, uint64(20), false, mp)
-		v2 := vector.NewVec(types.T_varchar.ToType())
+		v2 := vector.NewVec(types.T_varchar.ToType(), mp)
 		_ = vector.AppendBytes(v2, []byte("d"), false, mp)
 		needInsert, needUpdate, length, unit, err := CheckSysMoCatalogPitrResult(ctx, []*vector.Vector{v1, v2}, 10, "d")
 		assert.NoError(t, err)
@@ -2933,9 +2871,9 @@ func TestCheckSysMoCatalogPitrResult(t *testing.T) {
 	})
 
 	t.Run("mixed month and days use stable envelope", func(t *testing.T) {
-		v1 := vector.NewVec(types.T_uint64.ToType())
+		v1 := vector.NewVec(types.T_uint64.ToType(), mp)
 		_ = vector.AppendFixed(v1, uint64(1), false, mp)
-		v2 := vector.NewVec(types.T_varchar.ToType())
+		v2 := vector.NewVec(types.T_varchar.ToType(), mp)
 		_ = vector.AppendBytes(v2, []byte("mo"), false, mp)
 		needInsert, needUpdate, length, unit, err := CheckSysMoCatalogPitrResult(ctx, []*vector.Vector{v1, v2}, 30, "d")
 		assert.NoError(t, err)

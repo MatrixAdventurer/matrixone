@@ -262,6 +262,7 @@ func WithMoServerStateChecker(checker func() bool) EngineOptions {
 }
 
 type Engine struct {
+	rssPressure *rscthrottler.RSSPressureSource
 	sync.RWMutex
 	service  string
 	mp       *mpool.MPool
@@ -269,7 +270,7 @@ type Engine struct {
 	ls       lockservice.LockService
 	qc       qclient.QueryClient
 	hakeeper logservice.CNHAKeeperClient
-	us       udf.Service
+	us       udf.Runtime
 	cli      client.TxnClient
 	idGen    IDGenerator
 
@@ -293,7 +294,7 @@ type Engine struct {
 
 	//latest catalog will be loaded from TN when engine is initialized.
 	catalog atomic.Pointer[cache.CatalogCache]
-	//latest partitions which be protected by e.Lock().
+	// Latest partitions are protected by the engine's read/write mutex.
 	partitions map[[2]uint64]*logtailreplay.Partition
 
 	//snapshot partitions manager
@@ -516,10 +517,14 @@ func (r *txnRecordedUnpublished) takeAll() (names []string, took bool) {
 
 // Transaction represents a transaction
 type Transaction struct {
+	// commitPayload holds the commit requests' payload; see holdCommitPayload.
+	commitPayload atomic.Pointer[mpool.MessageBuffer]
+
 	workspaceAllocationMu     sync.Mutex
 	workspaceGeneration       *process.ExecutionResourceGeneration
 	workspaceAccount          *mpool.AllocationAccount
-	workspaceSelection        *vector.AllocationAccountSelection
+	workspaceView             *mpool.MPool
+	workspaceCopies           map[*batch.Batch]struct{}
 	workspaceAllocationClosed bool
 
 	catalogVisibilityRevision atomic.Uint64
@@ -699,13 +704,9 @@ type Transaction struct {
 	// Map logical table ID to its uncommitted CN objects and their metadata.
 	// Transaction-local clones may share an object, so each table owns a separate
 	// object map. Guarded by txn.Lock() and has the transaction lifecycle.
-	cnObjsSummary map[uint64]map[types.Objectid]Summary
-	// committed block belongs to txn's snapshot data -> delta locations for committed block's deletes.
-	cn_flushed_s3_tombstone_object_stats_list *sync.Map
-	//cn_flushed_s3_tombstone_object_stats_list struct {
-	//	sync.RWMutex
-	//	data []objectio.ObjectStats
-	//}
+	cnObjsSummary     map[uint64]map[types.Objectid]Summary
+	flushedTombstones workspaceFlushedTombstones
+
 	//select list for raw batch comes from txn.writes.batch.
 	batchSelectList map[*batch.Batch][]int64
 
@@ -1053,8 +1054,7 @@ func NewTxnWorkSpace(eng *Engine, proc *process.Process) *Transaction {
 		// The recorded-name holder installs at construction (round-41):
 		// a GC job the pool accepts captures it — never the
 		// transaction — as the settle state of its parked callback.
-		recordedUnpublishedObjects:                &txnRecordedUnpublished{},
-		cn_flushed_s3_tombstone_object_stats_list: new(sync.Map),
+		recordedUnpublishedObjects: &txnRecordedUnpublished{},
 
 		commitWorkspaceThreshold: eng.config.commitWorkspaceThreshold,
 		writeWorkspaceThreshold:  eng.config.writeWorkspaceThreshold,
@@ -1081,8 +1081,49 @@ func (txn *Transaction) SupportsAutoIncrEpochFence() bool {
 	return true
 }
 
-func (txn *Transaction) StashFlushedTombstones(stats objectio.ObjectStats) {
-	txn.cn_flushed_s3_tombstone_object_stats_list.Store(stats, nil)
+// Flushed workspace tombstones can reference data blocks shared by several
+// clone tables. Count live entries so transfers and rollback preserve any
+// remaining registration for the logical table.
+type workspaceFlushedTombstones struct {
+	mu     sync.RWMutex
+	tables map[uint64]map[objectio.ObjectStats]int
+}
+
+func (t *workspaceFlushedTombstones) adjust(tableID uint64, stats *vector.Vector, delta int) {
+	if stats.Length() == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	objects := t.tables[tableID]
+	if delta > 0 && objects == nil {
+		if t.tables == nil {
+			t.tables = make(map[uint64]map[objectio.ObjectStats]int)
+		}
+		objects = make(map[objectio.ObjectStats]int, stats.Length())
+		t.tables[tableID] = objects
+	}
+	for i := range stats.Length() {
+		key := objectio.ObjectStats(stats.GetBytesAt(i))
+		count := objects[key] + delta
+		if count <= 0 {
+			delete(objects, key)
+		} else {
+			objects[key] = count
+		}
+	}
+	if len(objects) == 0 {
+		delete(t.tables, tableID)
+	}
+}
+
+func (t *workspaceFlushedTombstones) forEach(tableID uint64, fn func(objectio.ObjectStats)) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for stats := range t.tables[tableID] {
+		fn(stats)
+	}
 }
 
 func (txn *Transaction) Readonly() bool {
@@ -1630,9 +1671,7 @@ func (txn *Transaction) GCObjsByIdxRange(start, end int) (err error) {
 
 // recordedWorkspaceNames selects the storage-object names the workspace
 // entries in [start, end] recorded — every write entry that carries a
-// published file — and retires tombstone objects from the CN summary
-// list the moment their GC is scheduled (their producer can no longer
-// flush them). Both GC front doors share this selection so the clone
+// published file. Both GC front doors share this selection so the clone
 // filters downstream see identical name sets.
 func (txn *Transaction) recordedWorkspaceNames(start, end int) []string {
 	var objsName []string
@@ -1656,9 +1695,6 @@ func (txn *Transaction) recordedWorkspaceNames(start, end int) []string {
 
 			for j := range vec.Length() {
 				ss := objectio.ObjectStats(vec.GetBytesAt(j))
-				if txn.writes[i].typ == DELETE {
-					txn.cn_flushed_s3_tombstone_object_stats_list.Delete(ss)
-				}
 				objsName = append(objsName, ss.ObjectName().String())
 			}
 		}
@@ -1979,6 +2015,10 @@ type Entry struct {
 	fileName string
 	//tuples would be applied to the table which belongs to the tenant(accountId)
 	bat *batch.Batch
+	// attrs names bat's columns, one name per vector. It is the entry's own
+	// copy: the names travel to TN with the batch (TN keys columns by name),
+	// and ALTER renames them in place.
+	attrs []string
 	// pkRange is the canonical-encoded primary-key envelope of an insert
 	// entry's rows (issue 26796). Writers compute it once from the entry's
 	// primary-key column; readers use it to skip the whole batch when the
@@ -2051,6 +2091,9 @@ func (e *Entry) TableId() uint64 {
 func (e *Entry) Type() int         { return e.typ }
 func (e *Entry) FileName() string  { return e.fileName }
 func (e *Entry) Bat() *batch.Batch { return e.bat }
+
+// Attrs names the columns of Bat.
+func (e *Entry) Attrs() []string { return e.attrs }
 
 // isCatalog denotes the entry is apply the tree tables
 func (e *Entry) isCatalog() bool {

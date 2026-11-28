@@ -490,12 +490,12 @@ func cloneCatalogLockBatch(
 			}
 		}
 	}()
-	inputs[0] = vector.NewVec(types.T_uint32.ToType())
+	inputs[0] = vector.NewVec(types.T_uint32.ToType(), proc.Mp())
 	if err := vector.AppendFixed(inputs[0], accountID, false, proc.GetMPool()); err != nil {
 		return nil, err
 	}
 	for i, name := range names {
-		inputs[i+1] = vector.NewVec(types.T_varchar.ToType())
+		inputs[i+1] = vector.NewVec(types.T_varchar.ToType(), proc.Mp())
 		if err := vector.AppendBytes(inputs[i+1], []byte(name), false, proc.GetMPool()); err != nil {
 			return nil, err
 		}
@@ -1256,6 +1256,22 @@ func handleCloneDatabaseWithSource(
 			}
 		}
 	}
+	for _, definition := range source.userDefinedFuncs {
+		if !strings.EqualFold(definition.lang, string(tree.PYTHON)) {
+			continue
+		}
+		// Database clone is a new Python publication in the target account.
+		// Apply the same runtime and catalog gates before creating the target
+		// database, so a disabled or partially upgraded node cannot leave a
+		// clone that contains an unrunnable routine.
+		if err = ensurePythonUdfRuntimeReady(reqCtx, ses); err != nil {
+			return
+		}
+		if err = ensurePythonUdfCatalogReady(reqCtx, bh); err != nil {
+			return
+		}
+		break
+	}
 	fromAccountID := source.opAccountId
 	if source.snapshot != nil && source.snapshot.Tenant != nil {
 		fromAccountID = source.snapshot.Tenant.TenantID
@@ -1279,6 +1295,9 @@ func handleCloneDatabaseWithSource(
 	}
 	if err = revalidateTimestampDataBranchCloneDatabaseSource(reqCtx, ses, bh, source); err != nil {
 		return
+	}
+	if err = validateCloneRoutineTransaction(reqCtx, bh, source); err != nil {
+		return nil, err
 	}
 	if source.hasFkCycle {
 		oldForeignKeyChecksReplayable, hadForeignKeyChecksReplayability :=
@@ -1505,6 +1524,7 @@ func handleCloneDatabaseWithSource(
 	}
 	if err = restoreCloneDatabaseUserDefinedFunctions(
 		ctx1, bh, routineTenant, source.userDefinedFuncs, stmt.DstDatabase.String(),
+		getPu(ses.GetService()).FileService,
 	); err != nil {
 		return
 	}
@@ -1821,5 +1841,18 @@ func updateBranchMetaTable(
 		return err
 	}
 
+	return nil
+}
+
+// Routine publication must share RENAME USER's pessimistic-RC creator exclusion.
+// Read the actual operator: explicit transactions do not inherit private options.
+func validateCloneRoutineTransaction(ctx context.Context, bh BackgroundExec, source cloneDatabaseSource) error {
+	if len(source.userDefinedFuncs) == 0 && len(source.storedProcedures) == 0 {
+		return nil
+	}
+	op := backgroundExecTxnOperator(bh)
+	if op == nil || !op.Txn().IsPessimistic() || !op.Txn().IsRCIsolation() {
+		return moerr.NewNotSupported(ctx, "CLONE containing routines requires pessimistic RC")
+	}
 	return nil
 }

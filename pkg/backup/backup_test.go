@@ -16,6 +16,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	"github.com/prashantv/gostub"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -35,6 +37,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/udf"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
@@ -76,6 +80,60 @@ func appendBatchesConcurrently(
 	}
 	close(start)
 	wg.Wait()
+}
+
+func TestGetBackupFileNames(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		want    []string
+	}{
+		{"valid", `{"result":["checkpoint-one;;checkpoint-two;","checkpoint-three"]}`, []string{"checkpoint-one", "checkpoint-two", "checkpoint-three"}},
+		{"malformed JSON", `{"result":`, nil},
+		{"invalid result element", `{"result":[123]}`, nil},
+		{"missing result", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := mpool.MustNewZero()
+			defer mpool.DeleteMPool(mp)
+			exec := executor.NewMemExecutor(func(sql string) (executor.Result, error) {
+				require.Equal(t, "select mo_ctl('dn','Backup','')", sql)
+				res := executor.NewMemResult([]types.Type{types.T_varchar.ToType()}, mp)
+				if tc.payload != "" {
+					res.NewBatchWithRowCount(1)
+					require.NoError(t, executor.AppendStringRows(res, 0, []string{tc.payload}))
+				}
+				return res.GetResult(), nil
+			})
+			names, err := getBackupFileNames(context.Background(), exec, executor.Options{})
+			require.Zero(t, mp.CurrNB())
+			if tc.want == nil {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, names)
+		})
+	}
+}
+
+func TestBackupDataReturnsControlQueryError(t *testing.T) {
+	sid := t.Name()
+	rt := runtime.DefaultRuntime()
+	runtime.SetupServiceBasedRuntime(sid, rt)
+	t.Cleanup(func() { runtime.CompareAndDeleteServiceBasedRuntime(sid, rt) })
+
+	queryErr := errors.New("backup control query failed")
+	calls := 0
+	rt.SetGlobalVariables(runtime.InternalSQLExecutor, executor.NewMemExecutor(func(sql string) (executor.Result, error) {
+		require.Equal(t, "select mo_ctl('dn','Backup','')", sql)
+		calls++
+		return executor.Result{}, queryErr
+	}))
+
+	err := BackupData(t.Context(), sid, nil, nil, "", &Config{}, nil)
+	require.ErrorIs(t, err, queryErr)
+	require.Equal(t, 1, calls)
 }
 
 func TestExecBackupRejectsIncompleteCheckpointResponse(t *testing.T) {
@@ -599,6 +657,32 @@ func TestBackupData3(t *testing.T) {
 
 }
 
+func TestCopyPythonArtifactFilesReusesOnlyIdenticalObjects(t *testing.T) {
+	ctx := t.Context()
+	src := newBackupMemoryFS(t, "source")
+	dst := newBackupMemoryFS(t, "destination")
+	slot := path.Join(udf.PythonArtifactAdmissionDirectory, "0001")
+	require.NoError(t, writeFile(ctx, src, slot, []byte("reservation")))
+	require.NoError(t, writeFile(ctx, src, udf.PythonArtifactDirectory+"-other/7/digest", []byte("unrelated")))
+	// A neighboring namespace and an unknown admission version are outside v1.
+	require.NoError(t, writeFile(ctx, src, "udf-artifact-admission/v10/0001", []byte("another version")))
+	copier := backupFileCopier{}
+	first, err := copier.copyPythonArtifactFiles(ctx, src, dst, types.TS{})
+	require.NoError(t, err)
+	require.Equal(t, []string{slot}, taeFilePaths(first))
+	second, err := copier.copyPythonArtifactFiles(ctx, src, dst, types.TS{})
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+
+	require.NoError(t, dst.Delete(ctx, slot))
+	require.NoError(t, writeFile(ctx, dst, slot, []byte("different reservation")))
+	_, err = copier.copyPythonArtifactFiles(ctx, src, dst, types.TS{})
+	require.ErrorContains(t, err, "admission checksum mismatch")
+	value, err := readFile(ctx, dst, slot)
+	require.NoError(t, err)
+	require.Equal(t, "different reservation", string(value))
+}
+
 func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -620,12 +704,25 @@ func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 
 	var sourceGlobalLSN uint64
 	var sourceGlobalEnd types.TS
+	const udfSource = "def f(ctx): return 1"
+	digest := udf.PythonInlineArtifactDigest("f", udfSource)
+	artifact := path.Join(udf.PythonArtifactDirectory, "7", digest)
+	quota := path.Join(udf.PythonArtifactAdmissionDirectory, "0000")
+	abandoned := path.Join(udf.PythonArtifactAdmissionDirectory, "0001")
+	pythonObjects := map[string]string{
+		artifact:  udfSource,
+		quota:     "7/" + digest,
+		abandoned: "7/" + udf.PythonInlineArtifactDigest("f", "def f(ctx): return 2"),
+	}
 	func() {
 		opts := config.WithLongScanAndCKPOpts(nil)
 		source := testutil.NewTestEngine(ctx, ModuleName, t, opts)
 		defer opts.Fs.Close(context.Background())
 		defer func() { require.NoError(t, source.Close()) }()
 		source.BindSchema(schema)
+		for name, value := range pythonObjects {
+			require.NoError(t, writeFile(ctx, opts.Fs, name, []byte(value)))
+		}
 		// Four small commits make the source WAL generation observably newer
 		// than the single post-restore append/delete transaction below.
 		for offset := 0; offset < sourceRows; offset += 5 {
@@ -700,6 +797,13 @@ func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 		require.NoError(t, err)
 		manifestRows, err := fromCsvBytes(manifest)
 		require.NoError(t, err)
+		for name, value := range pythonObjects {
+			checksum, err := checksumFile(ctx, opts.Fs, name)
+			require.NoError(t, err)
+			require.Equal(t, strconv.Itoa(len(value)), csvFieldForPath(t, manifestRows, name, 1))
+			require.Equal(t, fmt.Sprintf("%x", checksum), csvFieldForPath(t, manifestRows, name, 2))
+			require.Equal(t, "true", csvFieldForPath(t, manifestRows, name, 3))
+		}
 		for index := 0; index < indexLocations.Len(); index++ {
 			name := indexLocations.Get(index).Name().String()
 			stat, err := dstFs.StatFile(ctx, name)
@@ -718,6 +822,11 @@ func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 	opts.Fs = dstFs
 	restored := testutil.NewTestEngineWithDir(ctx, t.TempDir(), t, opts)
 	defer func() { require.NoError(t, restored.Close()) }()
+	for name, value := range pythonObjects {
+		got, err := readFile(ctx, dstFs, name)
+		require.NoError(t, err)
+		require.Equal(t, value, string(got))
+	}
 	restored.BindSchema(schema)
 	require.NoError(t, restored.ForceGlobalCheckpoint(ctx, restored.TxnMgr.Now(), time.Second))
 	global := restored.BGCheckpointRunner.MaxGlobalCheckpoint()
@@ -762,7 +871,7 @@ func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 				require.NoError(t, txn.Rollback(context.Background()))
 			}
 		}()
-		require.NoError(t, rel.DeleteByFilter(ctx, handle.NewEQFilter(data.Vecs[0].Get(0))))
+		require.NoError(t, rel.DeleteByFilter(ctx, handle.NewEQFilter(data.Vecs[0].GetValue(0))))
 		row := data.CloneWindow(sourceRows, 1)
 		defer row.Close()
 		require.NoError(t, rel.Append(ctx, row))
@@ -797,13 +906,13 @@ func TestBackupRestoreGlobalCheckpointWithFreshWAL(t *testing.T) {
 		}
 	}()
 	testutil.CheckAllColRowsByScan(t, rel, sourceRows, true)
-	_, _, err = rel.GetByFilter(ctx, handle.NewEQFilter(data.Vecs[0].Get(0)))
+	_, _, err = rel.GetByFilter(ctx, handle.NewEQFilter(data.Vecs[0].GetValue(0)))
 	require.True(t, moerr.IsMoErrCode(err, moerr.ErrNotFound))
 	for row := 1; row <= sourceRows; row++ {
-		value, isNull, err := rel.GetValueByFilter(ctx, handle.NewEQFilter(data.Vecs[0].Get(row)), 1)
+		value, isNull, err := rel.GetValueByFilter(ctx, handle.NewEQFilter(data.Vecs[0].GetValue(row)), 1)
 		require.NoError(t, err)
 		require.False(t, isNull)
-		require.Equal(t, data.Vecs[1].Get(row), value)
+		require.Equal(t, data.Vecs[1].GetValue(row), value)
 	}
 	require.NoError(t, txn.Commit(ctx))
 	readComplete = true

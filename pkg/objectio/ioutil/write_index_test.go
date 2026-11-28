@@ -24,15 +24,13 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/stretchr/testify/require"
 )
 
 func TestObjectColumnMetasBuilderUpdateZmWithoutInspect(t *testing.T) {
 	mp := mpool.MustNewZero()
-	vec := vector.NewVec(types.T_TS.ToType())
+	vec := vector.NewVec(types.T_TS.ToType(), mp)
 	for i := 0; i < 4; i++ {
 		require.NoError(t, vector.AppendFixed(vec, types.BuildTS(int64(i+1), 0), false, mp))
 	}
@@ -75,7 +73,7 @@ func TestObjectColumnMetasBuilderNullBatches(t *testing.T) {
 				if tc.constNull {
 					vec = vector.NewConstNull(types.T_int32.ToType(), len(values), mp)
 				} else {
-					vec = vector.NewVec(types.T_int32.ToType())
+					vec = vector.NewVec(types.T_int32.ToType(), mp)
 				}
 				t.Cleanup(func() { vec.Free(mp) })
 				if !tc.constNull {
@@ -85,7 +83,7 @@ func TestObjectColumnMetasBuilderNullBatches(t *testing.T) {
 				}
 				rows += len(values)
 				builder.AddRowCnt(len(values))
-				builder.InspectVector(0, containers.ToTNVector(vec, common.DefaultAllocator), false)
+				builder.InspectVector(0, vec, false)
 				zm := index.NewZM(types.T_int32, 0)
 				require.NoError(t, index.BatchUpdateZM(zm, vec))
 				builder.UpdateZm(0, zm)
@@ -164,9 +162,9 @@ func TestHiddenColumnsZoneMapPersistedAfterWriteAndRead(t *testing.T) {
 func batchForHiddenColumnsTest(t *testing.T, mp *mpool.MPool) *batch.Batch {
 	t.Helper()
 	bat := batch.NewWithSize(3)
-	bat.Vecs[0] = vector.NewVec(types.T_int32.ToType())
-	bat.Vecs[1] = vector.NewVec(types.T_Rowid.ToType())
-	bat.Vecs[2] = vector.NewVec(types.T_TS.ToType())
+	bat.Vecs[0] = vector.NewVec(types.T_int32.ToType(), mp)
+	bat.Vecs[1] = vector.NewVec(types.T_Rowid.ToType(), mp)
+	bat.Vecs[2] = vector.NewVec(types.T_TS.ToType(), mp)
 
 	values := []int32{11, 22, 33}
 	rowOffsets := []uint32{7, 1, 9}

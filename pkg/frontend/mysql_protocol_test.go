@@ -2966,7 +2966,8 @@ func FuzzParseExecuteData(f *testing.F) {
 		Name:        preparePlan.GetDcl().GetPrepare().GetName(),
 		PreparePlan: preparePlan,
 		PrepareStmt: stmts[0],
-		params:      vector.NewVec(types.T_varchar.ToType()),
+		params:      vector.NewVec(types.T_varchar.ToType(), proc.Mp()),
+		paramsMP:    proc.Mp(),
 	}
 
 	var testData []byte
@@ -3264,12 +3265,15 @@ func TestParseExecuteDataDecimalRebindsPreparedAbsExactly(t *testing.T) {
 		buildStringExecutePacket(proto, defines.MYSQL_TYPE_NEWDECIMAL, value), 0))
 	require.Equal(t, []byte{byte(defines.MYSQL_TYPE_NEWDECIMAL), 0}, prepareStmt.ParamTypes)
 	proc.SetPrepareParamsWithIsBin(prepareStmt.params, []bool{false})
-	values, err := preparedParamValues(proc, prepareStmt.ParamTypes,
+	values, err := preparedParamValues(proc, nil, prepareStmt.ParamTypes,
 		[]types.StringConversionKind{types.StringConversionDecimal})
 	require.NoError(t, err)
 	require.Len(t, values, 1)
-	param := values[0].(plan.ParamValue)
-	require.Equal(t, value, param.Value)
+	param := mustParamValue(values[0])
+	// The packet spelling is decoded once into its canonical lexeme.
+	_, _, canonical, ok := plan.PreparedDecimalRuntimeDomains(value)
+	require.True(t, ok)
+	require.Equal(t, canonical, param.Value)
 	require.True(t, param.HasRuntimeType)
 	require.Equal(t, types.T_decimal256, param.RuntimeType.Oid)
 
@@ -3351,7 +3355,7 @@ func TestParseExecuteDataBitCountMarkerUsesPacketDomain(t *testing.T) {
 			}()
 			require.NoError(t, proto.ParseExecuteData(ctx, proc, prepareStmt, tc.packet(proto), 0))
 			proc.SetPrepareParamsWithIsBin(prepareStmt.params, []bool{false})
-			values, err := preparedParamValues(proc, prepareStmt.ParamTypes,
+			values, err := preparedParamValues(proc, nil, prepareStmt.ParamTypes,
 				[]types.StringConversionKind{tc.paramKind})
 			require.NoError(t, err)
 			runtimePlan, specialized, err := plan.FillValuesOfParamsInPlanWithSpecialization(
@@ -3521,7 +3525,7 @@ func buildPreparedSetExecutePacket(proto *MysqlProtocolImpl, nullBitmap byte, fi
 	return data
 }
 
-func TestPrepareStmtClearBinaryParamStateReleasesParamArea(t *testing.T) {
+func TestPrepareStmtClearBinaryParamStateKeepsParamArea(t *testing.T) {
 	ctx := context.TODO()
 	proto, proc, prepareStmt := newBinaryPrepareProtocolTestCase(t, "select ?")
 
@@ -3532,13 +3536,19 @@ func TestPrepareStmtClearBinaryParamStateReleasesParamArea(t *testing.T) {
 	firstAreaLen := len(prepareStmt.params.GetArea())
 	require.Greater(t, firstAreaLen, 0)
 
+	params := prepareStmt.params
 	prepareStmt.clearBinaryParamState(proc)
-	require.Nil(t, prepareStmt.params)
+	require.Same(t, params, prepareStmt.params, "the storage stays with the statement")
+	require.Zero(t, prepareStmt.params.Length())
+	require.Empty(t, prepareStmt.params.GetArea(), "but not the execution's values")
 	require.Empty(t, prepareStmt.getFromSendLongData)
 
+	allocs := proc.Mp().Stats().NumAlloc.Load()
 	require.NoError(t, proto.ParseExecuteData(ctx, proc, prepareStmt, buildStringExecutePacket(proto, defines.MYSQL_TYPE_VAR_STRING, secondPayload), 0))
 	require.Equal(t, secondPayload, prepareStmt.params.GetStringAt(0))
-	require.Equal(t, firstAreaLen, len(prepareStmt.params.GetArea()))
+	require.Equal(t, allocs, proc.Mp().Stats().NumAlloc.Load(), "the next execution reuses it")
+	prepareStmt.Close()
+	require.Nil(t, prepareStmt.params)
 }
 
 func TestParseExecuteDataRejectsTruncatedNewParamBoundFlag(t *testing.T) {
@@ -3823,7 +3833,7 @@ func TestMysqlProtocolWriteUsesLogicalBatchRowCount(t *testing.T) {
 				types.T_int64.ToType(), int64(7), 1, mp,
 			)
 			require.NoError(t, err)
-			totals := vector.NewVec(types.T_int64.ToType())
+			totals := vector.NewVec(types.T_int64.ToType(), mp)
 			for _, value := range []int64{10, 20, 30} {
 				require.NoError(t, vector.AppendFixed(totals, value, false, mp))
 			}
@@ -3894,7 +3904,7 @@ func TestDatetimeExactSecondWireRowsKeepDeclaredScale(t *testing.T) {
 
 			mp := mpool.MustNewZero()
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 6))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 6), mp)
 			t.Cleanup(func() { bat.Clean(mp) })
 			dt, err := types.ParseDatetime("2024-01-15 10:20:30", 6)
 			require.NoError(t, err)
@@ -5230,7 +5240,7 @@ func makeKases(t *testing.T) []kase {
 				}
 				bat.Vecs[colIdx] = testutil.NewStringVector(len(mrs.Data), types.T_char.ToType(), mp, false, nil, vecData)
 			case defines.MYSQL_TYPE_GEOMETRY:
-				vec := vector.NewVec(types.T_geometry.ToType())
+				vec := vector.NewVec(types.T_geometry.ToType(), mp)
 				vecData := make([][]byte, 0, len(mrs.Data))
 				for i := 0; i < len(mrs.Data); i++ {
 					vecData = append(vecData, mrs.Data[i][colIdx].([]byte))
@@ -6475,7 +6485,7 @@ func Test_appendResultSetBinaryRow2_DateTimeHandling(t *testing.T) {
 
 			// Create a batch with DATE type vector
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_date, 0, 0))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_date, 0, 0), proc.Mp())
 			date := types.Date(types.DateFromCalendar(2024, 1, 15))
 			vector.AppendFixed(bat.Vecs[0], date, false, proc.Mp())
 			bat.SetRowCount(1)
@@ -6504,7 +6514,7 @@ func Test_appendResultSetBinaryRow2_DateTimeHandling(t *testing.T) {
 
 			// Create a batch with DATETIME type vector
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 0))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 0), proc.Mp())
 			dt, _ := types.ParseDatetime("2024-01-15 10:20:30", 0)
 			vector.AppendFixed(bat.Vecs[0], dt, false, proc.Mp())
 			bat.SetRowCount(1)
@@ -6533,7 +6543,7 @@ func Test_appendResultSetBinaryRow2_DateTimeHandling(t *testing.T) {
 
 			// Create a batch with DATE type vector
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_date, 0, 0))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_date, 0, 0), proc.Mp())
 			date := types.Date(types.DateFromCalendar(2024, 1, 15))
 			vector.AppendFixed(bat.Vecs[0], date, false, proc.Mp())
 			bat.SetRowCount(1)
@@ -6562,7 +6572,7 @@ func Test_appendResultSetBinaryRow2_DateTimeHandling(t *testing.T) {
 
 			// Create a batch with TIMESTAMP type vector
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_timestamp, 0, 0))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_timestamp, 0, 0), proc.Mp())
 			ts, _ := types.ParseTimestamp(time.UTC, "2024-01-15 10:20:30", 0)
 			vector.AppendFixed(bat.Vecs[0], ts, false, proc.Mp())
 			bat.SetRowCount(1)
@@ -6591,7 +6601,7 @@ func Test_appendResultSetBinaryRow2_DateTimeHandling(t *testing.T) {
 
 			// Create a batch with DATETIME type vector (with microseconds)
 			bat := batch.NewWithSize(1)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 6))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_datetime, 0, 6), proc.Mp())
 			dt, _ := types.ParseDatetime("2024-01-15 10:20:30.123456", 6)
 			vector.AppendFixed(bat.Vecs[0], dt, false, proc.Mp())
 			bat.SetRowCount(1)
@@ -6707,11 +6717,11 @@ func Test_appendResultSetBinaryRow2_TimeMicroseconds(t *testing.T) {
 			rs.AddColumn(uCol)
 
 			bat := batch.NewWithSize(2)
-			bat.Vecs[0] = vector.NewVec(types.New(types.T_time, 0, 6))
+			bat.Vecs[0] = vector.NewVec(types.New(types.T_time, 0, 6), proc.Mp())
 			tm, err := types.ParseTime(timeStr, 6)
 			convey.So(err, convey.ShouldBeNil)
 			convey.So(vector.AppendFixed(bat.Vecs[0], tm, false, proc.Mp()), convey.ShouldBeNil)
-			bat.Vecs[1] = vector.NewVec(types.New(types.T_uint64, 0, 0))
+			bat.Vecs[1] = vector.NewVec(types.New(types.T_uint64, 0, 0), proc.Mp())
 			convey.So(vector.AppendFixed(bat.Vecs[1], maxUint64, false, proc.Mp()), convey.ShouldBeNil)
 			bat.SetRowCount(1)
 
@@ -6882,8 +6892,91 @@ func installTestTypedPrepareParams(t *testing.T, proc *process.Process, typs ...
 	for i, typ := range typs {
 		bindings[i] = plan.PreparedSourceBinding{Position: int32(i), Type: typ}
 	}
-	require.NoError(t, installTypedPrepareParams(proc, bindings))
+	require.NoError(t, installTypedPrepareParams(proc, bindings, nil))
 	for i := range typs {
 		require.NotNil(t, proc.GetTypedPrepareParam(i), "parameter %d must carry a typed value", i)
 	}
+}
+
+// buildFixedExecutePacket builds a one-parameter COM_STMT_EXECUTE packet whose
+// value is the little-endian fixed-width encoding of tp.
+func buildFixedExecutePacket(tp defines.MysqlType, unsigned bool, value []byte) []byte {
+	flag := byte(0)
+	if unsigned {
+		flag = 0x80
+	}
+	data := make([]byte, 0, 9+len(value))
+	data = append(data, 0, 1, 0, 0, 0, 0, 1, byte(tp), flag)
+	return append(data, value...)
+}
+
+// Integer-domain wire types that are not plain integers (BIT, YEAR) and the
+// TINY 0/1 and DOUBLE packets that reach the planner as a Boolean or a float
+// keep the validation their wire text had: pagination and window offsets
+// (checked before planning, as EXECUTE does) and SRID (checked while the plan
+// is filled) accept them.
+func TestParseExecuteDataNativeValuesKeepValidation(t *testing.T) {
+	le64 := func(v uint64) []byte { return binary.LittleEndian.AppendUint64(nil, v) }
+	le16 := func(v uint16) []byte { return binary.LittleEndian.AppendUint16(nil, v) }
+	decimal := func(text string) []byte {
+		return buildFixedExecutePacket(defines.MYSQL_TYPE_NEWDECIMAL, false, append([]byte{byte(len(text))}, text...))
+	}
+	const srid = "select st_srid(st_geomfromtext('POINT(1 1)'), ?)"
+	for _, tc := range []struct {
+		name    string
+		sql     string
+		packet  []byte
+		fill    bool
+		fillErr bool
+	}{
+		{"BIT LIMIT", "select 1 limit ?", buildFixedExecutePacket(defines.MYSQL_TYPE_BIT, true, le64(1)), false, false},
+		{"YEAR OFFSET", "select 1 limit 1 offset ?", buildFixedExecutePacket(defines.MYSQL_TYPE_YEAR, true, le16(0)), false, false},
+		{"BIT LAG", "select lag(a, ?) over (order by a) from (select 1 as a) t", buildFixedExecutePacket(defines.MYSQL_TYPE_BIT, true, le64(1)), false, false},
+		{"YEAR NTH_VALUE", "select nth_value(a, ?) over (order by a) from (select 1 as a) t", buildFixedExecutePacket(defines.MYSQL_TYPE_YEAR, true, le16(1)), false, false},
+		{"TINY 1 SRID", "select st_srid(st_geomfromtext('POINT(1 1)'), ?)", buildTinyExecutePacket(1, false), true, false},
+		{"DOUBLE 1.0 SRID", "select st_srid(st_geomfromtext('POINT(1 1)'), ?)", buildFixedExecutePacket(defines.MYSQL_TYPE_DOUBLE, false, le64(math.Float64bits(1))), true, false},
+		// A DECIMAL reaches the planner as its canonical lexeme, which spells
+		// 10 as 1e1; the SRID check still reads the wire's integer.
+		{"NEWDECIMAL 10 SRID", srid, decimal("10"), true, false},
+		{"NEWDECIMAL 11 SRID", srid, decimal("11"), true, false},
+		{"NEWDECIMAL 10.0 SRID", srid, decimal("10.0"), true, true},
+		{"NEWDECIMAL 1.5 SRID", srid, decimal("1.5"), true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.TODO()
+			proto, proc, prepareStmt := newBinaryPrepareProtocolTestCase(t, tc.sql)
+			defer prepareStmt.clearBinaryParamState(proc)
+			require.NoError(t, proto.ParseExecuteData(ctx, proc, prepareStmt, tc.packet, 0))
+			proc.SetPrepareParamsWithIsBin(prepareStmt.params, []bool{false})
+			values, err := preparedParamValues(proc, nil, prepareStmt.ParamTypes,
+				[]types.StringConversionKind{binaryProtocolPrepareParamKind(
+					defines.MysqlType(prepareStmt.ParamTypes[0]), prepareStmt.ParamTypes[1]&0x80 != 0,
+					[]byte(prepareStmt.params.GetStringAt(0)))})
+			require.NoError(t, err)
+			preparePlan := prepareStmt.PreparePlan.GetDcl().GetPrepare().Plan
+			require.NoError(t, plan.ValidatePreparedWindowParams(ctx, preparePlan, values))
+			require.NoError(t, plan.ValidatePreparedPaginationParams(ctx, preparePlan, values))
+			if tc.fill {
+				_, _, err = plan.FillValuesOfParamsInPlanWithPreparedNumericOverload(ctx, preparePlan, values)
+				if tc.fillErr {
+					require.ErrorContains(t, err, "SRID should be an integer")
+				} else {
+					require.NoError(t, err)
+				}
+			}
+		})
+	}
+}
+
+// COM_STMT_RESET drops the previous execution's planner values, which can hold
+// a large string payload, while the statement stays executable.
+func TestPrepareStmtResetDropsPlannerParamValues(t *testing.T) {
+	_, _, prepareStmt := newBinaryPrepareProtocolTestCase(t, "select ?")
+	prepareStmt.paramValues.Reset(1)
+	ref := prepareStmt.paramValues.Ref(0)
+	*ref = plan.ParamValue{Value: strings.Repeat("x", 1<<20)}
+	prepareStmt.resetBinaryParamState()
+	require.Equal(t, plan.ParamValue{}, *ref)
+	again := prepareStmt.paramValues.Reset(1)
+	require.Same(t, ref, again[0], "the storage is reused by the next execution")
 }

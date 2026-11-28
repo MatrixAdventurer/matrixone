@@ -33,6 +33,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/internal/materialized"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	planutil "github.com/matrixorigin/matrixone/pkg/sql/util"
 )
 
@@ -189,6 +190,19 @@ func (builder *QueryBuilder) makeUpdateChangedRowsPredicate(
 	return BindFuncExprImplByPlanExpr(builder.GetContext(), "not", []*plan.Expr{allEqual})
 }
 
+// Parameterized compound ENUM/SET values must bind in the UPDATE row scope;
+// normalization can then select the converter from the bound result type.
+func (builder *QueryBuilder) deferSpecialUpdateConversion(typ plan.Type, expr tree.Expr) bool {
+	if !isEnumOrSetPlanType(&typ) ||
+		(!builder.isReusablePlan() && preparedSourceBindings(builder.GetContext()) == nil) {
+		return false
+	}
+	if _, bare := unwrapParenExpr(expr).(*tree.ParamExpr); bare {
+		return false
+	}
+	return checkExprHasParamExpr([]tree.Expr{expr})
+}
+
 // normalizeUpdateAssignment resolves the value owned by an explicit assignment.
 // Callers choose the input row image: preceding values for sequential UPDATE,
 // original values for simultaneous joined UPDATE.
@@ -206,6 +220,8 @@ func (builder *QueryBuilder) normalizeUpdateAssignment(
 		if err != nil {
 			return nil, err
 		}
+	} else if radix := boundDecimalRadixAssignmentSource(rhs, col.Typ); radix != nil {
+		rhs = radix
 	}
 	rhs, err = builder.wrapLegacyTimestampAssignment(col, rhs)
 	if err != nil {
@@ -304,8 +320,10 @@ func (builder *QueryBuilder) appendSequentialSingleTableUpdateAssignments(
 		rhsBindCtx, rhsBinder := builder.newSequentialUpdateProjectionBinder(
 			bindCtx, currentNodeID, currentTag, tableDef, alias, currentProjectList, stageLegacy,
 		)
-		if useNumericAssignmentContext(tableDef.Cols[columnIndex].Typ, ignore) && !isPreparedAssignmentParam(builder, astExpr) {
-			target := tableDef.Cols[columnIndex].Typ
+		_, columnAssignment := unwrapParenExpr(astExpr).(*tree.UnresolvedName)
+		if target := tableDef.Cols[columnIndex].Typ; (useNumericAssignmentContext(target, ignore) ||
+			columnAssignment && isEnumOrSetPlanType(&target)) &&
+			!isPreparedAssignmentParam(builder, astExpr) && !builder.deferSpecialUpdateConversion(target, astExpr) {
 			rhsBinder.numericTargetType = &target
 		}
 		rhs, err := rhsBinder.BindExpr(astExpr, 0, true)
@@ -420,6 +438,9 @@ func (builder *QueryBuilder) newSequentialUpdateProjectionBinder(
 		ctx.bindingByCol[col] = binding
 	}
 	ctx.bindingTree = &BindingTreeNode{binding: binding}
+	if source := parent.bindingByTable[alias]; source != nil && source.dmlStorageColumns != nil {
+		ctx.restrictDMLBinding(binding, source.colIdByName)
+	}
 	havingBinder := NewHavingBinder(builder, ctx)
 	binder := NewProjectionBinder(builder, ctx, havingBinder)
 	ctx.binder = binder
@@ -453,6 +474,9 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 		}
 	}
 	if err = validateRepeatedPhysicalTargetPrimaryKeyUpdate(builder.GetContext(), dmlCtx); err != nil {
+		return 0, err
+	}
+	if err = builder.enableDMLTargetRewrites(bindCtx, dmlCtx.updateRewrites, dmlCtx.updateCol2Expr); err != nil {
 		return 0, err
 	}
 	if stmt.HasReturning() {
@@ -503,9 +527,10 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 		for _, col := range tableDef.Cols {
 			oldColName2Idx[alias+"."+col.Name] = int32(len(selectList))
 			e := tree.NewUnresolvedName(tree.NewCStr(alias, bindCtx.lower), tree.NewCStr(col.Name, 1))
-			if sequentialAssignments && isEnumOrSetPlanType(&col.Typ) {
-				// Sequential projections must retain the storage ordinal/bitmap.
-				// A display string cannot recover an empty-label ENUM member.
+			bindCtx.markDMLPhysicalRef(e)
+			if isEnumOrSetPlanType(&col.Typ) {
+				// DML row images keep the storage ordinal/bitmap, including
+				// ENUM members that share an empty display string.
 				if bindCtx.physicalMySQLSpecialRefs == nil {
 					bindCtx.physicalMySQLSpecialRefs = make(map[*tree.UnresolvedName]struct{})
 				}
@@ -524,13 +549,8 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 
 		var unsupportedIrregularRoute bool
 		inlineIrregularIndexes[i], unsupportedIrregularRoute, err = classifyIrregularIndexesForUpdate(
-			builder.GetContext(), tableDef, dmlCtx.updateCol2Expr[i])
+			tableDef, withSelfForeignKeyActionColumns(tableDef, dmlCtx.updateCol2Expr[i]))
 		if err != nil {
-			if stmt.HasReturning() {
-				if feature := returningUpdatePlannerFeature(err); feature != "" {
-					return 0, returningNotSupported(builder, feature)
-				}
-			}
 			return 0, err
 		}
 		if unsupportedIrregularRoute {
@@ -594,9 +614,14 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 				}
 			}
 
+			deferSpecial := false
+			_, columnAssignment := unwrapParenExpr(updateExpr).(*tree.UnresolvedName)
 			for _, colDef := range tableDef.Cols {
 				if colDef.Name == colName {
-					if isEnumOrSetPlanType(&colDef.Typ) {
+					deferSpecial = builder.deferSpecialUpdateConversion(colDef.Typ, updateExpr)
+					// A column assignment must bind in the source row scope.
+					// Projection supplies the storage type for the later cast.
+					if isEnumOrSetPlanType(&colDef.Typ) && !deferSpecial && !columnAssignment {
 						updateExpr, err = wrapAstExprForMySQLSpecialType(builder.GetContext(), colDef.Typ, updateExpr)
 						if err != nil {
 							return 0, err
@@ -624,14 +649,18 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 			}
 
 			oldPos := oldColName2Idx[alias+"."+colName]
-			if typ := tableDef.Cols[tableDef.Name2ColIndex[colName]].Typ; useNumericAssignmentContext(typ, stmt.Ignore) && !isPreparedAssignmentParam(builder, updateExpr) {
+			if typ := tableDef.Cols[tableDef.Name2ColIndex[colName]].Typ; (useNumericAssignmentContext(typ, stmt.Ignore) ||
+				columnAssignment && isEnumOrSetPlanType(&typ)) && !deferSpecial && !isPreparedAssignmentParam(builder, updateExpr) {
 				updateNumericTargets[oldPos] = typ
 			}
 			newColName2Idx[alias+"."+colName] = oldPos
 			oldColName2Idx[alias+"."+colName] = int32(len(selectList))
-			selectList = append(selectList, tree.SelectExpr{
-				Expr: tree.NewUnresolvedName(tree.NewCStr(alias, bindCtx.lower), tree.NewCStr(colName, 1)),
-			})
+			oldColumn := tree.NewUnresolvedName(tree.NewCStr(alias, bindCtx.lower), tree.NewCStr(colName, 1))
+			bindCtx.markDMLPhysicalRef(oldColumn)
+			if typ := tableDef.Cols[tableDef.Name2ColIndex[colName]].Typ; isEnumOrSetPlanType(&typ) {
+				bindCtx.physicalMySQLSpecialRefs[oldColumn] = struct{}{}
+			}
+			selectList = append(selectList, tree.SelectExpr{Expr: oldColumn})
 			selectList[oldPos] = tree.SelectExpr{Expr: updateExpr}
 		}
 	}
@@ -662,9 +691,10 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 			},
 			Where: stmt.Where,
 		},
-		OrderBy: stmt.OrderBy,
-		Limit:   stmt.Limit,
-		With:    stmt.With,
+		OrderBy:       stmt.OrderBy,
+		Limit:         stmt.Limit,
+		With:          stmt.With,
+		RewriteOption: stmt.RewriteOption,
 	}
 	bindCtx.numericProjectionTypes = make([]Type, len(selectList))
 	for pos, typ := range updateNumericTargets {
@@ -2708,7 +2738,7 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 		}
 		return lockTargets[i].PrimaryColIdxInBat < lockTargets[j].PrimaryColIdxInBat
 	})
-	if !builder.hasExistingLockTargets() &&
+	if len(builder.dmlRewriteTargets) == 0 && !builder.hasExistingLockTargets() &&
 		isUnrestrictedSingleTargetUpdate(stmt, dmlCtx, updatedTargetCount) &&
 		lockTargetsCoverCompleteKeyspaces(lockTargets) {
 		if builder.fullTableUpdateLockTargets == nil {
@@ -2808,21 +2838,7 @@ func (builder *QueryBuilder) bindUpdate(stmt *tree.Update, bindCtx *BindContext,
 		if err != nil {
 			return 0, err
 		}
-		builder.irregularUpdateMaints = append(
-			builder.irregularUpdateMaints,
-			irregularUpdateMaintenance{
-				sourceStep:              builder.irregularMaintSourceStep,
-				deleteStep:              builder.irregularMaintDeleteStep,
-				deletePkPos:             builder.irregularMaintDeletePkPos,
-				deletePkTyp:             builder.irregularMaintDeletePkTyp,
-				indexes:                 builder.irregularMaintIndexes,
-				insertOnlySourceStep:    builder.irregularMaintInsertOnlySourceStep,
-				insertOnlyIndexes:       builder.irregularMaintInsertOnlyIndexes,
-				valueChangedSourceSteps: builder.irregularMaintValueChangedSourceSteps,
-				tableDef:                builder.irregularMaintTableDef,
-				objRef:                  builder.irregularMaintObjRef,
-			},
-		)
+		builder.queueIrregularUpdateMaint()
 	}
 
 	dmlNode := &plan.Node{
@@ -4918,6 +4934,13 @@ func (builder *QueryBuilder) mergeSamePhysicalTargetAssignmentsAcrossTuples(
 	return projectID, projectNode, nil
 }
 
+// queueIrregularUpdateMaint moves the maintenance recorded in the builder's
+// single-target fields to the queue finishIrregularIndexMaintenance emits.
+func (builder *QueryBuilder) queueIrregularUpdateMaint() {
+	builder.irregularUpdateMaints = append(builder.irregularUpdateMaints, builder.saveIrregularMaint())
+	builder.restoreIrregularMaint(irregularUpdateMaintenance{sourceStep: -1, deleteStep: -1, insertOnlySourceStep: -1})
+}
+
 func buildIrregularUpdateTargetProjection(
 	alias string,
 	tableDef *plan.TableDef,
@@ -5082,11 +5105,25 @@ func (builder *QueryBuilder) guardTargetLocalExpr(
 	newExpr *plan.Expr,
 	oldExpr *plan.Expr,
 ) (*plan.Expr, error) {
-	return BindFuncExprImplByPlanExpr(
-		builder.GetContext(),
-		"if",
-		[]*plan.Expr{DeepCopyExpr(targetSelected), newExpr, DeepCopyExpr(oldExpr)},
-	)
+	args := []*plan.Expr{DeepCopyExpr(targetSelected), newExpr, DeepCopyExpr(oldExpr)}
+	newType, oldType := newExpr.Typ, oldExpr.Typ
+	sameLabels := isEnumOrSetPlanType(&newType) && isEnumOrSetPlanType(&oldType) &&
+		newType.Id == oldType.Id && newType.Enumvalues == oldType.Enumvalues
+	sameGeometry := isGeometryPlanType(&newType) && isGeometryPlanType(&oldType) &&
+		makeTypeByPlan2Type(newType).Eq(makeTypeByPlan2Type(oldType))
+	if sameLabels || sameGeometry {
+		// Both arms are already normalized to the destination storage
+		// type. Select the exact value without ordinary SQL IF coercion.
+		newType.NotNullable = newType.NotNullable && oldType.NotNullable
+		return &plan.Expr{
+			Typ: newType,
+			Expr: &plan.Expr_F{F: &plan.Function{
+				Func: &plan.ObjectRef{Obj: function.EncodeOverloadID(function.IFF, 0), ObjName: "if"},
+				Args: args,
+			}},
+		}, nil
+	}
+	return BindFuncExprImplByPlanExpr(builder.GetContext(), "if", args)
 }
 
 func (builder *QueryBuilder) appendSelectedTargetNotNullAssertions(
@@ -5304,13 +5341,9 @@ func irregularIndexAffectedByUpdatedColumnNames(
 // from CDC-only indexes using plugin metadata. MASTER has no plugin, but shares
 // the modern synchronous maintenance pipeline with the plugin-backed indexes.
 // The bool return reports an affected irregular algorithm that has not migrated
-// to either mechanism. MASTER indexes delete
-// by the old source PK and rebuild from the final row image, so changing the
-// base-table PK is handled by the same maintenance pipeline. Plugin-backed
-// synchronous full-text/vector indexes retain their existing PK-update
-// restriction until their complete hidden-table groups support that contract.
+// to either mechanism. Synchronous indexes delete by the old source PK and
+// rebuild from the final row image, so a primary-key change affects every one.
 func classifyIrregularIndexesForUpdate(
-	ctx context.Context,
 	tableDef *plan.TableDef,
 	updateCols map[string]tree.Expr,
 ) (inline []*plan.IndexDef, unsupported bool, err error) {
@@ -5328,43 +5361,17 @@ func classifyIrregularIndexesForUpdate(
 		if err != nil {
 			return nil, false, err
 		}
-
-		p, ok := indexplugin.Get(idxDef.IndexAlgo)
-		if !ok {
-			if !isModernMaintainedIrregularAlgo(idxDef.IndexAlgo) {
-				if affected || pkUpdated {
-					return nil, true, nil
-				}
-				continue
-			}
-			if affected || pkUpdated {
-				affectedSyncGroups[idxDef.IndexName+"\x00"+idxDef.IndexTableName] = true
-			}
-			continue
-		}
-		desc := p.Catalog().SyncDescriptor()
-		if desc.AlwaysAsync {
-			continue
-		}
-		async, err := catalog.IndexParamAsync(idxDef.IndexAlgoParams)
+		sync, maintained, err := syncIrregularIndex(idxDef)
 		if err != nil {
 			return nil, false, err
 		}
-		if async {
+		if !sync || !(affected || pkUpdated) {
 			continue
 		}
-		if pkUpdated {
-			return nil, false, newUpdatePlannerRouteError(
-				updatePlannerRejected,
-				updateRouteReasonIrregularIndex,
-				moerr.NewUnsupportedDML(
-					ctx,
-					"update primary key on a table with a synchronous full-text/vector index"),
-			)
+		if !maintained {
+			return nil, true, nil
 		}
-		if affected {
-			affectedSyncGroups[idxDef.IndexName+"\x00"+idxDef.IndexTableName] = true
-		}
+		affectedSyncGroups[idxDef.IndexName+"\x00"+idxDef.IndexTableName] = true
 	}
 
 	for _, idxDef := range tableDef.Indexes {
@@ -5374,6 +5381,48 @@ func classifyIrregularIndexesForUpdate(
 		inline = append(inline, idxDef)
 	}
 	return inline, false, nil
+}
+
+// withSelfForeignKeyActionColumns returns updateCols plus the columns that
+// self-referencing ON UPDATE CASCADE / SET NULL actions change on rows merged
+// into the same UPDATE, followed to a fixpoint.
+func withSelfForeignKeyActionColumns(tableDef *plan.TableDef, updateCols map[string]tree.Expr) map[string]tree.Expr {
+	if len(tableDef.Fkeys) == 0 {
+		return updateCols
+	}
+	colNames := make(map[uint64]string, len(tableDef.Cols))
+	for _, col := range tableDef.Cols {
+		colNames[col.ColId] = col.Name
+	}
+	cols := maps.Clone(updateCols)
+	for changed := true; changed; {
+		changed = false
+		for _, fk := range tableDef.Fkeys {
+			if fk.ForeignTbl != 0 && fk.ForeignTbl != tableDef.TblId {
+				continue
+			}
+			if fk.OnUpdate != plan.ForeignKeyDef_CASCADE && fk.OnUpdate != plan.ForeignKeyDef_SET_NULL {
+				continue
+			}
+			referenced := false
+			for _, colID := range fk.ForeignCols {
+				if _, ok := cols[colNames[colID]]; ok {
+					referenced = true
+					break
+				}
+			}
+			if !referenced {
+				continue
+			}
+			for _, colID := range fk.Cols {
+				if _, ok := cols[colNames[colID]]; !ok {
+					cols[colNames[colID]] = nil
+					changed = true
+				}
+			}
+		}
+	}
+	return cols
 }
 
 func updateHasMultipleSourceTables(stmt *tree.Update) bool {
@@ -5855,6 +5904,9 @@ func validateUpdateAssignmentTargets(builder *QueryBuilder, bindCtx *BindContext
 				return err
 			}
 
+			if target := dmlCtx.updateRewrites[binding.table]; target != nil && target.visible == nil {
+				return rewritePrivilegeError(builder.GetContext())
+			}
 			idx, writable := dmlCtx.aliasMap[binding.table]
 			if !writable || binding.tableID != dmlCtx.tableDefs[idx].TblId {
 				return moerr.NewInvalidInputf(builder.GetContext(), "UPDATE target table '%s' is not updatable", binding.table)
@@ -5866,8 +5918,8 @@ func validateUpdateAssignmentTargets(builder *QueryBuilder, bindCtx *BindContext
 
 // Use the existing source identity owner for SET, never SELECT projection aliases.
 func resolveUpdateAssignmentTarget(ctx context.Context, bindCtx *BindContext, lhs *tree.UnresolvedName) (*Binding, error) {
-	binding, _, ok := resolveColumnIdentity(bindCtx, lhs)
-	if !ok {
+	binding, pos, ok := resolveColumnIdentity(bindCtx, lhs)
+	if !ok || pos == NotFound {
 		if lhs.TblName() == "" {
 			if value, found := bindCtx.bindingByCol[lhs.ColName()]; found && value == nil {
 				return nil, moerr.NewInvalidInputf(ctx, "ambiguous column reference '%s'", lhs.ColNameOrigin())

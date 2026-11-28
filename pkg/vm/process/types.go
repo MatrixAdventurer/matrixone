@@ -537,13 +537,17 @@ type BaseProcess struct {
 	// only supplied the legacy text transport.
 	typedPrepareParams      *batch.Batch
 	typedPrepareParamsOwned bool
+	// typedPrepareParamConversions holds typedPrepareParams converted once
+	// to the narrower integer types the plan reads them as; it lives and dies
+	// with typedPrepareParams.
+	typedPrepareParamConversions *TypedParamConversions
 	// prepareParamsStringSource records where this execution's parameter
 	// values came from (SQL PREPARE or COM_STMT_EXECUTE). Constant folding
 	// stamps it on literals built from parameters.
 	prepareParamsStringSource       types.StringSource
 	QueryClient                     qclient.QueryClient
 	Hakeeper                        logservice.CNHAKeeperClient
-	UdfService                      udf.Service
+	UdfService                      udf.Runtime
 	WaitPolicy                      lock.WaitPolicy
 	messageBoard                    *message.MessageBoard
 	executionResourceBudgetBorrowed bool
@@ -751,6 +755,9 @@ type Process struct {
 	// WarningSink is an immutable execution-attempt destination. Children inherit
 	// the pointer; remote callbacks retain it after a failed attempt is sealed.
 	WarningSink any
+	// WarningRowOffset maps a singleton VALUES evaluation to its statement row.
+	// VALUE_SCAN restores it before leaving the current evaluation.
+	WarningRowOffset uint64
 }
 
 type sqlHelper interface {

@@ -39,6 +39,7 @@ import (
 	util2 "github.com/matrixorigin/matrixone/pkg/util"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/util/resource"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
@@ -51,6 +52,26 @@ type runSQLCoordinator interface {
 
 type runSQLCoordinatorWithSQL interface {
 	CancelAndWaitRunningSQLWithSQL(ctx context.Context, keepToken uint64, currentSQL string) error
+}
+
+var errPythonRoutineInRetryPlan = moerr.NewInternalErrorNoCtx("retry plan contains a Python routine")
+
+// A worker can have run on another CN even when this coordinator only saw a
+// transaction conflict. Inspect the failed attempt's bound expressions,
+// including a DDL's source query, before allowing a new execution generation.
+func planMayReplayPython(p *plan.Plan) bool {
+	query := p.GetQuery()
+	if query == nil {
+		query = p.GetDdl().GetQuery()
+	}
+	return plan.VisitExpressionsInOwner(query, func(root *plan.Expr) error {
+		return plan.VisitExprTree(root, func(expr *plan.Expr) error {
+			if expr.GetF().GetRoutineCall().GetPython() != nil {
+				return errPythonRoutineInRetryPlan
+			}
+			return nil
+		})
+	}) != nil
 }
 
 func statementHasSQLCalcFoundRows(stmt tree.Statement) bool {
@@ -168,7 +189,7 @@ func (c *Compile) Compile(
 
 	// Reject unsupported lock policies before query scheduling, source/scope
 	// construction, Sirius offload, or any later MergeRun can publish work.
-	if err = c.validateNonBlockingLockPlan(queryPlan); err != nil {
+	if err = c.validateLockPlan(queryPlan); err != nil {
 		return err
 	}
 	c.capturedExecutionTopology = c.capturedExecutionTopology || requiresCapturedExecution
@@ -177,7 +198,7 @@ func (c *Compile) Compile(
 	// rolling back the caller's workspace statement. This also covers
 	// frontend background execution and reused Compile instances.
 	if c.proc != nil && c.proc.IncrStatementDisabled() {
-		if err = validateTemporalResultProtocol(c.proc, queryPlan); err != nil {
+		if err = validateTemporalResultContracts(queryPlan); err != nil {
 			return err
 		}
 		queryPlan, err = c.prepareCreateNamePlan(queryPlan)
@@ -185,22 +206,10 @@ func (c *Compile) Compile(
 			return err
 		}
 	}
-	if err = validateJSONStringConsumerProtocol(c.proc, queryPlan); err != nil {
-		return err
-	}
 	if err = plan.RequireLegacyCollations(queryPlan); err != nil {
 		return err
 	}
-	if err = validateTemporalResultProtocol(c.proc, queryPlan); err != nil {
-		return err
-	}
-	if err = validateOctStringProtocol(c.proc, queryPlan); err != nil {
-		return err
-	}
-	if err = validateHexMySQLNumericProtocol(c.proc, queryPlan); err != nil {
-		return err
-	}
-	if err = validateIncompleteTemporalStringProtocol(c.proc, queryPlan); err != nil {
+	if err = validateTemporalResultContracts(queryPlan); err != nil {
 		return err
 	}
 	if c.indexMaintenanceSpec != nil {
@@ -456,7 +465,7 @@ func expressionsContainUnresolvedFullText(expressions []*plan.Expr) bool {
 // Run executes the pipeline and returns the result.
 func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 	defer func() { err = process.UnwrapPipelineFailure(err) }()
-	if err = validateTemporalResultProtocol(c.proc, c.pn); err != nil {
+	if err = validateTemporalResultContracts(c.pn); err != nil {
 		return nil, err
 	}
 	if c.pn.GetDdl().GetDropTable() != nil {
@@ -476,19 +485,6 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 	warningsSucceeded := false
 	defer func() { warnings.finish(warningsSucceeded, warningDestination) }()
 
-	// Cached plans can outlive the negotiated cluster capability.
-	if err = validateJSONStringConsumerProtocol(c.proc, c.pn); err != nil {
-		return nil, err
-	}
-	if err = validateOctStringProtocol(c.proc, c.pn); err != nil {
-		return nil, err
-	}
-	if err = validateHexMySQLNumericProtocol(c.proc, c.pn); err != nil {
-		return nil, err
-	}
-	if err = validateIncompleteTemporalStringProtocol(c.proc, c.pn); err != nil {
-		return nil, err
-	}
 	var txnOperator = c.proc.GetTxnOperator()
 
 	// init context for pipeline.
@@ -599,6 +595,13 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 	var coordinatorPhaseStart time.Time
 	var coordinatorPhaseBase time.Duration
 	var allocationAttempt *statementAllocationAttempt
+	localJoined, analyzed := false, false
+	defer func() {
+		if err != nil && localJoined && !analyzed {
+			resourceRecorder.publish()
+			c.capturePartialExecution(runC, uint64(retryTimes))
+		}
+	}()
 	finishAllocationAttempt := func() error {
 		if allocationAttempt == nil {
 			return nil
@@ -644,6 +647,7 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			localJoined = false
 			var panicErr error = moerr.NewInternalError(execTopContext, "panic while executing DML RETURNING")
 			if c.resultSink != nil {
 				panicErr = errors.Join(panicErr, c.cancelAndWaitRunningSQL(&attemptRemoteWait))
@@ -687,7 +691,8 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 		if err == nil {
 			allocationAttempt, err = runC.beginAllocationAccountAttempt()
 		}
-		if err == nil {
+		executionMayHaveStarted := err == nil
+		if executionMayHaveStarted {
 			err = runC.runPipelineAttempt(func() error {
 				preRunWall = carriedPreRunWall + time.Since(preRunOnceStart)
 				attemptPreRunWall = preRunWall
@@ -699,7 +704,9 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 				coordinatorPhaseStart = time.Time{}
 				coordinatorPhaseBase = 0
 
-				if runErr := runC.runOnce(); runErr != nil {
+				joined, runErr := runC.runOnce()
+				localJoined = joined
+				if runErr != nil {
 					return runErr
 				}
 				return runC.proc.GetQueryContextError()
@@ -731,7 +738,7 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 		// Seal before cancellation: a late terminal RPC must not leak diagnostics.
 		warnings.discard()
 		c.fatalLog(retryTimes, err)
-		if !c.canRetry(err) {
+		if !c.canRetry(err) || (executionMayHaveStarted && planMayReplayPython(runC.pn)) {
 			// runOnce may return after a local or coordinator branch fails while a
 			// remote branch is still unwinding. Quiesce every producer before the
 			// attempt-owned sink releases its file and reservations; a generation
@@ -831,6 +838,7 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 		)
 		attemptOpen = false
 		warnings.finish(false, nil)
+		localJoined = false
 		if runC != c {
 			releaseRetryCompile(runC)
 		}
@@ -879,7 +887,7 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 		}
 
 		// rebuild context for the retry.
-		runC.InitPipelineContextToRetryQuery()
+		runC.initPipelineContextToRetryQuery(c.resourceAttemptOwnerEligible)
 		carriedPreRunWall = time.Since(attemptStart)
 		attemptPreRunWall = carriedPreRunWall
 		coordinatorPhaseStart = time.Time{}
@@ -918,6 +926,7 @@ func (c *Compile) Run(_ uint64) (queryResult *util2.RunResult, err error) {
 	// outcome. The panic defer above remains the single terminal owner until
 	// this call returns.
 	c.AnalyzeExecPlan(runC, queryResult, stats, isExplainPhyPlan, option)
+	analyzed = true
 	if terminalErr := finishAllocationAttempt(); terminalErr != nil {
 		err = joinAllocationLifecycleErrors(err, terminalErr)
 		err = abortSinkAttempt(err)
@@ -1203,6 +1212,7 @@ func (c *Compile) buildRetryCompile(rebuildPlan, safeFallback bool, existingOffs
 		// after physical compilation succeeds. A subsequent ordinary retry must
 		// inherit this generation rather than the one that first hit the fence.
 		c.pn = planForRetry
+		c.lockingReadPlan = runC.lockingReadPlan
 		c.capturedExecutionTopology = runC.capturedExecutionTopology
 		c.preparedJoinDiagnosticFree = runC.preparedJoinDiagnosticFree
 		c.inheritPlanSnapshot(runC)
@@ -1264,6 +1274,20 @@ func (c *Compile) bindRetryPlanGeneration(runC *Compile, rebuildPlan bool) {
 	c.planGenerationRebuilt = true
 }
 
+func (c *Compile) lockReadQueryContext(ctx context.Context, ownerEligible bool) context.Context {
+	var lockReadRoot *resource.Root
+	// Metadata locks can also occur on ordinary SELECTs. Use the compiled
+	// locking-read classification to avoid walking the plan on execution.
+	if c.lockingReadPlan && ownerEligible && !c.isInternal {
+		if stmt, ok := c.stmt.(*tree.Select); ok && stmt != nil {
+			if root := resource.RootFromContext(ctx); root.LockReadEnabled() {
+				lockReadRoot = root
+			}
+		}
+	}
+	return resource.ContextWithLockReadRoot(ctx, lockReadRoot)
+}
+
 // InitPipelineContextToExecuteQuery initializes the context for each pipeline tree.
 //
 // the entire process must follow these rules:
@@ -1271,7 +1295,7 @@ func (c *Compile) bindRetryPlanGeneration(runC *Compile, rebuildPlan bool) {
 // 2. if there's a data transfer between two pipelines, the lifecycle of the sender's context ends with the receiver's termination.
 func (c *Compile) InitPipelineContextToExecuteQuery() {
 	contextBase := c.proc.Base.GetContextBase()
-	contextBase.BuildQueryCtx(c.proc.GetTopContext())
+	contextBase.BuildQueryCtx(c.lockReadQueryContext(c.proc.GetTopContext(), c.resourceAttemptOwnerEligible))
 	contextBase.SaveToQueryContext(defines.EngineKey{}, c.e)
 	queryContext := contextBase.WithCounterSetToQueryContext(c.counterSet)
 
@@ -1285,12 +1309,12 @@ func (c *Compile) InitPipelineContextToExecuteQuery() {
 	}
 }
 
-// InitPipelineContextToRetryQuery initializes the context for each pipeline tree.
-// the only place diff to InitPipelineContextToExecuteQuery is this function build query context from the last query.
-func (c *Compile) InitPipelineContextToRetryQuery() {
+// initPipelineContextToRetryQuery retains the statement context and determines
+// lock observation eligibility from the retry's compiled plan.
+func (c *Compile) initPipelineContextToRetryQuery(ownerEligible bool) {
 	lastQueryCtx, _ := process.GetQueryCtxFromProc(c.proc)
 	contextBase := c.proc.Base.GetContextBase()
-	contextBase.BuildQueryCtx(lastQueryCtx)
+	contextBase.BuildQueryCtx(c.lockReadQueryContext(lastQueryCtx, ownerEligible))
 	contextBase.SaveToQueryContext(defines.EngineKey{}, c.e)
 	queryContext := contextBase.WithCounterSetToQueryContext(c.counterSet)
 

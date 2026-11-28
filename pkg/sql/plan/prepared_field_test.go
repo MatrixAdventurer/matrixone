@@ -55,7 +55,7 @@ func TestPreparedFieldResolvedStringDomain(t *testing.T) {
 			t.Run(tc.name+"/"+sourceOID.String(), func(t *testing.T) {
 				mock := NewMockOptimizer(false, newPlanTestProcess(t))
 				proc := mock.ctxt.GetProcess()
-				params := vector.NewVec(types.T_text.ToType())
+				params := vector.NewVec(types.T_text.ToType(), proc.Mp())
 				t.Cleanup(func() { proc.SetPrepareParams(nil); params.Free(proc.Mp()) })
 				require.NoError(t, vector.AppendBytes(params, []byte("a"), false, proc.Mp()))
 				proc.SetPrepareParams(params)
@@ -760,6 +760,23 @@ func TestPreparedFieldWrappedTypeHistory(t *testing.T) {
 					require.Equal(t, oid, bindings[1].Type.Oid, "return types must not rewrite marker sources")
 				}
 			})
+		}
+	}
+}
+
+func TestFrozenRoutineStringDomainUsesReturnType(t *testing.T) {
+	for _, oid := range []types.T{types.T_blob, types.T_text} {
+		for _, count := range []int{0, 1} {
+			typ := planpb.Type{Id: int32(oid)}
+			expr := &planpb.Expr{Typ: typ, Expr: &planpb.Expr_F{F: &planpb.Function{
+				Func: &planpb.ObjectRef{ObjName: "python_user_defined_function"},
+				Args: make([]*planpb.Expr, count), RoutineCall: &planpb.RoutineCall{ReturnType: typ},
+			}}}
+			want := uint8(possibleStringDomainText)
+			if oid == types.T_blob {
+				want = possibleStringDomainBinary
+			}
+			require.Equal(t, want, possibleStringDomainsForExpr(expr))
 		}
 	}
 }

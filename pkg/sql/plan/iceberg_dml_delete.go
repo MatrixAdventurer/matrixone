@@ -37,8 +37,12 @@ func buildIcebergUpdatePlan(stmt *tree.Update, ctx CompilerContext, isPrepareStm
 	if err != nil {
 		return nil, err
 	}
+	if len(rewriteChainForTable(ctx, stmt.RewriteOption, target.objRef.SchemaName, target.tableName)) != 0 {
+		return nil, rewritePrivilegeError(ctx.GetContext())
+	}
 
 	builder := NewQueryBuilder(plan.Query_UPDATE, ctx, isPrepareStmt, false)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
 		bindCtx.snapshot = ctx.GetSnapshot()
@@ -55,9 +59,10 @@ func buildIcebergUpdatePlan(stmt *tree.Update, ctx CompilerContext, isPrepareStm
 			From:     &tree.From{Tables: stmt.Tables},
 			Where:    stmt.Where,
 		},
-		OrderBy: stmt.OrderBy,
-		Limit:   stmt.Limit,
-		With:    stmt.With,
+		OrderBy:       stmt.OrderBy,
+		Limit:         stmt.Limit,
+		With:          stmt.With,
+		RewriteOption: stmt.RewriteOption,
 	}
 	lastNodeID, err := builder.bindSelect(selectStmt, bindCtx, false)
 	if err != nil {
@@ -121,8 +126,12 @@ func buildIcebergDeletePlan(stmt *tree.Delete, ctx CompilerContext, isPrepareStm
 	if err != nil {
 		return nil, err
 	}
+	if len(rewriteChainForTable(ctx, stmt.RewriteOption, target.objRef.SchemaName, target.tableName)) != 0 {
+		return nil, rewritePrivilegeError(ctx.GetContext())
+	}
 
 	builder := NewQueryBuilder(plan.Query_DELETE, ctx, isPrepareStmt, false)
+	builder.zeroScalarPolicy = zeroScalarRetainOnly
 	bindCtx := NewBindContext(builder, nil)
 	if IsSnapshotValid(ctx.GetSnapshot()) {
 		bindCtx.snapshot = ctx.GetSnapshot()
@@ -136,9 +145,10 @@ func buildIcebergDeletePlan(stmt *tree.Delete, ctx CompilerContext, isPrepareStm
 			From:     &tree.From{Tables: stmt.Tables},
 			Where:    stmt.Where,
 		},
-		OrderBy: stmt.OrderBy,
-		Limit:   stmt.Limit,
-		With:    stmt.With,
+		OrderBy:       stmt.OrderBy,
+		Limit:         stmt.Limit,
+		With:          stmt.With,
+		RewriteOption: stmt.RewriteOption,
 	}
 	lastNodeID, err := builder.bindSelect(selectStmt, bindCtx, false)
 	if err != nil {

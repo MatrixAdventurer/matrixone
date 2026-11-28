@@ -36,7 +36,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/mergesort"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
 	"go.uber.org/zap"
 
@@ -63,7 +62,7 @@ type CkpReplayer struct {
 	readDuration, applyDuration       time.Duration
 	readCount, applyCount, totalCount int
 
-	objectReplayWorker []sm.Queue
+	objectReplayWorker []sm.ContextQueue
 	wg                 sync.WaitGroup
 	objectCountMap     map[uint64]int
 }
@@ -288,7 +287,7 @@ func (c *CkpReplayer) replayObjectList(
 	ctx context.Context,
 	forSys bool,
 ) (maxTS types.TS, maxLsn uint64, err error) {
-	tmpBatch := ckputil.MakeDataScanTableIDBatch()
+	tmpBatch := ckputil.MakeDataScanTableIDBatch(common.CheckpointAllocator)
 	defer tmpBatch.Clean(common.CheckpointAllocator)
 	defer c.ckpReader.Reset(ctx)
 	for {
@@ -360,6 +359,7 @@ func (c *CkpReplayer) ReplayThreeTablesObjectlist(phase string) (
 }
 
 func (c *CkpReplayer) ReplayCatalog(
+	ctx context.Context,
 	readTxn txnif.AsyncTxn,
 	phase string,
 ) (err error) {
@@ -382,21 +382,21 @@ func (c *CkpReplayer) ReplayCatalog(
 		return
 	}
 
-	// logutil.Info(c.r.catalog.SimplePPString(common.PPL3))
-	sortFunc := func(cols []containers.Vector, pkidx int) (err2 error) {
-		_, err2 = mergesort.SortBlockColumns(cols, pkidx, c.r.rt.VectorPool.Transient)
-		return
-	}
-	closeFn := c.r.catalog.RelayFromSysTableObjects(
-		c.r.ctx,
+	err = c.r.catalog.ReplayFromSysTableObjects(
+		ctx,
 		readTxn,
-		tables.ReadSysTableBatch,
-		sortFunc,
+		tables.ScanSysTable,
 		c,
 	)
+	// A cancellation or error may arrive after some tasks were submitted.
+	// They own their schemas and must finish before replay returns.
 	c.wg.Wait()
-	for _, fn := range closeFn {
-		fn()
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		err = context.Cause(ctx)
+		return err
 	}
 	c.resetObjectCountMap()
 	// logutil.Info(c.r.catalog.SimplePPString(common.PPL0))
@@ -446,11 +446,15 @@ func (c *CkpReplayer) ReplayObjectlist(ctx context.Context, phase string) (err e
 	return
 }
 
-func (c *CkpReplayer) Submit(tid uint64, replayFn func()) {
+func (c *CkpReplayer) Submit(ctx context.Context, tid uint64, replayFn func()) error {
 	c.wg.Add(1)
 	workerOffset := tid % uint64(len(c.objectReplayWorker))
+	if _, err := c.objectReplayWorker[workerOffset].EnqueueWithContext(ctx, replayFn); err != nil {
+		c.wg.Done()
+		return err
+	}
 	c.objectCountMap[tid] = c.objectCountMap[tid] + 1
-	c.objectReplayWorker[workerOffset].Enqueue(replayFn)
+	return nil
 }
 
 func (c *CkpReplayer) resetObjectCountMap() {
@@ -465,7 +469,7 @@ func (r *runner) BuildReplayer(
 		dir:            dir,
 		objectCountMap: make(map[uint64]int),
 	}
-	objectWorker := make([]sm.Queue, DefaultObjectReplayWorkerCount)
+	objectWorker := make([]sm.ContextQueue, DefaultObjectReplayWorkerCount)
 	for i := 0; i < DefaultObjectReplayWorkerCount; i++ {
 		objectWorker[i] = sm.NewSafeQueue(10000, 100, func(items ...any) {
 			for _, item := range items {
@@ -535,24 +539,39 @@ func MergeCkpMeta(
 			continue
 		}
 		var vec containers.Vector
-		if bats[0].Vecs[i].Length() == 0 {
+		if src := bats[0].Vecs[i]; src.Length() == 0 {
 			vec = containers.MakeVector(colTypes[i], common.CheckpointAllocator)
+		} else if src.IsReadOnly() {
+			// rows are appended below: copy a cache-backed vector first
+			if vec, err = src.Dup(common.CheckpointAllocator); err != nil {
+				return "", err
+			}
 		} else {
-			vec = containers.ToTNVector(bats[0].Vecs[i], common.CheckpointAllocator)
+			vec = src
 		}
 		bat.AddVector(colNames[i], vec)
 	}
 	last := bat.Vecs[0].Length() - 1
-	bat.GetVectorByName(CheckpointAttr_StartTS).Append(startTs, false)
-	bat.GetVectorByName(CheckpointAttr_EndTS).Append(ts, false)
-	bat.GetVectorByName(CheckpointAttr_MetaLocation).Append([]byte(cnLocation), false)
-	bat.GetVectorByName(CheckpointAttr_EntryType).Append(true, false)
-	bat.GetVectorByName(CheckpointAttr_Version).Append(bat.GetVectorByName(CheckpointAttr_Version).Get(last), false)
-	bat.GetVectorByName(CheckpointAttr_AllLocations).Append([]byte(tnLocation), false)
-	bat.GetVectorByName(CheckpointAttr_CheckpointLSN).Append(bat.GetVectorByName(CheckpointAttr_CheckpointLSN).Get(last), false)
-	bat.GetVectorByName(CheckpointAttr_TruncateLSN).Append(bat.GetVectorByName(CheckpointAttr_TruncateLSN).Get(last), false)
-	bat.GetVectorByName(CheckpointAttr_Type).Append(int8(ET_Backup), false)
-	bat.GetVectorByName(CheckpointAttr_TableIDLocation).Append([]byte(tableIDLocation), false)
+	for _, col := range []struct {
+		attr string
+		val  any
+	}{
+		{CheckpointAttr_StartTS, startTs},
+		{CheckpointAttr_EndTS, ts},
+		{CheckpointAttr_MetaLocation, []byte(cnLocation)},
+		{CheckpointAttr_EntryType, true},
+		{CheckpointAttr_Version, bat.GetVectorByName(CheckpointAttr_Version).GetValue(last)},
+		{CheckpointAttr_AllLocations, []byte(tnLocation)},
+		{CheckpointAttr_CheckpointLSN, bat.GetVectorByName(CheckpointAttr_CheckpointLSN).GetValue(last)},
+		{CheckpointAttr_TruncateLSN, bat.GetVectorByName(CheckpointAttr_TruncateLSN).GetValue(last)},
+		{CheckpointAttr_Type, int8(ET_Backup)},
+		{CheckpointAttr_TableIDLocation, []byte(tableIDLocation)},
+	} {
+		vec := bat.GetVectorByName(col.attr)
+		if err = vector.AppendAny(vec, col.val, false, vec.MPool()); err != nil {
+			return "", err
+		}
+	}
 	name := ioutil.EncodeCKPMetadataFullName(startTs, ts)
 	writer, err := objectio.NewObjectWriterSpecial(objectio.WriterCheckpoint, name, fs)
 	if err != nil {
@@ -570,27 +589,27 @@ func MergeCkpMeta(
 func ReplayCheckpointEntries(bat *containers.Batch, checkpointVersion int) (entries []*CheckpointEntry, maxGlobalEnd types.TS) {
 	entries = make([]*CheckpointEntry, bat.Length())
 	for i := 0; i < bat.Length(); i++ {
-		start := bat.GetVectorByName(CheckpointAttr_StartTS).Get(i).(types.TS)
-		end := bat.GetVectorByName(CheckpointAttr_EndTS).Get(i).(types.TS)
-		cnLoc := objectio.Location(bat.GetVectorByName(CheckpointAttr_MetaLocation).Get(i).([]byte))
+		start := bat.GetVectorByName(CheckpointAttr_StartTS).GetValue(i).(types.TS)
+		end := bat.GetVectorByName(CheckpointAttr_EndTS).GetValue(i).(types.TS)
+		cnLoc := objectio.Location(bat.GetVectorByName(CheckpointAttr_MetaLocation).GetValue(i).([]byte))
 		typ := ET_Global
 		if checkpointVersion > 2 {
-			typ = EntryType(bat.GetVectorByName(CheckpointAttr_Type).Get(i).(int8))
+			typ = EntryType(bat.GetVectorByName(CheckpointAttr_Type).GetValue(i).(int8))
 		} else {
-			isIncremental := bat.GetVectorByName(CheckpointAttr_EntryType).Get(i).(bool)
+			isIncremental := bat.GetVectorByName(CheckpointAttr_EntryType).GetValue(i).(bool)
 			if isIncremental {
 				typ = ET_Incremental
 			}
 		}
 		var tableIDLocation objectio.LocationSlice
 		if checkpointVersion > 3 {
-			tableIDLocation = objectio.LocationSlice(bat.GetVectorByName(CheckpointAttr_TableIDLocation).Get(i).([]byte))
+			tableIDLocation = objectio.LocationSlice(bat.GetVectorByName(CheckpointAttr_TableIDLocation).GetValue(i).([]byte))
 		}
-		version := bat.GetVectorByName(CheckpointAttr_Version).Get(i).(uint32)
-		tnLoc := objectio.Location(bat.GetVectorByName(CheckpointAttr_AllLocations).Get(i).([]byte))
+		version := bat.GetVectorByName(CheckpointAttr_Version).GetValue(i).(uint32)
+		tnLoc := objectio.Location(bat.GetVectorByName(CheckpointAttr_AllLocations).GetValue(i).([]byte))
 		var ckpLSN, truncateLSN uint64
-		ckpLSN = bat.GetVectorByName(CheckpointAttr_CheckpointLSN).Get(i).(uint64)
-		truncateLSN = bat.GetVectorByName(CheckpointAttr_TruncateLSN).Get(i).(uint64)
+		ckpLSN = bat.GetVectorByName(CheckpointAttr_CheckpointLSN).GetValue(i).(uint64)
+		truncateLSN = bat.GetVectorByName(CheckpointAttr_TruncateLSN).GetValue(i).(uint64)
 		checkpointEntry := &CheckpointEntry{
 			start:           start,
 			end:             end,
